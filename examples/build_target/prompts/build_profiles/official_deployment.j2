@@ -1,0 +1,8 @@
+The input contains deployment material. Treat the supplied Compose files, Dockerfiles, entrypoints, lockfiles, and initialization scripts as the primary implementation.
+
+- Start by auditing the existing deployment closure and referenced local files.
+- Reuse it with minimal compatibility repair; do not replace it with a newly invented stack.
+- Preserve all required application, database, cache, browser/Bot, proxy, and initialization services.
+- Use the Writeup only to understand expected behavior and the vulnerability path.
+- Record each deviation from upstream and why it does not alter the challenge.
+- If an external image or dependency is unavailable, report that exact blocker before considering an evidence-backed substitution.

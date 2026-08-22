@@ -132,6 +132,7 @@ models:
   demo:
     provider: openai
     model: demo-model
+    max_context_size: 131072
     base_url: https://example.test/v1
     api_key: ${CAGE_TEST_MODEL_KEY}
 """,
@@ -153,6 +154,7 @@ models:
   deepseek-v4-pro:
     provider: anthropic
     model: deepseek-v4-pro
+    max_context_size: 131072
     base_url: https://api.deepseek.com/anthropic
     api_key: sk-test
     agent_model_names:

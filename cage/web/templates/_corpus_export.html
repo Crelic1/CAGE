@@ -1,0 +1,17 @@
+{# Corpus-export button. Shared by the run page and the trial page.
+
+   The endpoint answers 202 with progress while the export is being produced and
+   200 with the file once it exists, so the button polls rather than navigating:
+   pointing a browser straight at it would show the progress JSON. Polling also
+   makes a long export legible — an export of a large run takes minutes, and a
+   button that simply looks stuck invites the repeat clicks that used to
+   multiply the work.
+
+   Expects `export_url` and, optionally, `export_hint`. #}
+<a href="{{ export_url }}"
+   data-corpus-export
+   data-corpus-idle="Export traj"
+   class="px-3 py-1.5 rounded-lg bg-emerald-500/15 text-emerald-200 text-sm font-medium border border-emerald-500/30 hover:bg-emerald-500/25 whitespace-nowrap"
+   title="{{ export_hint or 'Every trajectory here as one training-corpus JSONL — the same thing `cage corpus export` writes. Produced in the background; a large run takes minutes, and the result is cached.' }}">
+  Export traj
+</a>

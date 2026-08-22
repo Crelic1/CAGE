@@ -6,7 +6,18 @@ from enum import Enum
 
 
 class TerminationStatus(str, Enum):
-    """Stable coarse-grained trial lifecycle status."""
+    """How a trial ended — the terminal subset of ``TrialStatus``.
+
+    Two enums describe one vocabulary, deliberately: ``TrialStatus`` covers a
+    trial's whole life (including ``pending`` and ``running``), while this one
+    is the answer to "how did it *end*" and so cannot hold a non-terminal value.
+
+    Their four shared values must stay byte-identical — the classifier writes
+    this enum into the same ``status`` field the runtime writes ``TrialStatus``
+    into, so any drift would produce a status no consumer recognises. That
+    agreement is asserted against ``contracts.trial_status.TERMINAL_TRIAL_STATUSES``
+    in the test suite rather than left as a coincidence between two files.
+    """
 
     COMPLETED = "completed"
     FAILED = "failed"
@@ -43,7 +54,22 @@ class TerminationReason(str, Enum):
        - ``MODEL_ERROR``            other unclassified upstream HTTP error
        - ``OOM_KILLED``             container killed (SIGKILL / exit 137)
        - ``TARGET_UNAVAILABLE``     target stack failed to launch
-       - ``TRIAL_ERROR``            orchestrator / container raised an exception
+       - ``TARGET_ERROR``           target stack died after coming up
+       - ``CONTAINER_ERROR``        agent container lifecycle failed
+       - ``PROXY_ERROR``            in-container LLM proxy failed to start/run
+       - ``AGENT_SETUP_ERROR``      agent could not be prepared or launched
+       - ``BENCHMARK_ERROR``        a Benchmark subclass raised (Layer 2 bug)
+       - ``SCORING_ERROR``          a Scorer subclass raised (trial itself is fine)
+       - ``TRIAL_ERROR``            orchestrator raised something unclassified
+
+       The five middle reasons exist so "the trial errored" stops being one
+       bucket holding five unrelated failures. They are produced either from a
+       typed exception (``cage.contracts.exceptions``) or, for the many untyped
+       ``RuntimeError``/``ValueError`` raises across the framework, inferred from
+       the lifecycle phase the exception escaped from.
+
+    2b. **Config** (resume re-runs, but only after the user acts):
+       - ``CONFIG_ERROR``           project.yml / models.yml cannot be resolved
 
     3. **State** (resume policy depends on user intent):
        - ``USER_INTERRUPTED``       Ctrl+C while running
@@ -72,12 +98,58 @@ class TerminationReason(str, Enum):
     # Unexpected — infra
     OOM_KILLED = "oom_killed"
     TARGET_UNAVAILABLE = "target_unavailable"
+    TARGET_ERROR = "target_error"
+    CONTAINER_ERROR = "container_error"
+    PROXY_ERROR = "proxy_error"
+    AGENT_SETUP_ERROR = "agent_setup_error"
+    BENCHMARK_ERROR = "benchmark_error"
+    SCORING_ERROR = "scoring_error"
     TRIAL_ERROR = "trial_error"
+
+    # Unexpected — configuration
+    CONFIG_ERROR = "config_error"
 
     # State
     USER_INTERRUPTED = "user_interrupted"
     CANCELLED_BEFORE_START = "cancelled_before_start"
     AGENT_EXIT_NONZERO = "agent_exit_nonzero"
+
+
+#: Reasons under which the agent process stopped talking on its own terms, so
+#: whatever it said last really is its answer.
+#:
+#: ``AGENT_EXIT_NONZERO`` belongs here: the agent chose to exit, and its parting
+#: words are usually its own error message. ``SCORING_ERROR`` too — the trial
+#: itself ran to completion and only the scorer afterwards blew up.
+AGENT_FINISHED_SPEAKING = frozenset({
+    "completed",
+    "agent_exit_nonzero",
+    "scoring_error",
+})
+
+
+def agent_was_cut_off(reason: str) -> bool:
+    """Did something outside the agent stop it before it could conclude?
+
+    Answers the question a reader of a trial's recorded output actually has:
+    *is this a conclusion, or the middle of a sentence?* A timed-out agent's
+    last words are typically a plan for a tool call whose result it never saw
+    — real information about where it got to, but not an answer, and a panel
+    labelled "Final Output" claims otherwise.
+
+    Membership is an allowlist rather than a list of the ways to be cut off,
+    so a reason added later defaults to "cut off". That errs toward
+    under-claiming: presenting a conclusion as a fragment costs a reader
+    nothing, presenting a fragment as a conclusion misleads them.
+
+    No reason at all — a still-running trial, or a run dir written before
+    this field existed — is not evidence of either, so it answers False. The
+    allowlist decides between *known* endings; it does not turn silence into
+    a claim.
+    """
+
+    text = str(reason or "").strip()
+    return bool(text) and text not in AGENT_FINISHED_SPEAKING
 
 
 class TerminationSource(str, Enum):

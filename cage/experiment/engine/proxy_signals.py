@@ -7,6 +7,8 @@ termination classifier that consumes them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from cage.contracts.jsonio import iter_jsonl_entries
 from cage.experiment.engine.termination_model import TerminationReason
 
 
@@ -170,27 +172,13 @@ def _last_proxy_error_signal(proxy_jsonl_path: object) -> _UpstreamErrorSignal |
     """Extract structured signals when the trial's final proxy entry is an error."""
     import json as _json
     import re as _re
-    from pathlib import Path as _Path
 
     if not proxy_jsonl_path:
         return None
-    path = _Path(str(proxy_jsonl_path))
-    if not path.is_file():
-        return None
     last_entry: dict | None = None
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    entry = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                last_entry = entry
+        for entry in iter_jsonl_entries(proxy_jsonl_path):
+            last_entry = entry
     except OSError:
         return None
     if not last_entry or str(last_entry.get("status") or "").lower() != "error":
@@ -261,104 +249,157 @@ def _last_proxy_error_text(proxy_jsonl_path: object) -> str:
     Note: proxy.jsonl files can be hundreds of MB for long-running trials
     (codex sends the full conversation context with every request, so a
     single JSON line may be tens of MB). A naive tail-read can miss the
-    last error line entirely, so we stream the whole file with the
-    builtin line iterator. That's still bounded by disk speed and runs
-    once per trial — acceptable.
+    last error line entirely, so we stream the whole file. That's still
+    bounded by disk speed and runs once per trial — acceptable.
     """
     import json as _json
-    from pathlib import Path as _Path
 
     if not proxy_jsonl_path:
         return ""
-    path = _Path(str(proxy_jsonl_path))
-    if not path.is_file():
-        return ""
     last_error_parts: list[str] = []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    entry = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("status") or "").lower() != "error":
-                    continue
-                err = str(entry.get("error_text") or entry.get("error") or "")
-                body = ""
-                for k in ("upstream_response_body", "upstream_text", "raw_response"):
-                    v = entry.get(k)
-                    if isinstance(v, str) and v:
-                        body = v
-                        break
-                    if isinstance(v, dict):
-                        body = _json.dumps(v, ensure_ascii=False)
-                        break
-                status_code = entry.get("upstream_status_code")
-                sc = f"http {status_code}" if isinstance(status_code, int) else ""
-                # Keep overwriting so we end up with the *last* error entry.
-                last_error_parts = [p for p in (sc, err, body) if p]
+        for entry in iter_jsonl_entries(proxy_jsonl_path):
+            if str(entry.get("status") or "").lower() != "error":
+                continue
+            err = str(entry.get("error_text") or entry.get("error") or "")
+            body = ""
+            for k in ("upstream_response_body", "upstream_text", "raw_response"):
+                v = entry.get(k)
+                if isinstance(v, str) and v:
+                    body = v
+                    break
+                if isinstance(v, dict):
+                    body = _json.dumps(v, ensure_ascii=False)
+                    break
+            status_code = entry.get("upstream_status_code")
+            sc = f"http {status_code}" if isinstance(status_code, int) else ""
+            # Keep overwriting so we end up with the *last* error entry.
+            last_error_parts = [p for p in (sc, err, body) if p]
     except OSError:
         return ""
     return " | ".join(last_error_parts)
 
 
-def _count_proxy_jsonl_budgeted_rounds(proxy_jsonl_path: object) -> int:
-    """Count the **root agent's** decision rounds in ``proxy.jsonl``.
+@dataclass(frozen=True)
+class RoundBudgetUsage:
+    """How a trial's recorded calls map onto the ``max_rounds`` budget.
 
-    The proxy records every upstream call for audit, flat and interleaved:
-    failed attempts, context-compaction bookkeeping, the harness's own
-    background/auxiliary calls, and any subagents the root delegates to. Only
-    the *root* conversation's non-compaction turns are agent decisions that
-    spend ``max_rounds`` — a subagent's loop, a background title call, and a
-    compaction-continuation must not.
+    Two numbers, because two different things are being asked:
 
-    We reconstruct the conversation forest (see
-    :mod:`cage.proxy.conversations`) and return its root-only round count, so a
-    delegating trial is not mis-classified as having exhausted its round budget.
-    Codex's explicit ``/compact`` rewrites are dropped before reconstruction.
+    ``billed`` — what the **enforcer** counted. The in-container proxy admits a
+    request only while its own counter is below ``max_rounds``, then
+    429-rejects, and it publishes that counter as ``successful_requests`` in
+    ``progress.json``. We read that number rather than recompute it: the
+    sidecar may not import cage code (it ships as a lone file into every agent
+    container), so any rule expressed in host code is a *second*
+    implementation of it, and the two drift. They already did once — the host
+    refined its recount to root-only turns, the enforcer kept charging every
+    call, and a trial stopped at its 500th admitted call reported "476/500".
+    Rules cross that boundary as data, not as duplicated code. Recomputing
+    from ``proxy.jsonl`` stays only as the fallback for trials whose
+    ``progress.json`` is missing.
+
+    ``root_rounds`` — what the agent actually got to *decide*. The proxy log is
+    flat and interleaved: subagent loops, the harness's own auxiliary calls
+    (a WebSearch helper, a background title call) and context-compaction calls
+    all land in it. Reconstructing the conversation forest (see
+    :mod:`cage.proxy.conversations`) and counting only the root conversation's
+    non-compaction turns says how much of the budget was real agent thinking.
+
+    The rest of the budget is split rather than lumped, because the two kinds
+    cost the same but mean opposite things: ``compaction`` is the agent's own
+    context being folded up (a handful per trial), while ``tool_side`` is what
+    the harness sent beside the main conversation on a tool's behalf — one
+    single-message call per WebSearch, one per fetched page, a subagent's whole
+    loop — which is where a budget quietly drains. Lumping them reads as "this
+    trial compacted 24 times", which is exactly the kind of collapsed number
+    this verdict already got wrong once.
+
+    ``root_rounds + compaction + tool_side == billed`` always: ``tool_side``
+    absorbs the few audit-only entries (bodyless retries) that ``root_rounds``
+    drops, so the parts never fail to add up to the number that was enforced.
     """
-    import json as _json
+
+    billed: int
+    root_rounds: int
+    compaction: int
+    tool_side: int
+
+
+def _enforcer_billed_rounds(proxy_jsonl_path: object) -> int | None:
+    """The round count the in-container proxy itself charged, or None.
+
+    ``progress.json`` sits beside ``proxy.jsonl`` and is written by the
+    enforcer as it runs, so it answers "how many calls did this trial spend"
+    without the host re-deriving the rule. ``successful_requests`` is exactly
+    the admission counter (successes minus tagged compact rewrites); the older
+    ``success`` field is accepted for logs written before it was split out.
+    """
     from pathlib import Path as _Path
 
-    from cage.proxy.conversations import reconstruct_forest
+    from cage.contracts.jsonio import load_json_file
 
     if not proxy_jsonl_path:
-        return 0
-    path = _Path(str(proxy_jsonl_path))
-    if not path.is_file():
-        return 0
+        return None
+    progress = load_json_file(_Path(str(proxy_jsonl_path)).with_name("progress.json"))
+    if not isinstance(progress, dict):
+        return None
+    for key in ("successful_requests", "success"):
+        value = progress.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+
+def _proxy_round_budget_usage(proxy_jsonl_path: object) -> RoundBudgetUsage:
+    """Read one trial's round counters: billed by the enforcer, split by us."""
+    from cage.proxy.conversations import reconstruct_forest
+
+    empty = RoundBudgetUsage(billed=0, root_rounds=0, compaction=0, tool_side=0)
+    if not proxy_jsonl_path:
+        return empty
+    enforcer_billed = _enforcer_billed_rounds(proxy_jsonl_path)
     entries: list[dict] = []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    entry = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("status") or "").lower() != "success":
-                    continue
-                openai_request = entry.get("openai_request")
-                if (
-                    isinstance(openai_request, dict)
-                    and openai_request.get("_proxy_compact_rewritten")
-                ):
-                    continue
-                entries.append(entry)
+        for entry in iter_jsonl_entries(proxy_jsonl_path):
+            if str(entry.get("status") or "").lower() != "success":
+                continue
+            openai_request = entry.get("openai_request")
+            if (
+                isinstance(openai_request, dict)
+                and openai_request.get("_proxy_compact_rewritten")
+            ):
+                continue
+            entries.append(entry)
     except OSError:
-        return 0
+        entries = []
     if not entries:
-        return 0
-    return reconstruct_forest(entries).root_rounds
+        # No usable log: the enforcer's own count is still the truth about the
+        # budget, even when the records behind it are gone.
+        if enforcer_billed:
+            return RoundBudgetUsage(
+                billed=enforcer_billed, root_rounds=0, compaction=0, tool_side=0
+            )
+        return empty
+    forest = reconstruct_forest(entries)
+    # Counting the log is the fallback, not the answer: it agrees with the
+    # enforcer today, and re-deriving it here is how the two drifted before.
+    billed = enforcer_billed if enforcer_billed is not None else len(entries)
+    # The breakdown is ours to derive, but it is reported against the
+    # enforcer's total — so clamp the parts to fit it. They only need clamping
+    # when the log and the counter disagree (a truncated or trimmed log), and
+    # then a breakdown that overflows its own total would be worse than a
+    # conservative one.
+    root_rounds = min(forest.root_rounds, billed)
+    compaction = min(
+        int(forest.structure.get("num_compactions", 0) or 0), billed - root_rounds
+    )
+    return RoundBudgetUsage(
+        billed=billed,
+        root_rounds=root_rounds,
+        compaction=compaction,
+        tool_side=billed - root_rounds - compaction,
+    )
 
 
 def _proxy_usage_cost(entry: dict) -> float | None:
@@ -435,25 +476,15 @@ def _proxy_budget_usage(proxy_jsonl_path: object) -> dict[str, float | int]:
     try:
         from cage.proxy.usage import extract_entry_usage
 
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    entry = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("status") or "").lower() != "success":
-                    continue
-                tokens = extract_entry_usage(entry)
-                usage["input_tokens"] = int(usage["input_tokens"]) + tokens["input_tokens"]
-                usage["output_tokens"] = int(usage["output_tokens"]) + tokens["output_tokens"]
-                cost = _proxy_usage_cost(entry)
-                if cost is not None:
-                    usage["cost_usd"] = float(usage["cost_usd"]) + cost
+        for entry in iter_jsonl_entries(path):
+            if str(entry.get("status") or "").lower() != "success":
+                continue
+            tokens = extract_entry_usage(entry)
+            usage["input_tokens"] = int(usage["input_tokens"]) + tokens["input_tokens"]
+            usage["output_tokens"] = int(usage["output_tokens"]) + tokens["output_tokens"]
+            cost = _proxy_usage_cost(entry)
+            if cost is not None:
+                usage["cost_usd"] = float(usage["cost_usd"]) + cost
     except OSError:
         return usage
     return usage

@@ -1,0 +1,1927 @@
+{
+  "components": {
+    "schemas": {
+      "Body_submit_challenge_submit__run_id__post": {
+        "properties": {
+          "agent_output": {
+            "anyOf": [
+              {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "tar.gz/zip of the agent output dir (its final_answer/ holds per-vuln reports). Omit for marker-only post-exploitation challenges. Bodies over the server's upload limit (1 GiB default) are rejected with 413.",
+            "title": "Agent Output"
+          }
+        },
+        "title": "Body_submit_challenge_submit__run_id__post",
+        "type": "object"
+      },
+      "ChallengeSummary": {
+        "description": "Public-facing projection of a challenge, returned by ``GET /challenges``.\n\nStrictly excludes flag, verify scripts, ``agent_input``, and any\n``source_fields`` content. The list endpoint is safe to expose to\nexternal callers carrying the bearer token.",
+        "properties": {
+          "benchmark": {
+            "description": "`\"\"` when unknown.",
+            "title": "Benchmark",
+            "type": "string"
+          },
+          "category": {
+            "description": "Falls back to the literal string `unknown` when unset — NOT `\"\"`, unlike the sibling `benchmark` field.",
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "entry_service_count": {
+            "title": "Entry Service Count",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Pass to `GET /launch/{chal_id}`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "objective_count": {
+            "default": 0,
+            "description": "How many objectives this challenge is scored out of — the denominator a result's progress is measured against, known before the challenge is ever launched. `0` when the challenge declares none. Pairs with the `objective_achieved` / `objective_total` the scorer reports, so the same number is used end to end.",
+            "title": "Objective Count",
+            "type": "integer"
+          },
+          "objective_kind": {
+            "default": "",
+            "description": "What one objective IS for this challenge — `vulnerability` for a single-target app, `host` for a multi-host range; `\"\"` when unknown. A range counts hosts it is possible to own, not marker stages: several stages can belong to one host, and a host offering only a file read can never be owned. The count above is uniform whatever the noun, so a caller reads a denominator without branching on the challenge's shape.",
+            "title": "Objective Kind",
+            "type": "string"
+          },
+          "task_profile": {
+            "title": "Task Profile",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "benchmark",
+          "category",
+          "description",
+          "task_profile",
+          "entry_service_count"
+        ],
+        "title": "ChallengeSummary",
+        "type": "object"
+      },
+      "EntryUrl": {
+        "description": "A user-facing target entry point published to host network.\n\nOnly returned for ``audience=external`` callers. ``role`` is the\nservice name from the challenge's ``application_service_keys``\n(e.g. ``web``, ``entry_web``, ``ssh_jump``); ``url`` is the\nfull address an external client should hit (``http://<host>:<port>``\nfor HTTP, ``<host>:<port>`` otherwise).",
+        "properties": {
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "port": {
+            "title": "Port",
+            "type": "integer"
+          },
+          "protocol": {
+            "default": "tcp",
+            "title": "Protocol",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "role",
+          "url",
+          "host",
+          "port"
+        ],
+        "title": "EntryUrl",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "InstanceSummary": {
+        "description": "A running target instance, projected for the management console.\n\nReturned by ``GET /instances``. Public-safe: carries only the operational\nfacts a console needs (what is running, since when, is it healthy, where\nare its entry points) and never a flag, verify script, or scoring secret.\n``entry_urls`` is populated for external callers exactly like\n:class:`LaunchResponse`; internal callers get the docker-internal view.",
+        "properties": {
+          "audience": {
+            "default": "",
+            "description": "One of `internal`, `external`, or `\"\"`. Decides whether `entry_urls` is populated.",
+            "title": "Audience",
+            "type": "string"
+          },
+          "benchmark": {
+            "default": "",
+            "description": "Owning benchmark; `\"\"` if unknown.",
+            "title": "Benchmark",
+            "type": "string"
+          },
+          "cage_run_id": {
+            "default": "",
+            "description": "Owning cage run, or `\"\"` when standalone. Never null.",
+            "title": "Cage Run Id",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "description": "Challenge category; `\"\"` if unknown.",
+            "title": "Category",
+            "type": "string"
+          },
+          "chal_id": {
+            "description": "Challenge id this instance was launched from.",
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "container_addr": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Container Addr",
+            "type": "array"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Launch time as an RFC 3339 / ISO 8601 UTC timestamp, second precision (`2026-07-19T16:12:57Z`). Null if the instance predates timestamp tracking. NOTE: the value is stamped when the launch STARTS and re-stamped when it completes, so for an instance observed mid-launch it can move forward (and `uptime_s` drop back toward 0) between polls — do not rely on it being monotonic.",
+            "example": "2026-07-19T16:12:57Z",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "entry_url_source": {
+            "default": "",
+            "title": "Entry Url Source",
+            "type": "string"
+          },
+          "entry_urls": {
+            "description": "Host-reachable entry points. ALWAYS `[]` for `audience=internal`, and `[]` under the default `network_only=true` because no host port is published. An empty list does NOT imply a broken instance — use `container_addr` for the on-network view.",
+            "items": {
+              "$ref": "#/components/schemas/EntryUrl"
+            },
+            "title": "Entry Urls",
+            "type": "array"
+          },
+          "healthy": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TRI-STATE. `true`/`false` only when called with `?probe=true`; otherwise null. Null ALSO means the probe itself errored, so null is 'unknown', never 'unhealthy'. Do not collapse null to false.",
+            "title": "Healthy"
+          },
+          "lifecycle_state": {
+            "default": "",
+            "description": "One of `launching`, `waiting_health`, `running`, `restarting`, `stopping`, `cleanup`, or `\"\"`. Treat unknown values as in-transition rather than failing — new states may be added.",
+            "title": "Lifecycle State",
+            "type": "string"
+          },
+          "network_gateway": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Gateway IPv4 of the network.",
+            "title": "Network Gateway"
+          },
+          "network_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Isolated docker network name.",
+            "title": "Network Name"
+          },
+          "network_subnet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CIDR, e.g. `172.31.4.0/24`.",
+            "title": "Network Subnet"
+          },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
+          },
+          "run_id": {
+            "description": "Instance handle — pass this to `/prompt`, `/submit`, and `DELETE /launch`. Equal to `chal_id` under `target_scope=per_challenge` and for static targets; `<chal_id>_<8 hex>` under `per_agent`. Do not assume it differs from `chal_id`.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "service_count": {
+            "default": 0,
+            "description": "Containers in this instance.",
+            "title": "Service Count",
+            "type": "integer"
+          },
+          "target_scope": {
+            "default": "",
+            "description": "One of `per_challenge`, `per_agent`, or `\"\"`.",
+            "title": "Target Scope",
+            "type": "string"
+          },
+          "ttl_remaining_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Remaining S"
+          },
+          "ttl_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl S"
+          },
+          "uptime_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Seconds since `created_at`, rounded to 0.1. Server-computed, so it needs no clock sync with the caller. Null when `created_at` is null.",
+            "example": 137.4,
+            "title": "Uptime S",
+            "x-unit": "seconds"
+          }
+        },
+        "required": [
+          "run_id",
+          "chal_id"
+        ],
+        "title": "InstanceSummary",
+        "type": "object"
+      },
+      "LaunchOpError": {
+        "properties": {
+          "code": {
+            "description": "Machine-readable failure code, e.g. prompt_unavailable, startup_failed.",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable detail.",
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "description": "Whether a fresh launch (new cage_run_id) might succeed.",
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "LaunchOpError",
+        "type": "object"
+      },
+      "LaunchOpRequest": {
+        "description": "Body of ``POST /launches`` — a durable, idempotent launch operation.\n\n``cage_run_id`` is the caller's stable correlation id AND the operation id:\nrepeating the POST with the same id + params returns the same operation and\nnever builds a second container set; the same id with different params is a\n``409``. Everything else mirrors ``GET /launch`` query params.",
+        "properties": {
+          "cage_run_id": {
+            "description": "Stable caller-supplied id; the launch operation's identity. Required.",
+            "title": "Cage Run Id",
+            "type": "string"
+          },
+          "challenge_id": {
+            "description": "Challenge to launch.",
+            "title": "Challenge Id",
+            "type": "string"
+          },
+          "exposure_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "host_ports | internal.",
+            "title": "Exposure Mode"
+          },
+          "network_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "compose_project_local | shared_external.",
+            "title": "Network Mode"
+          },
+          "network_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Keep the target on the docker network only. Default follows the server (off on a --public-host server).",
+            "title": "Network Only"
+          },
+          "parallel_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "network | alias.",
+            "title": "Parallel Mode"
+          },
+          "prompt_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hint tier l0/l1/l2 bound to this instance. Default: the server's --prompt-level.",
+            "title": "Prompt Level"
+          },
+          "target_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "per_agent | per_challenge.",
+            "title": "Target Scope"
+          },
+          "ttl": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lease in seconds; the instance is reaped when it expires.",
+            "title": "Ttl"
+          }
+        },
+        "required": [
+          "cage_run_id",
+          "challenge_id"
+        ],
+        "title": "LaunchOpRequest",
+        "type": "object"
+      },
+      "LaunchOpResult": {
+        "description": "The complete, Fleet-consumable result of a ``ready`` launch operation.",
+        "properties": {
+          "chal_id": {
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "container_addr": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Container Addr",
+            "type": "array"
+          },
+          "entry_urls": {
+            "items": {
+              "$ref": "#/components/schemas/EntryUrl"
+            },
+            "title": "Entry Urls",
+            "type": "array"
+          },
+          "network_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Network Name"
+          },
+          "network_subnet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Network Subnet"
+          },
+          "prompt_level": {
+            "default": "l0",
+            "title": "Prompt Level",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "task_prompt": {
+            "default": "",
+            "title": "Task Prompt",
+            "type": "string"
+          },
+          "task_prompt_template": {
+            "default": "",
+            "title": "Task Prompt Template",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "chal_id"
+        ],
+        "title": "LaunchOpResult",
+        "type": "object"
+      },
+      "LaunchOpStatus": {
+        "description": "One authoritative representation of a launch operation.\n\nReturned by ``POST /launches`` (202 while pending) and ``GET /launches/{id}``.\n``status`` is a small state machine: ``queued`` → ``starting`` → ``ready`` |\n``failed``; and ``... → closing → closed`` on cancel. ``result`` is present\nonly for ``ready``; ``error`` only for ``failed``/``closed``. ``ready``\nguarantees a non-empty ``run_id``, a reachable target address, and a non-empty\n``task_prompt`` — treat it as \"go\" with no second discovery step.",
+        "properties": {
+          "cage_run_id": {
+            "title": "Cage Run Id",
+            "type": "string"
+          },
+          "challenge_id": {
+            "title": "Challenge Id",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchOpError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "launch_id": {
+            "title": "Launch Id",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchOpResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retry_after": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Seconds to wait before re-polling (pending states only).",
+            "title": "Retry After"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "status_url": {
+            "title": "Status Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "launch_id",
+          "cage_run_id",
+          "challenge_id",
+          "status",
+          "status_url"
+        ],
+        "title": "LaunchOpStatus",
+        "type": "object"
+      },
+      "LaunchResponse": {
+        "description": "Result of ``GET /launch/{chal_id}``.",
+        "properties": {
+          "chal_id": {
+            "description": "Challenge id that was launched.",
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "container_addr": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Container Addr",
+            "type": "array"
+          },
+          "debug": {
+            "additionalProperties": true,
+            "description": "FREE-FORM network diagnostics, best-effort. Keys are OMITTED rather than nulled when a value could not be resolved, and the whole block is replaced by `{\"error\": \"...\"}` on failure. Read defensively; for human debugging only — never branch program logic on it.",
+            "title": "Debug",
+            "type": "object"
+          },
+          "entry_url_source": {
+            "default": "",
+            "title": "Entry Url Source",
+            "type": "string"
+          },
+          "entry_urls": {
+            "description": "See `InstanceSummary.entry_urls` — `[]` is normal, not an error.",
+            "items": {
+              "$ref": "#/components/schemas/EntryUrl"
+            },
+            "title": "Entry Urls",
+            "type": "array"
+          },
+          "network_gateway": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for `status=static`.",
+            "title": "Network Gateway"
+          },
+          "network_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for `status=static`.",
+            "title": "Network Name"
+          },
+          "network_subnet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for `status=static`.",
+            "title": "Network Subnet"
+          },
+          "project_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Docker compose project. Null for `status=static`.",
+            "title": "Project Name"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Instance handle for follow-up calls. See `InstanceSummary.run_id`.",
+            "title": "Run Id"
+          },
+          "scoring": {
+            "additionalProperties": true,
+            "description": "FREE-FORM, passed through verbatim from the challenge definition. Its shape is owned by the benchmark, not by this server, and varies between benchmarks. Do not code-generate a type from one sample.",
+            "title": "Scoring",
+            "type": "object"
+          },
+          "services": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ServiceInfo"
+            },
+            "title": "Services",
+            "type": "array"
+          },
+          "status": {
+            "description": "One of `launched` (fresh), `recreated` (replaced a stale instance), `reused` (an existing healthy instance was returned — no new containers), or `static` (a pre-existing target, not managed here). `reused` means you may be sharing state with an earlier caller.",
+            "title": "Status",
+            "type": "string"
+          },
+          "ttl_remaining_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Remaining S"
+          },
+          "ttl_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl S"
+          }
+        },
+        "required": [
+          "status",
+          "chal_id"
+        ],
+        "title": "LaunchResponse",
+        "type": "object"
+      },
+      "PromptResponse": {
+        "description": "Agent-facing task briefing for a launched instance (``GET /prompt/{run_id}``).\n\nTwo forms of the benchmark's own ``build_prompt`` output — the SAME briefing a\nCAGE-managed agent receives as ``{task_instruction}``:\n\n- ``task_prompt`` — ready to hand to your agent as-is: the live target\n  address(es) of THIS instance are filled in. This is the one you use.\n- ``task_prompt_template`` — the same briefing with the target address(es)\n  shown as placeholder tokens (the un-filled template).\n\n``prompt_level`` is the OPERATOR-selected hint tier\n(``cage benchmark serve --prompt-level``); an agent cannot raise it. Both\nstrings are empty if the benchmark exposes no ``build_prompt``.",
+        "properties": {
+          "chal_id": {
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "prompt_level": {
+            "default": "l0",
+            "title": "Prompt Level",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "task_profile": {
+            "default": "",
+            "title": "Task Profile",
+            "type": "string"
+          },
+          "task_prompt": {
+            "default": "",
+            "title": "Task Prompt",
+            "type": "string"
+          },
+          "task_prompt_template": {
+            "default": "",
+            "title": "Task Prompt Template",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "chal_id"
+        ],
+        "title": "PromptResponse",
+        "type": "object"
+      },
+      "RescoreOpError": {
+        "properties": {
+          "code": {
+            "description": "Machine-readable failure code, e.g. RescoreError.",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable detail.",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "RescoreOpError",
+        "type": "object"
+      },
+      "RescoreOpResult": {
+        "description": "What a finished re-judge produced.",
+        "properties": {
+          "benchmark_module": {
+            "default": "",
+            "title": "Benchmark Module",
+            "type": "string"
+          },
+          "chal_id": {
+            "default": "",
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "changed": {
+            "default": false,
+            "description": "Whether any scorer's numeric value moved.",
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "from_record": {
+            "default": false,
+            "description": "True when this verdict was read back from the submission record rather than produced by the polled operation (e.g. after a serve restart).",
+            "title": "From Record",
+            "type": "boolean"
+          },
+          "grader_drift": {
+            "default": false,
+            "description": "True means the verifier scripts / ground truth changed since this submission was graded. The frozen verifier verdicts still reflect the OLD ones — a re-judge cannot account for that, only a fresh launch can.",
+            "title": "Grader Drift",
+            "type": "boolean"
+          },
+          "inputs_digest": {
+            "default": "",
+            "title": "Inputs Digest",
+            "type": "string"
+          },
+          "inputs_unchanged": {
+            "default": true,
+            "description": "False means the frozen evidence or findings changed on disk since the original scoring, so this pass is NOT comparable to it.",
+            "title": "Inputs Unchanged",
+            "type": "boolean"
+          },
+          "judge_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Judge Models",
+            "type": "array"
+          },
+          "pass_count": {
+            "default": 0,
+            "description": "Total scoring passes on this submission, the original included.",
+            "title": "Pass Count",
+            "type": "integer"
+          },
+          "pass_id": {
+            "default": "",
+            "description": "Id of the pass just written; now the canonical verdict.",
+            "title": "Pass Id",
+            "type": "string"
+          },
+          "previous_pass_id": {
+            "default": "",
+            "description": "The pass this one superseded as canonical.",
+            "title": "Previous Pass Id",
+            "type": "string"
+          },
+          "previous_scores": {
+            "additionalProperties": true,
+            "description": "The superseded verdict, for comparison.",
+            "title": "Previous Scores",
+            "type": "object"
+          },
+          "run_id": {
+            "default": "",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scored_at": {
+            "default": 0.0,
+            "description": "Unix time this pass was scored.",
+            "title": "Scored At",
+            "type": "number"
+          },
+          "scores": {
+            "additionalProperties": true,
+            "description": "The new verdict, per scorer: {value, answer, explanation, metadata}.",
+            "title": "Scores",
+            "type": "object"
+          },
+          "submission_dir": {
+            "default": "",
+            "description": "Local path of the submission record this verdict was written to.",
+            "title": "Submission Dir",
+            "type": "string"
+          },
+          "submission_id": {
+            "default": "",
+            "title": "Submission Id",
+            "type": "string"
+          }
+        },
+        "title": "RescoreOpResult",
+        "type": "object"
+      },
+      "RescoreOpStatus": {
+        "description": "One authoritative representation of a re-judge operation.\n\nReturned by ``POST /rescores`` (202 while pending) and\n``GET /rescores/{run_id}``. ``status`` is a small state machine:\n``queued`` → ``running`` → ``done`` | ``failed``. ``result`` is present for\n``done``; ``error`` only for ``failed``.\n\nThe operation id is the ``run_id``, so a re-POST while one is still pending\nreturns that same operation rather than starting a competing re-judge of the\nsame submission. Re-POSTing a finished one starts a fresh re-judge — that is\nthe whole point of the endpoint.",
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "description": "How many re-judges have been started for this submission in this server's lifetime.",
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RescoreOpError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RescoreOpResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retry_after": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Seconds to wait before re-polling (pending states only).",
+            "title": "Retry After"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "status_url": {
+            "title": "Status Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "status",
+          "status_url"
+        ],
+        "title": "RescoreOpStatus",
+        "type": "object"
+      },
+      "RescoreRequest": {
+        "description": "Body of ``POST /rescores`` — re-judge one already-scored submission.\n\nRe-runs the OFFLINE half of scoring for the submission produced by\n``run_id``: the ``LLM_judge`` signal is re-evaluated against the findings\nfrozen at submit time, while the verifier verdicts — gathered back when the\ntarget was still running — are reproduced from the frozen evidence, not\nre-run. No instance needs to be alive.\n\nUse it when a verdict is wrong for reasons outside the agent's submission:\nan expired judge API key, a rate-limited judge, a judge model being\nreplaced. It never alters the agent's findings, and every pass is kept.",
+        "properties": {
+          "judge_models": {
+            "description": "Judge model id(s) to score with. Default: the server's own judge configuration.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Judge Models",
+            "type": "array"
+          },
+          "run_id": {
+            "description": "Launch id of the submission to re-judge; also the operation's identity.",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "RescoreRequest",
+        "type": "object"
+      },
+      "ServiceInfo": {
+        "description": "One container in a launched instance.\n\n``host``/``port`` are the address to use **for your audience**: an internal\ncaller gets the docker alias, an external caller gets the published host\naddress. The ``inner_*`` / ``internal_*`` / ``external_*`` fields expose both\nviews explicitly when you need to disambiguate.",
+        "properties": {
+          "alias": {
+            "description": "Docker network alias of the container.",
+            "title": "Alias",
+            "type": "string"
+          },
+          "external_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host-published address, external audience only.",
+            "title": "External Host"
+          },
+          "external_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host-published port. Always present; null when nothing was published — which is the DEFAULT (`network_only=true`), not an error.",
+            "title": "External Port"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Address for the caller's audience — docker alias (internal) or the published host IP (external). Null if unresolved.",
+            "title": "Host"
+          },
+          "inner_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Docker-internal hostname.",
+            "title": "Inner Host"
+          },
+          "inner_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Docker-internal IPv4, resolved AFTER the health check. Null while the instance is still starting, or if resolution failed.",
+            "title": "Inner Ip"
+          },
+          "inner_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Docker-internal port.",
+            "title": "Inner Port"
+          },
+          "internal_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Port inside the container. Always present; null if undeclared.",
+            "title": "Internal Port"
+          },
+          "ip": {
+            "description": "Container IPv4 on the isolated docker network.",
+            "title": "Ip",
+            "type": "string"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Port matching `host`; mirrors `external_port`.",
+            "title": "Port"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "One of `tcp`, `udp`, `http`, or null. Null for dependency services that declare no protocol. Web-category targets are promoted to `http` after the health check, so this can differ from the value a challenge file declares.",
+            "title": "Protocol"
+          },
+          "service_name": {
+            "description": "Service key from the challenge definition.",
+            "title": "Service Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_name",
+          "alias",
+          "ip",
+          "internal_port",
+          "external_port"
+        ],
+        "title": "ServiceInfo",
+        "type": "object"
+      },
+      "StopResponse": {
+        "description": "Result of ``DELETE /launch/{chal_id}``.",
+        "properties": {
+          "chal_id": {
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "container_logs": {
+            "description": "Container logs captured just before purge, for audit. Entries are NOT uniform: the normal shape is `{name, service, status, exit_code, error, logs}`, but an entry that failed to collect carries only `{name, error}` — no `logs`/`status`/`exit_code`. Access by `.get()`, not by index. Empty when the instance was already gone.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Container Logs",
+            "type": "array"
+          },
+          "message": {
+            "description": "Free prose, not machine-readable.",
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "description": "Always the literal `stopped` — INCLUDING the no-op case where no such instance existed. Not a success/failure discriminator; read `message` to tell the two apart.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "chal_id",
+          "message"
+        ],
+        "title": "StopResponse",
+        "type": "object"
+      },
+      "SubmitResponse": {
+        "description": "Verdict for a serve-only submission, returned by ``POST /submit/{run_id}``.\n\nThe server gathered live evidence against the still-running instance and\nscored the submission with the challenge's benchmark scorer. ``scores`` maps\neach scorer name to ``{value, answer, explanation, metadata}``. ``run_dir``\nis the ``.cage_runs`` path the verdict was persisted to — the same tree the\ncage inspector renders, so a submission is inspectable exactly like a\ncage-run trial. ``closed`` reports whether the instance was torn down after\nscoring (``?close=true``).\n\n**One submission per instance.** The score is locked in on the first submit;\na repeat call for the same ``run_id`` returns that recorded verdict unchanged\nwith ``already_submitted=true`` (an agent cannot resubmit to fish for a\npass). To make another attempt, launch a fresh instance.",
+        "properties": {
+          "already_submitted": {
+            "default": false,
+            "description": "True when this is a replay of a previously locked-in verdict.",
+            "title": "Already Submitted",
+            "type": "boolean"
+          },
+          "benchmark_module": {
+            "default": "",
+            "description": "Filesystem path of the scoring module, for audit.",
+            "title": "Benchmark Module",
+            "type": "string"
+          },
+          "chal_id": {
+            "title": "Chal Id",
+            "type": "string"
+          },
+          "closed": {
+            "default": false,
+            "description": "Whether the instance was torn down after scoring (`?close=true`). On the `already_submitted=true` replay path this is always `false` even if the FIRST submit did close the instance — check `GET /instances` if you need the real current state.",
+            "title": "Closed",
+            "type": "boolean"
+          },
+          "run_dir": {
+            "default": "",
+            "description": "`.cage_runs` path the verdict persisted to.",
+            "title": "Run Dir",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scores": {
+            "additionalProperties": true,
+            "description": "Maps scorer name to `{value, answer, explanation, metadata}`. `value` is normally a float, but a scorer may return `bool`/`int`/null and nothing coerces it — compare numerically, do not assume float. `metadata` is free-form, and a custom scorer may add keys beyond the four listed.",
+            "title": "Scores",
+            "type": "object"
+          },
+          "status": {
+            "default": "scored",
+            "description": "Always the literal `scored`. Not a discriminator — a scored FAIL and a scored PASS both report `scored`. Read `scores[*].value` for the verdict.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "chal_id"
+        ],
+        "title": "SubmitResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Serve (PULL) mode: an external agent lists challenges, launches an isolated target instance, attacks it, and submits its output for scoring — with no Cage-managed agent runtime.\n\nEndpoints are audience-gated: loopback callers are internal; non-loopback callers need `Authorization: Bearer <token>` when the server was started with `--external-token`.\n\nSee `docs/serve-external-audience.md` in the Cage repo for the narrative contract, deployment model and worked examples.",
+    "title": "Cage target server",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/challenges": {
+      "get": {
+        "description": "List challenges with public-safe metadata only.\n\nStrictly excludes flag, verify scripts, ``agent_input``, and any\n``source_fields`` content. ``entry_service_count`` is the number of\nuser-facing entry services (web challenges declare them as\n``application_service_keys``, post-exploitation ranges as ``entry_services``):\n1 for a single-entry web challenge, 2+ for a multi-entry range.\n\n``objective_count`` is what a result is scored out of, available here BEFORE\nanything is launched, with ``objective_kind`` naming the unit\n(``vulnerability`` / ``marker``). It is the same number the scorer later\nreports as ``objective_total``. Note that it is NOT ``entry_service_count``:\na range can publish more entry services than it has objectives.\n\nAuthentication is the same as ``/launch``: loopback OR bearer token.",
+        "operationId": "list_challenges_challenges_get",
+        "parameters": [
+          {
+            "description": "Filter by benchmark name (exact match).",
+            "in": "query",
+            "name": "benchmark",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by benchmark name (exact match).",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "description": "Filter by category (exact match).",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by category (exact match).",
+              "title": "Category"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChallengeSummary"
+                  },
+                  "title": "Response List Challenges Challenges Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Challenges"
+      }
+    },
+    "/instances": {
+      "get": {
+        "description": "List every target instance this server currently has running.\n\nThe management view the launch/stop API always lacked: without it a\nconsole can start and kill targets but never *see* what is up. Public-safe\n(no flag / verify / scoring secret) and audience-gated exactly like\n``/challenges`` and ``/launch``.",
+        "operationId": "list_instances_instances_get",
+        "parameters": [
+          {
+            "description": "Run a live per-instance docker health check (slower). Default: report only the cached lifecycle_state.",
+            "in": "query",
+            "name": "probe",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Run a live per-instance docker health check (slower). Default: report only the cached lifecycle_state.",
+              "title": "Probe",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/InstanceSummary"
+                  },
+                  "title": "Response List Instances Instances Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Instances"
+      }
+    },
+    "/launch/{chal_id}": {
+      "delete": {
+        "description": "Stop and clean up exactly one running challenge target.\n\n``run_id`` is mandatory. A DELETE that didn't carry it used to fall\nthrough to ``cleanup_instance(chal_id, run_id=None)`` which, combined\nwith the registry's old chal_id-fallback lookup, silently destroyed\n*some other agent's* per_agent instance. Both halves of that bug have\nbeen removed: registry helpers are now strict-key-only, and this\nendpoint refuses calls that don't name a specific instance.",
+        "operationId": "stop_challenge_launch__chal_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chal_id",
+            "required": true,
+            "schema": {
+              "title": "Chal Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Specific runtime instance id to stop. REQUIRED — DELETE always operates on exactly one instance.",
+            "in": "query",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "Specific runtime instance id to stop. REQUIRED — DELETE always operates on exactly one instance.",
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StopResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Challenge"
+      },
+      "get": {
+        "operationId": "launch_challenge_launch__chal_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chal_id",
+            "required": true,
+            "schema": {
+              "title": "Chal Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "If true, shutdown existing instance and create a fresh one.",
+            "in": "query",
+            "name": "force_recreate",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "If true, shutdown existing instance and create a fresh one.",
+              "title": "Force Recreate",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Parallelization strategy: network or alias.",
+            "in": "query",
+            "name": "parallel_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Parallelization strategy: network or alias.",
+              "title": "Parallel Mode"
+            }
+          },
+          {
+            "description": "Target allocation scope: per_challenge or per_agent.",
+            "in": "query",
+            "name": "target_scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Target allocation scope: per_challenge or per_agent.",
+              "title": "Target Scope"
+            }
+          },
+          {
+            "description": "Compose launch mode: compose_project_local or shared_external. Experiment default; challenge.json wins if it declares one.",
+            "in": "query",
+            "name": "network_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Compose launch mode: compose_project_local or shared_external. Experiment default; challenge.json wins if it declares one.",
+              "title": "Network Mode"
+            }
+          },
+          {
+            "description": "Service exposure: host_ports or internal. Experiment default; challenge.json wins if it declares one. Independent of network_only.",
+            "in": "query",
+            "name": "exposure_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Service exposure: host_ports or internal. Experiment default; challenge.json wins if it declares one. Independent of network_only.",
+              "title": "Exposure Mode"
+            }
+          },
+          {
+            "description": "Cage-side run id. Stamped as cage.run_id label on every container/network.",
+            "in": "query",
+            "name": "cage_run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cage-side run id. Stamped as cage.run_id label on every container/network.",
+              "title": "Cage Run Id"
+            }
+          },
+          {
+            "description": "Keep this target on the docker network only (no host port) — reach it via the returned container_addr. Default: on for a normal server, OFF on a --public-host server (which publishes every launch's declared entry). Pass network_only=true to keep one launch off the host even on a --public-host server; network_only=false to host-publish one launch on a normal server.",
+            "in": "query",
+            "name": "network_only",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Keep this target on the docker network only (no host port) — reach it via the returned container_addr. Default: on for a normal server, OFF on a --public-host server (which publishes every launch's declared entry). Pass network_only=true to keep one launch off the host even on a --public-host server; network_only=false to host-publish one launch on a normal server.",
+              "title": "Network Only"
+            }
+          },
+          {
+            "description": "Hint tier (l0/l1/l2) bound to THIS instance for GET /prompt. l0 = no hints; l1/l2 progressively reveal vuln location / topology. Default: the server's --prompt-level. Set per-launch so instances on one server can differ without restarting serve.",
+            "in": "query",
+            "name": "prompt_level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Hint tier (l0/l1/l2) bound to THIS instance for GET /prompt. l0 = no hints; l1/l2 progressively reveal vuln location / topology. Default: the server's --prompt-level. Set per-launch so instances on one server can differ without restarting serve.",
+              "title": "Prompt Level"
+            }
+          },
+          {
+            "description": "Lease in seconds: reap this instance automatically once it expires. Declared per launch because how long a target is needed is a property of the attempt, not of the server. Omit to run until DELETEd. On an external-access server the lease is what stops an agent that walks away from holding a host-published slot forever.",
+            "in": "query",
+            "name": "ttl",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lease in seconds: reap this instance automatically once it expires. Declared per launch because how long a target is needed is a property of the attempt, not of the server. Omit to run until DELETEd. On an external-access server the lease is what stops an agent that walks away from holding a host-published slot forever.",
+              "title": "Ttl"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Launch Challenge"
+      }
+    },
+    "/launches": {
+      "post": {
+        "description": "Accept a launch as a durable async operation — the orchestration-safe path.\n\nProvisioning (minutes for a multi-host range) runs in the background; this\nreturns immediately. The operation id is ``cage_run_id``, so the call is\nidempotent: a repeat with the same params returns the same operation and\nnever builds a second container set (``202`` while pending, ``200`` with the\nterminal representation once ready/failed/closed); a repeat with different\nparams is ``409``. Poll ``status_url`` (honouring ``Retry-After``) until\n``ready`` — which guarantees a non-empty ``run_id``, a reachable target\naddress, and a non-empty ``task_prompt``. See ``GET /launches/{id}``.",
+        "operationId": "create_launch_launches_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LaunchOpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchOpStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Launch"
+      }
+    },
+    "/launches/{launch_id}": {
+      "delete": {
+        "description": "Idempotently cancel + tear down a launch operation.\n\nWorks in ``queued``, ``starting``, and ``ready`` — crucially even before an\ninternal ``run_id`` exists (the case the ``run_id``-keyed ``DELETE /launch``\ncannot handle): teardown also purges any docker resources tagged with this\n``cage_run_id``. Reaches ``closed`` only once containers/networks are\nconfirmed gone.\n\nWhen cleanup cannot finish in the request — a provisioning worker is still\nin flight, or a first teardown left resources behind — this returns ``202``\nwith ``status=closing``; poll the status URL (honouring ``Retry-After``)\nuntil ``200`` with ``status=closed``. Repeating it is idempotent throughout.",
+        "operationId": "cancel_launch_launches__launch_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "launch_id",
+            "required": true,
+            "schema": {
+              "title": "Launch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchOpStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Launch"
+      },
+      "get": {
+        "description": "The one authoritative representation of a launch operation.\n\n``status`` walks ``queued → starting → ready | failed`` (and ``… → closing →\nclosed`` on cancel). While pending, ``200`` carries ``status`` +\n``retry_after``; a terminal *operation* failure is still ``200`` with\n``status=failed`` (the query itself succeeded). Only auth/'\"unknown id\"'\nare non-200 (401/404). A ``ready`` body carries the full ``result``.",
+        "operationId": "get_launch_launches__launch_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "launch_id",
+            "required": true,
+            "schema": {
+              "title": "Launch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchOpStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Launch"
+      }
+    },
+    "/prompt/{run_id}": {
+      "get": {
+        "description": "The agent-facing task briefing for a launched instance.\n\nAn external agent needs the same task framing a CAGE-managed agent gets —\nwhat to exploit, the live target address(es), and the ``final_answer`` output\ncontract. This renders the challenge's own ``build_prompt`` against the\nrunning instance (so target/entry hosts are the ones the agent will reach),\nat the hint tier bound to the instance at ``/launch`` (``?prompt_level=``,\ndefaulting to the server's ``--prompt-level``). Returns both the ready-to-use\n``task_prompt`` (target filled in) and the un-filled ``task_prompt_template``.\nAudience-gated like ``/launch`` and ``/submit``.",
+        "operationId": "prompt_challenge_prompt__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromptResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Prompt Challenge"
+      }
+    },
+    "/rescores": {
+      "post": {
+        "description": "Re-judge an already-scored submission, offline, as a background operation.\n\nScoring a submission has two halves. The verifier half ran against the live\ntarget and is frozen on disk; the ``LLM_judge`` half is a model call, and a\nmodel call can fail for reasons that say nothing about the agent — an\nexpired key, a rate limit, a model swapped out. This re-runs the judge half\nover the frozen inputs and appends the result as a new scoring pass.\n\nNo instance needs to be alive: the findings and the verifier evidence were\npersisted at submit time precisely so this could happen later.\n\nThe agent-facing \"one submission per instance\" rule is untouched — this\nchanges no findings, only how they were judged. Every pass is retained, and\nthe response reports ``grader_drift`` when the verifier scripts themselves\nhave changed since grading, because no re-judge can account for that.",
+        "operationId": "create_rescore_rescores_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RescoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RescoreOpStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Rescore"
+      }
+    },
+    "/rescores/{run_id}": {
+      "get": {
+        "description": "Authoritative status of a re-judge.\n\nWith no operation in flight, this answers from the submission record itself\n— the durable truth about which pass is canonical — so a serve restart, or a\nquery long after the work finished, still gets a real answer instead of\n\"unknown operation\". Such a result is flagged ``from_record``.",
+        "operationId": "get_rescore_rescores__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RescoreOpStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Rescore"
+      }
+    },
+    "/submit/{run_id}": {
+      "post": {
+        "description": "Score one submission against a still-running serve-only instance.\n\nCloses the PULL benchmark loop: the agent launched an isolated instance,\nattacked it, and (for web) produced a ``final_answer/`` output — omit the\nupload entirely for marker-only post-exploitation ranges, which are scored\nfrom live target state. This gathers LIVE evidence against the still-up\ntarget and scores it with the challenge's benchmark scorer, writing a\nserve-native submission record under ``.cage_serve``. Gather needs the\ntarget alive, so scoring runs before any ``?close=true`` teardown.\nAudience-gated like ``/launch``.\n\n**One submission per instance.** The verdict is locked in on the first call;\na repeat for the same ``run_id`` returns it unchanged (``already_submitted``)\nso an agent cannot resubmit to fish for a pass. Launch a fresh instance for\nanother attempt.",
+        "operationId": "submit_challenge_submit__run_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tear the instance down (DELETE) after scoring. Default: keep it up (e.g. for inspection). One submission per instance either way.",
+            "in": "query",
+            "name": "close",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Tear the instance down (DELETE) after scoring. Default: keep it up (e.g. for inspection). One submission per instance either way.",
+              "title": "Close",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Optional human-friendly name for this submission's record, for easy lookup (prefixes the .cage_serve dir). Not an identity — may be empty or repeat.",
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "Optional human-friendly name for this submission's record, for easy lookup (prefixes the .cage_serve dir). Not an identity — may be empty or repeat.",
+              "title": "Label",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_submit_challenge_submit__run_id__post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Challenge"
+      }
+    }
+  }
+}

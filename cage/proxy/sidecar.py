@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -36,20 +38,124 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("cage-proxy")
 
 
+# How many times a failed CONNECT is replayed before the caller hears about it.
+# Applied by httpx's own transport, which backs off exponentially between tries.
+UPSTREAM_CONNECT_RETRIES = 3
+
+# Sizing note, so nobody optimises for traffic that does not exist. One sidecar
+# serves ONE agent in ONE container (proxy/host.py starts it per trial and binds
+# it to that container's loopback), and a measurement of six live trials — 72
+# samples — found this process at exactly two threads every single time: the
+# accept loop plus one request. Real concurrency here is 1.
+#
+# The ceilings below are therefore headroom, not a working point. They cost
+# nothing when unused, because connections are opened on demand rather than
+# preallocated; what does multiply across trials is one idle keepalive
+# connection per sidecar, held for ``keepalive_expiry``.
+
+
 def _make_http_client(request_timeout: float, http_proxy: str = "") -> httpx.Client:
-    """Build an upstream client that can speak HTTP/2 when the endpoint requires it."""
+    """Build an upstream client that owns connection reuse, TLS and retries.
+
+    Everything load-bearing lives on the transport rather than being
+    reimplemented above it:
+
+      * ``limits`` — keepalive is the whole point of sharing these clients (see
+        :func:`_shared_http_client`). A connection held open is a name not
+        resolved again and a TLS handshake not repeated. This proxy used to
+        build a connection per model call, which is how a wobble in name
+        resolution turned into a wave of failed requests.
+      * ``retries`` — replays a failed connect with exponential backoff. Scoped
+        to establishing the connection, so a POST that may already have reached
+        the model is never sent twice.
+      * ``proxy`` — CONNECT tunnelling for a model endpoint behind a corporate
+        or GFW egress proxy.
+    """
     kwargs: dict = {
-        "timeout": request_timeout,
-        "trust_env": False,
+        # Keepalive capacity deliberately equals the connection ceiling. When
+        # it is lower, a connection handed back while that many are already
+        # idle is CLOSED rather than kept — so a burst of concurrent calls
+        # quietly returns to a connection per request, which is the thing this
+        # is here to prevent. Measured: 400 calls over 200 threads went from
+        # 397 upstream connections to 64 by lifting this alone.
+        "limits": httpx.Limits(
+            max_connections=64, max_keepalive_connections=64, keepalive_expiry=300.0,
+        ),
+        "retries": UPSTREAM_CONNECT_RETRIES,
         "http2": True,
     }
     if http_proxy:
         kwargs["proxy"] = http_proxy
     try:
-        return httpx.Client(**kwargs)
-    except ImportError:
+        transport = httpx.HTTPTransport(**kwargs)
+    except ImportError:  # h2 not installed
         kwargs["http2"] = False
-        return httpx.Client(**kwargs)
+        transport = httpx.HTTPTransport(**kwargs)
+    return httpx.Client(timeout=request_timeout, trust_env=False, transport=transport)
+
+
+_shared_clients: dict[tuple[float, str], httpx.Client] = {}
+_shared_clients_lock = threading.Lock()
+
+
+def _shared_http_client(request_timeout: float, http_proxy: str = "") -> httpx.Client:
+    """One pooled client per (timeout, proxy), for the life of the process.
+
+    These used to be built and closed per request, which meant a fresh name
+    resolution and a fresh TLS handshake for every single model call — hundreds
+    of them per trial, all over whatever egress the container happens to have.
+    The client is never closed: it is process-global state, and closing it
+    mid-flight is what the pool exists to avoid.
+    """
+    key = (float(request_timeout), http_proxy)
+    with _shared_clients_lock:
+        client = _shared_clients.get(key)
+        if client is None or client.is_closed:
+            client = _make_http_client(request_timeout, http_proxy)
+            _shared_clients[key] = client
+        return client
+
+
+# Errors where the request never reached the model: the connection could not be
+# made at all. Worth telling the caller so, because an agent SDK backs off and
+# retries a 503 with Retry-After, while a 502 carries no reason to try again.
+#
+# Retrying them is httpx's job, not ours: ``HTTPTransport(retries=...)`` already
+# replays connect failures with exponential backoff, and it is scoped to the
+# connect — a POST that may have been delivered is never replayed, which would
+# mean a duplicate model call and a duplicate bill.
+#
+# SSLEOFError is in here on purpose: a handshake cut off mid-flight is what a
+# congested or filtered egress looks like from this side. A certificate that
+# does not verify is SSLCertVerificationError and is deliberately NOT covered —
+# that one fails identically every time and should say so at once.
+_TRANSIENT_UPSTREAM = (
+    socket.gaierror,
+    ConnectionError,
+    TimeoutError,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+def _is_transient_upstream(exc: BaseException) -> bool:
+    return isinstance(exc, _TRANSIENT_UPSTREAM)
+
+
+# Headers that describe THIS hop and must not be relayed to the next one
+# (RFC 9110 §7.6.1). Forwarding them is not merely untidy: passing the agent's
+# ``Connection: close`` upstream makes the model endpoint hang up after every
+# single call, which silently defeats the connection pool and puts a fresh name
+# resolution and TLS handshake back in front of every request.
+_HOP_BY_HOP_REQUEST = frozenset({
+    "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+    "te", "trailer", "transfer-encoding", "upgrade",
+})
+
 
 
 def _apply_extra_headers(headers: dict[str, str], extra: dict[str, str]) -> None:
@@ -134,6 +240,37 @@ def _inject_wrapup_reminder(body: dict[str, Any], message: str) -> bool:
             turn["content"] = block
         return True
     return False
+
+
+def _wrapup_reminder_active(
+    round_count: int,
+    wrapup_at: int,
+    message: str,
+) -> bool:
+    """Return whether this request is the wrap-up boundary request.
+
+    ``round_count`` contains only successfully forwarded agent rounds.  Equality
+    makes the reminder a one-shot after a successful boundary request, while an
+    upstream failure leaves the count unchanged so the next retry still gets it.
+    """
+
+    return bool(message and wrapup_at > 0 and round_count == wrapup_at)
+
+
+def _startup_reminder_active(
+    round_count: int,
+    reminder_at: int,
+    reminder_until: int,
+    message: str,
+) -> bool:
+    """Return whether an early benchmark reminder belongs on this request."""
+
+    return bool(
+        message
+        and reminder_at > 0
+        and reminder_until >= reminder_at
+        and reminder_at <= round_count <= reminder_until
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -226,6 +363,20 @@ def _stringify_tool_result_content(tr_content: Any) -> str:
     return str(tr_content or "")
 
 
+# Set once from the proxy config (``preserve_thinking`` on the models.yml entry).
+# Default off keeps the historical behaviour for every model that has not opted in.
+#
+# Why it matters: a model that emits reasoning in a *separate* response field
+# (``reasoning_content`` — GLM, DeepSeek) loses it twice on the translation path,
+# while one that emits it *inline* in ``content`` (``<think>…</think>`` — Qwen)
+# keeps it for free, because inline reasoning is indistinguishable from text.
+# Measured on the arvo collection: 99.4% of qwen36 turns carried reasoning
+# against 0.1% for glm52, purely from that asymmetry. With this on, both are
+# handled the same way — the reasoning reaches the agent as a real thinking
+# block, and is replayed to the upstream on the next turn.
+_PRESERVE_THINKING = False
+
+
 def _translate_messages_anthropic_to_openai(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -243,6 +394,7 @@ def _translate_messages_anthropic_to_openai(
             continue
 
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         tool_uses: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
 
@@ -257,7 +409,12 @@ def _translate_messages_anthropic_to_openai(
             elif block_type == "tool_result":
                 tool_results.append(block)
             elif block_type in ("thinking", "redacted_thinking"):
-                # Ephemeral reasoning — not replayed to OpenAI upstreams.
+                # Ephemeral reasoning, unless the model opted into
+                # ``preserve_thinking``. ``redacted_thinking`` stays dropped
+                # either way: its payload is encrypted and carries no meaning
+                # for a non-Anthropic upstream.
+                if _PRESERVE_THINKING and block_type == "thinking":
+                    thinking_parts.append(str(block.get("thinking") or ""))
                 continue
             else:
                 # image / document / unknown: keep a visible marker so the
@@ -279,11 +436,14 @@ def _translate_messages_anthropic_to_openai(
                         "arguments": json.dumps(inp) if not isinstance(inp, str) else inp,
                     },
                 })
-            openai_messages.append({
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": text,
                 "tool_calls": tool_calls,
-            })
+            }
+            if thinking_parts:
+                assistant_msg["reasoning_content"] = "\n".join(thinking_parts)
+            openai_messages.append(assistant_msg)
             continue
 
         if tool_results:
@@ -300,9 +460,37 @@ def _translate_messages_anthropic_to_openai(
                 openai_messages.append({"role": "user", "content": "\n".join(text_parts)})
             continue
 
-        openai_messages.append({"role": role, "content": "\n".join(text_parts)})
+        plain: dict[str, Any] = {"role": role, "content": "\n".join(text_parts)}
+        if thinking_parts and role == "assistant":
+            plain["reasoning_content"] = "\n".join(thinking_parts)
+        openai_messages.append(plain)
 
     return openai_messages
+
+
+# Claude Code prepends a billing header line to its system prompt whose ``cch``
+# field is freshly randomised on every single call:
+#
+#   x-anthropic-billing-header: cc_version=2.1.150.aa4; cc_entrypoint=sdk-cli; cch=7ddef;
+#
+# Anthropic's own API doesn't care — it caches from explicit ``cache_control``
+# breakpoints. Every OpenAI-protocol upstream we relay to caches by *prefix*
+# instead, and this line sits at byte 79 of a 25 KB system prompt, so those five
+# hex characters invalidate the whole conversation on every turn. Measured
+# against boyue/deepseek-v4-flash with an otherwise byte-identical 8.4k prompt:
+# 0% cache hit with the line, 97% without it, three trials each.
+#
+# It carries no meaning for a non-Anthropic upstream, so drop it on the way out.
+# Only the OpenAI translation path strips it; the Anthropic passthrough forwards
+# the system prompt untouched and keeps the header intact for billing.
+_BILLING_HEADER_RE = re.compile(r"^x-anthropic-billing-header:[^\n]*\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def _strip_billing_header(system: str) -> str:
+    """Drop Claude Code's per-call billing header so the prefix stays stable."""
+    if not system or "billing-header" not in system.lower():
+        return system
+    return _BILLING_HEADER_RE.sub("", system)
 
 
 _TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
@@ -484,6 +672,27 @@ def _hoist_xml_tool_calls_inplace(response: dict[str, Any], request_id: str) -> 
     return hoisted
 
 
+_INLINE_THINK_CLOSE = "</think>"
+_INLINE_THINK_OPEN = "<think>"
+
+
+def _split_inline_thinking(text: str) -> tuple[str, str]:
+    """Split ``…reasoning</think>answer`` into (reasoning, answer).
+
+    Only the FIRST closing tag splits: a later one belongs to the answer (a
+    model quoting the tag, say), and treating it as a boundary would swallow
+    real content into the thinking block. Text with no closing tag is returned
+    unchanged as the answer, so a model that never emits the tag is unaffected.
+    """
+    head, sep, tail = text.partition(_INLINE_THINK_CLOSE)
+    if not sep:
+        return "", text
+    # The opening tag normally lives in the prompt, but a model that emits it
+    # anyway must not have it end up inside the reasoning.
+    _, _, head = head.rpartition(_INLINE_THINK_OPEN)
+    return head.strip(), tail.lstrip("\n")
+
+
 def _translate_response_openai_to_anthropic(
     *,
     request_id: str,
@@ -516,6 +725,36 @@ def _translate_response_openai_to_anthropic(
                 if blocks:
                     text_tool_blocks = blocks
                     break
+
+    # Reasoning the upstream returned in its own field. Without this it never
+    # becomes a content block at all, so the agent's transcript — and therefore
+    # any training data built from it — has no record of the model's reasoning,
+    # even though the raw upstream response in proxy.jsonl does. A thinking
+    # block must precede the text it produced, so this goes before ``raw_text``.
+    if _PRESERVE_THINKING:
+        thinking_text = ""
+        for field in ("reasoning_content", "reasoning"):
+            rc = message.get(field)
+            if isinstance(rc, str) and rc.strip():
+                thinking_text = rc
+                break
+        if not thinking_text and raw_text:
+            # Qwen-style deployments put the reasoning *inline* at the head of
+            # ``content`` and close it with a bare ``</think>``: the chat
+            # template already emitted the opening tag into the prompt, so the
+            # model only ever generates the closing one. Left alone, the whole
+            # reasoning arrives as ordinary text with a stray tag in it, which
+            # means the transcript cannot tell reasoning from answer.
+            thinking_text, raw_text = _split_inline_thinking(raw_text)
+        if thinking_text:
+            content_blocks.append({
+                "type": "thinking",
+                "thinking": thinking_text,
+                # Anthropic carries an opaque integrity signature here.
+                # There is nothing to verify against a vLLM upstream, but
+                # the key must exist for the block to round-trip.
+                "signature": "",
+            })
 
     if raw_text:
         content_blocks.append({"type": "text", "text": raw_text})
@@ -1456,29 +1695,26 @@ def _director_apply(anthropic_request: dict, system: str) -> str:
     body = _DIR_WRAP.format(hint=hint)
     if cfg.get("mode", "reminder") == "system":
         return system + "\n\n<system-reminder>\n" + body + "\n</system-reminder>"
-    # reminder mode: append to the content of the last user-role message (after the tool result)
+    # reminder mode: deliver the hint as a SIBLING <system-reminder> text block on the
+    # last user-role turn — beside the tool_result, NEVER wedged inside its content. This
+    # is the topology native Claude Code uses for post-tool reminders, and the one the
+    # translator turns into a distinct OpenAI ``role=user`` message (see
+    # tests/test_proxy.py TestDirectorReminderInjection +
+    # test_tool_result_and_text_ordering). Nesting it into
+    # ``tool_result.content`` instead would fold it into the ``role=tool`` observation —
+    # a different final prompt that no native Claude Code turn produces.
     try:
         msgs = anthropic_request.get("messages", []) or []
         for m in reversed(msgs):
             if m.get("role") == "user":
-                rem = "\n\n<system-reminder>\n" + body + "\n</system-reminder>"
+                reminder = "<system-reminder>\n" + body + "\n</system-reminder>"
                 c = m.get("content")
                 if isinstance(c, str):
-                    m["content"] = c + rem
+                    # A string-content user turn carries no tool_result; appending keeps
+                    # it a single ``role=user`` message, already the sibling topology.
+                    m["content"] = c + "\n\n" + reminder
                 elif isinstance(c, list):
-                    # inject INTO the last tool_result's content (same place claude-code's own
-                    # <system-reminder> live), so the form is identical to native and it shows up
-                    # inside the observation rather than as a stray text block.
-                    placed = False
-                    for b in reversed(c):
-                        if isinstance(b, dict) and b.get("type") == "tool_result":
-                            ic = b.get("content")
-                            if isinstance(ic, str):
-                                b["content"] = ic + rem; placed = True; break
-                            elif isinstance(ic, list):
-                                ic.append({"type": "text", "text": rem}); placed = True; break
-                    if not placed:
-                        c.append({"type": "text", "text": rem})
+                    c.append({"type": "text", "text": reminder})
                 break
     except Exception:
         pass
@@ -1502,6 +1738,8 @@ def _build_openai_request(
         modified_system = system_content
 
     modified_system = _director_apply(anthropic_request, modified_system)
+    # Last, so it also catches a header a template or the director wrapped.
+    modified_system = _strip_billing_header(modified_system)
 
     if modified_system:
         messages.append({"role": "system", "content": modified_system})
@@ -1869,6 +2107,12 @@ class _ProxyServer(ThreadingHTTPServer):
     ``run_proxy``; the handler reads config via ``self.server.<attr>``.
     """
     daemon_threads = True
+    # socketserver's default listen backlog is 5. A harness that opens several
+    # connections at once — subagents, background calls, a retry storm — then
+    # has its connections refused by the kernel before this process ever sees
+    # them, which surfaces to the agent as "connection reset by peer" and has
+    # nothing to do with the model.
+    request_queue_size = 128
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -1905,19 +2149,40 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _maybe_inject_wrapup(self, body: dict[str, Any]) -> bool:
-        """Inject the wrap-up reminder if the agent is in the flush window.
+        """Inject the wrap-up reminder on the flush-window boundary.
 
-        Fires once ``budgeted_round_count() >= wrapup_at`` (the agent has
-        completed at least that many rounds) and on every remaining request up
-        to the hard cap, so the nudge persists through the wind-down. This runs
-        only on requests that ARE forwarded upstream — the agent gets a real
-        turn to act on it, unlike the ``max_requests`` hard rejection.
+        Fires while ``budgeted_round_count() == wrapup_at``.  A successful
+        forwarded request advances the count and makes this a one-shot; a failed
+        upstream request does not advance it, so a retry cannot permanently miss
+        the reminder.  This runs only on requests that ARE forwarded upstream —
+        the agent gets a real turn to act on it, unlike the ``max_requests`` hard
+        rejection.
         """
         wrapup_at = getattr(self.server, "wrapup_at", -1)
         message = getattr(self.server, "wrapup_message", "")
-        if not isinstance(wrapup_at, int) or wrapup_at <= 0 or not message:
+        if not isinstance(wrapup_at, int):
             return False
-        if self.server.recorder.budgeted_round_count() < wrapup_at:
+        if not _wrapup_reminder_active(
+            self.server.recorder.budgeted_round_count(),
+            wrapup_at,
+            message,
+        ):
+            return False
+        return _inject_wrapup_reminder(body, message)
+
+    def _maybe_inject_startup_reminder(self, body: dict[str, Any]) -> bool:
+        """Inject a benchmark's repeated early ordering reminder."""
+
+        reminder_at = getattr(self.server, "startup_reminder_at", -1)
+        reminder_until = getattr(self.server, "startup_reminder_until", -1)
+        message = getattr(self.server, "startup_reminder_message", "")
+        round_count = self.server.recorder.budgeted_round_count()
+        if not _startup_reminder_active(
+            round_count,
+            reminder_at,
+            reminder_until,
+            message,
+        ):
             return False
         return _inject_wrapup_reminder(body, message)
 
@@ -1942,12 +2207,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # Max requests limit (proxy-enforced max_rounds)
             if not self.server.recorder.try_reserve_budgeted_round(max_requests=self.server.max_requests):
                 logger.info("max_requests reached (%d), rejecting", self.server.max_requests)
+                # 403, not 429: this budget is spent for the rest of the trial,
+                # so there is nothing to wait for. 429 says "slow down and try
+                # again" — agents believe it, retry, and burn their retry
+                # budget discovering that the answer never changes.
                 self._send_json(
-                    HTTPStatus.TOO_MANY_REQUESTS,
+                    HTTPStatus.FORBIDDEN,
                     {
                         "type": "error",
                         "error": {
-                            "type": "rate_limit_error",
+                            "type": "budget_limit_error",
                             "message": f"Maximum request limit reached ({self.server.max_requests}). Please stop.",
                         },
                     },
@@ -1962,8 +2231,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             )
             if budget_signal is not None:
                 logger.info("runtime budget reached (%s), rejecting", budget_signal)
+                # Same reasoning as the max_requests rejection above: a spent
+                # token/cost budget does not refill mid-trial.
                 self._send_json(
-                    HTTPStatus.TOO_MANY_REQUESTS,
+                    HTTPStatus.FORBIDDEN,
                     {
                         "type": "error",
                         "error": {
@@ -2032,10 +2303,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # inject into the JSON body and re-serialize only for /v1/messages
             # when the flush window is active; every other route/body forwards
             # untouched.
-            if route == "/v1/messages" and getattr(self.server, "wrapup_message", ""):
+            if route == "/v1/messages" and (
+                getattr(self.server, "startup_reminder_message", "")
+                or getattr(self.server, "wrapup_message", "")
+            ):
                 try:
                     tbody = json.loads(raw_body)
-                    if self._maybe_inject_wrapup(tbody):
+                    injected = self._maybe_inject_startup_reminder(tbody)
+                    injected = self._maybe_inject_wrapup(tbody) or injected
+                    if injected:
                         raw_body = json.dumps(tbody, ensure_ascii=False).encode("utf-8")
                 except (ValueError, TypeError):
                     pass
@@ -2068,13 +2344,24 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 cage_span=self._cage_span(),
             )
             logger.error("proxy_request_error: %s (trial=%s)", error_msg, self.server.trial_id)
-            self._send_json(
-                HTTPStatus.BAD_GATEWAY,
-                {
-                    "type": "error",
-                    "error": {"type": "proxy_error", "message": str(exc)},
-                },
-            )
+            # When the upstream answered, forward its answer untouched — status
+            # code and body verbatim. The proxy does not get a vote on what an
+            # upstream error means: agents already branch on the real category
+            # (back off, stop, send something smaller), and rewriting every
+            # failure into one status destroys the distinction they act on.
+            #
+            # 502 is reserved for the case where it is literally true: no
+            # upstream response exists, because the request never completed.
+            if isinstance(exc, httpx.HTTPStatusError):
+                self._send_upstream_response(exc.response)
+            else:
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "type": "error",
+                        "error": {"type": "proxy_error", "message": str(exc)},
+                    },
+                )
         finally:
             if reserved_budgeted_round:
                 self.server.recorder.release_reserved_round()
@@ -2261,8 +2548,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         consumers can subtract context-compaction churn from agent
         turn counts.
         """
-        import http.client as _hc
-
         is_gemini = _is_gemini_route(route)
 
         # Build upstream URL
@@ -2279,12 +2564,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if incoming_query:
             url_str = url_str + ("&" if "?" in url_str else "?") + incoming_query
 
-        url_parts = urlsplit(url_str)
-        host = url_parts.hostname or "127.0.0.1"
-        port_num = url_parts.port or (443 if url_parts.scheme == "https" else 80)
-        path = url_parts.path or route
-        if url_parts.query:
-            path = path + "?" + url_parts.query
+        # Host, port and origin-form path used to be split out here to build a
+        # connection (and a CONNECT tunnel) by hand. The transport takes the
+        # whole URL and works all of that out itself.
 
         # Apply `proxy.rewrite.system` to OpenAI Chat-Completions
         # requests so the project-level system prepend reaches agents
@@ -2328,7 +2610,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         seen_auth = False
         for key, val in self.headers.items():
             lk = key.lower()
-            if lk in ("host", "content-length", "transfer-encoding"):
+            if lk in _HOP_BY_HOP_REQUEST or lk in ("host", "content-length"):
                 continue
             if lk in self._CAGE_SPAN_FIELDS:
                 continue  # internal span marker: recorded, never forwarded upstream
@@ -2358,76 +2640,58 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if is_gemini and isinstance(body_for_log, dict):
             body_for_log = _gemini_request_to_openai(body_for_log, route)
 
-        # Route through upstream HTTP proxy (CONNECT tunnel for HTTPS,
-        # absolute-URI request for HTTP). Required when the model
-        # endpoint sits behind a corporate / GFW egress proxy — without
-        # this, OpenAI-protocol agents that hit /v1/chat/completions
-        # fail DNS or get blocked, while Anthropic-protocol agents
-        # still work because _forward_anthropic uses _make_http_client
-        # which already honours http_proxy.
+        # One pooled client does the talking. It owns connection reuse, the
+        # CONNECT tunnel when a model endpoint sits behind a corporate / GFW
+        # egress proxy, TLS, timeouts and connect-level retries — all of which
+        # this function used to hand-roll on top of ``http.client``, and each of
+        # which was a bug: a fresh connection (and so a fresh DNS lookup and TLS
+        # handshake) per model call, and no retry of any kind.
         try:
-            proxy_parts = urlsplit(self.server.http_proxy) if self.server.http_proxy else None
-            use_proxy = bool(proxy_parts and proxy_parts.hostname)
-
-            if url_parts.scheme == "https":
-                import ssl
-                if use_proxy:
-                    conn = _hc.HTTPSConnection(
-                        proxy_parts.hostname,
-                        proxy_parts.port or 80,
-                        timeout=self.server.request_timeout,
-                        context=ssl.create_default_context(),
-                    )
-                    conn.set_tunnel(host, port_num)
-                else:
-                    conn = _hc.HTTPSConnection(
-                        host, port_num, timeout=self.server.request_timeout,
-                        context=ssl.create_default_context(),
-                    )
-            else:
-                if use_proxy:
-                    conn = _hc.HTTPConnection(
-                        proxy_parts.hostname,
-                        proxy_parts.port or 80,
-                        timeout=self.server.request_timeout,
-                    )
-                else:
-                    conn = _hc.HTTPConnection(host, port_num, timeout=self.server.request_timeout)
-
-            # HTTP-via-proxy requires an absolute URI on the request line;
-            # HTTPS-via-CONNECT-tunnel + plain HTTP-direct both use the
-            # origin-form path.
-            send_target = (
-                url_str
-                if (use_proxy and url_parts.scheme == "http")
-                else path
+            client = _shared_http_client(
+                self.server.request_timeout, http_proxy=self.server.http_proxy,
             )
-            conn.request("POST", send_target, body=raw_body, headers=headers)
-            resp = conn.getresponse()
-            resp_headers = resp.getheaders()
+            request = client.build_request("POST", url_str, content=raw_body, headers=headers)
+            # httpx adds Accept, Accept-Encoding, User-Agent and Connection of
+            # its own. On a transparent proxy those are not defaults, they are
+            # forgery: Accept-Encoding alone decides whether the upstream
+            # compresses the reply. Anything the agent did not send, we do not
+            # send. (Content-Length is httpx's to compute — the body may have
+            # been rewritten above.)
+            _sent = {k.lower() for k in headers}
+            for name in ("accept", "accept-encoding", "user-agent", "connection"):
+                if name not in _sent and name in request.headers:
+                    del request.headers[name]
+
+            resp = client.send(request, stream=True)
+            # ``multi_items`` and not ``items``: a repeated header (Set-Cookie)
+            # must reach the agent as it arrived, not folded into one line.
+            resp_headers = list(resp.headers.multi_items())
             _hop_by_hop = {"transfer-encoding", "connection", "keep-alive"}
 
             # --- Non-200: forward status + headers + body verbatim ---
-            if resp.status != 200:
-                raw_err = resp.read()
-                self.send_response(resp.status)
+            if resp.status_code != 200:
+                # ``iter_raw`` throughout, never ``read``/``iter_bytes``: those
+                # decompress, and this path forwards the body together with the
+                # upstream's own Content-Encoding and Content-Length.
+                raw_err = b"".join(resp.iter_raw())
+                resp.close()
+                self.send_response(resp.status_code)
                 for h, v in resp_headers:
                     if h.lower() not in _hop_by_hop:
                         self.send_header(h, v)
                 self.end_headers()
                 self.wfile.write(raw_err)
-                conn.close()
                 self.server.recorder.record(
                     request_id=request_id,
                     openai_request=body_for_log,
                     original_system=original_system_xfwd,
                     modified_system=modified_system_xfwd,
                     status="error",
-                    error=f"HTTP {resp.status}: {raw_err[:500].decode('utf-8', errors='replace')}",
+                    error=f"HTTP {resp.status_code}: {raw_err[:500].decode('utf-8', errors='replace')}",
                 )
                 return
 
-            content_type = resp.getheader("Content-Type", "")
+            content_type = resp.headers.get("Content-Type", "")
             is_sse = "text/event-stream" in content_type
 
             if is_sse:
@@ -2442,7 +2706,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 gemini_acc: dict[str, Any] | None = None
                 buf = b""
                 decode_for_log = _make_stream_log_decoder(
-                    resp.getheader("Content-Encoding", "")
+                    resp.headers.get("Content-Encoding", "")
                 )
 
                 def _capture_sse_events_from(data: bytes) -> None:
@@ -2474,10 +2738,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                                 except (json.JSONDecodeError, TypeError):
                                     pass
 
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
+                for chunk in resp.iter_raw():
                     self.wfile.write(chunk)
                     self.wfile.flush()
                     decoded = decode_for_log(chunk, final=False)
@@ -2511,12 +2772,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # transformation: hoist Hermes/Qwen ``<tool_call>`` XML
                 # into native ``message.tool_calls`` so OpenAI-protocol
                 # agents (codex, qwen-code, kimi-cli) can see the calls.
-                raw_resp = resp.read()
+                raw_resp = b"".join(resp.iter_raw())
 
                 log_resp: dict[str, Any] = {}
                 try:
                     log_bytes = raw_resp
-                    if resp.getheader("Content-Encoding", "") == "gzip":
+                    if resp.headers.get("Content-Encoding", "") == "gzip":
                         import gzip
                         log_bytes = gzip.decompress(raw_resp)
                     log_resp = json.loads(log_bytes)
@@ -2564,10 +2825,20 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     cage_span=self._cage_span(),
                 )
 
-            conn.close()
+            # Releases the connection back to the pool rather than closing the
+            # socket — the point of pooling it in the first place.
+            resp.close()
 
         except Exception as exc:  # noqa: BLE001
-            logger.error("transparent_forward_error: %s (route=%s)", exc, route)
+            # A connection we never managed to open is not a bad gateway, it is
+            # a temporarily unavailable one — and the difference is not
+            # cosmetic: agent SDKs back off and retry a 503 with Retry-After,
+            # while a 502 with no signal is as likely to end the trial.
+            transient = _is_transient_upstream(exc)
+            status = 503 if transient else 502
+            logger.error(
+                "transparent_forward_error: %s (route=%s status=%d)", exc, route, status,
+            )
             self.server.recorder.record(
                 request_id=request_id,
                 openai_request=body_for_log,
@@ -2577,11 +2848,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 error=str(exc),
             )
             try:
-                self.send_response(502)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                if transient:
+                    self.send_header("Retry-After", "2")
                 self.end_headers()
                 self.wfile.write(json.dumps(
-                    {"error": {"message": str(exc), "type": "proxy_error"}},
+                    {"error": {
+                        "message": str(exc),
+                        "type": "proxy_unavailable" if transient else "proxy_error",
+                    }},
                 ).encode("utf-8"))
             except Exception:  # noqa: BLE001
                 pass
@@ -2592,10 +2868,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if self.server.upstream_api_key:
             headers["Authorization"] = f"Bearer {self.server.upstream_api_key}"
         _apply_extra_headers(headers, self.server.extra_headers)
-        with _make_http_client(self.server.request_timeout, http_proxy=self.server.http_proxy) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        return self._post_upstream(url, headers, payload)
 
     def _forward_anthropic(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.server.upstream_base_url.rstrip('/')}/v1/messages"
@@ -2604,10 +2877,46 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             headers["x-api-key"] = self.server.upstream_api_key
             headers["anthropic-version"] = "2023-06-01"
         _apply_extra_headers(headers, self.server.extra_headers)
-        with _make_http_client(self.server.request_timeout, http_proxy=self.server.http_proxy) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        return self._post_upstream(url, headers, payload)
+
+    def _post_upstream(
+        self, url: str, headers: dict[str, str], payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST to the model API over the pooled client.
+
+        No retry loop here on purpose: the transport already replays failed
+        connects with backoff, and it is the only layer that can tell a connect
+        that never happened from a request the model may have received.
+        """
+        client = _shared_http_client(
+            self.server.request_timeout, http_proxy=self.server.http_proxy,
+        )
+        resp = client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _send_upstream_response(self, response: Any) -> None:
+        """Relay an upstream HTTP response to the client byte-for-byte.
+
+        No interpretation: whatever status and body the upstream produced is
+        what the agent sees. Only the framing headers are ours.
+        """
+        try:
+            status = int(response.status_code)
+            raw = response.content or b""
+            content_type = response.headers.get("Content-Type", "application/json")
+        except Exception:  # noqa: BLE001
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"type": "error", "error": {"type": "proxy_error",
+                                            "message": "unreadable upstream response"}},
+            )
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2667,6 +2976,30 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                         "partial_json": json.dumps(block.get("input") or {}),
                     },
                 }))
+            elif btype == "thinking":
+                # A thinking block's text arrives as ``thinking_delta``, never in
+                # the start event — the client accumulates deltas and treats the
+                # start payload as an empty shell. Emitting the whole block at
+                # start (what the generic branch below does) therefore reaches
+                # the agent as ``{"thinking": ""}``: the block survives, its
+                # content does not, and the reasoning is silently lost on replay.
+                events.append(("content_block_start", {
+                    "type": "content_block_start", "index": idx,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                }))
+                events.append(("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": str(block.get("thinking") or ""),
+                    },
+                }))
+                signature = str(block.get("signature") or "")
+                if signature:
+                    events.append(("content_block_delta", {
+                        "type": "content_block_delta", "index": idx,
+                        "delta": {"type": "signature_delta", "signature": signature},
+                    }))
             else:
                 events.append(("content_block_start", {
                     "type": "content_block_start", "index": idx,
@@ -2707,6 +3040,9 @@ def run_proxy(config: dict[str, Any]) -> None:
     upstream_protocol = config.get("upstream_protocol", "openai")
     system_template = config.get("system_template", "")
     max_output_tokens_cap = config.get("max_output_tokens_cap")
+    # Literal mirror of contracts.execution.DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S — the
+    # sidecar is httpx-only and cannot import cage code. host.py always writes this key,
+    # so the fallback only applies to a hand-crafted config; keep the two numbers in sync.
     request_timeout = config.get("request_timeout", 3600.0)
     http_proxy = config.get("http_proxy", "")
     extra_headers = {
@@ -2715,12 +3051,27 @@ def run_proxy(config: dict[str, Any]) -> None:
     upstream_extra_body = config.get("upstream_extra_body") or {}
     if not isinstance(upstream_extra_body, dict):
         upstream_extra_body = {}
+    global _PRESERVE_THINKING
+    _PRESERVE_THINKING = bool(config.get("preserve_thinking"))
     port = config.get("port", 8877)
     trial_id = config.get("trial_id", "unknown")
     log_dir = Path(config.get("log_dir", "/tmp/proxy_logs"))
 
     raw_max_requests = config.get("max_requests", -1)
     max_requests = -1 if raw_max_requests in (None, "") else int(raw_max_requests)
+    raw_startup_reminder_at = config.get("startup_reminder_at", -1)
+    startup_reminder_at = (
+        -1
+        if raw_startup_reminder_at in (None, "")
+        else int(raw_startup_reminder_at)
+    )
+    raw_startup_reminder_until = config.get("startup_reminder_until", -1)
+    startup_reminder_until = (
+        -1
+        if raw_startup_reminder_until in (None, "")
+        else int(raw_startup_reminder_until)
+    )
+    startup_reminder_message = str(config.get("startup_reminder_message") or "")
     raw_wrapup_at = config.get("wrapup_at", -1)
     wrapup_at = -1 if raw_wrapup_at in (None, "") else int(raw_wrapup_at)
     wrapup_message = str(config.get("wrapup_message") or "")
@@ -2751,6 +3102,9 @@ def run_proxy(config: dict[str, Any]) -> None:
     httpd.max_output_tokens = max_output_tokens
     httpd.max_output_tokens_cap = max_output_tokens_cap
     httpd.max_requests = max_requests
+    httpd.startup_reminder_at = startup_reminder_at
+    httpd.startup_reminder_until = startup_reminder_until
+    httpd.startup_reminder_message = startup_reminder_message
     httpd.wrapup_at = wrapup_at
     httpd.wrapup_message = wrapup_message
     httpd.needs_translation = needs_translation

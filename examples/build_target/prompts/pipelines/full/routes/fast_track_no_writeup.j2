@@ -1,0 +1,31 @@
+## APB fast track: reuse B and mechanically port P
+
+Official deployment material is the starting implementation and the supplied
+exploit fixes the intended attack. There is no writeup; do not manufacture its
+missing claims.
+
+Deployment roots:
+{% for path in instance_data.materials.get("deployment", []) %}- `{{ path }}`
+{% endfor %}
+Exploit roots:
+{% for path in instance_data.materials.get("exploit", []) %}- `{{ path }}`
+{% endfor %}
+
+- Reuse the closure reached from B, including all services, wrappers, pinned
+  versions, users, and flag mechanism. Repair only a demonstrated build or boot
+  incompatibility and record it.
+- Copy P completely and make the mechanical endpoint/path adaptation before
+  re-deriving anything. Preserve its primitive, staged interaction, artifact-
+  derived addresses, live-leak arithmetic, and success parser.
+- If P's driver executes a supplied prebuilt payload, the first `solve/` version
+  must contain that exact byte-identical file and driver. Do not compile a
+  same-named source until a current factual run proves the supplied binary
+  incompatible.
+- Derive diagnostics only from the actual B closure, served artifact, P, and
+  live validator evidence. After a factual failed capture, use bounded
+  symbols/disassembly only to answer the specific first-unproven question.
+- If P fails, first compare the artifacts it assumes with the artifacts B
+  actually serves. Change the environment only when that comparison contradicts
+  B; otherwise repair the first unproven P/transport link.
+- The route succeeds only when the complete supplied attack captures the fresh
+  validator flag at R5.

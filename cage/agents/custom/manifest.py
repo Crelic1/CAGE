@@ -10,6 +10,8 @@ interprets any manifest.
 
 from __future__ import annotations
 
+from cage.contracts.exceptions import ConfigError
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,7 +64,7 @@ def _reject_reserved_params(params: dict[str, str], manifest_path: Path) -> None
         k for k in params if k in RESERVED_TOKEN_NAMES or k.startswith("model.")
     )
     if clashing:
-        raise ValueError(
+        raise ConfigError(
             f"{manifest_path}: params may not reuse Cage-reserved token name(s) "
             f"{clashing}. Cage fills these ({', '.join(sorted(RESERVED_TOKEN_NAMES))}, "
             f"model.*) — use the reserved {{token}} directly in `command` (e.g. map "
@@ -81,7 +83,7 @@ def load_manifest(source: str, base_dir: Path) -> CustomManifest:
         src = base_dir / src
     src = src.resolve()
     if not src.is_dir():
-        raise ValueError(
+        raise ConfigError(
             f"custom agent source is not a directory: {src} (declared {source!r})"
         )
 
@@ -91,16 +93,16 @@ def load_manifest(source: str, base_dir: Path) -> CustomManifest:
         if alt.is_file():
             manifest_path = alt
         else:
-            raise ValueError(
+            raise ConfigError(
                 f"custom agent manifest not found: expected {src}/agent.yml"
             )
 
     raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
-        raise ValueError(f"{manifest_path}: top level must be a mapping")
+        raise ConfigError(f"{manifest_path}: top level must be a mapping")
     for required in ("image", "command"):
         if not raw.get(required):
-            raise ValueError(f"{manifest_path}: missing required field '{required}'")
+            raise ConfigError(f"{manifest_path}: missing required field '{required}'")
 
     params = {str(k): str(v) for k, v in (raw.get("params") or {}).items()}
     _reject_reserved_params(params, manifest_path)
@@ -124,17 +126,17 @@ def _normalize_output(output: Any, manifest_path: Path) -> dict[str, Any]:
     """Normalize the ``output`` spec. Supported: ``stdout`` | ``{json_field: X}``."""
     if isinstance(output, str):
         if output != "stdout":
-            raise ValueError(
+            raise ConfigError(
                 f"{manifest_path}: output string must be 'stdout', got {output!r}"
             )
         return {"type": "stdout"}
     if isinstance(output, dict):
         if "json_field" in output:
             return {"type": "json_field", "field": str(output["json_field"])}
-        raise ValueError(
+        raise ConfigError(
             f"{manifest_path}: unsupported output spec {output!r}; "
             "use 'stdout' or {json_field: <key>}"
         )
-    raise ValueError(
+    raise ConfigError(
         f"{manifest_path}: output must be 'stdout' or a mapping, got {type(output).__name__}"
     )

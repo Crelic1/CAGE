@@ -272,3 +272,48 @@ def test_real_fixture_compaction_and_background():
     # root agent rounds (5) are a tiny fraction of the 117 raw successful calls
     assert forest.root_rounds == 5
     assert forest.root_rounds < len(entries)
+
+
+def test_summary_quoting_its_own_instruction_counts_as_one_compaction():
+    """A summary that restates its instruction must not flag every later call.
+
+    Real Claude Code compaction: the model's summary opens by restating the task
+    it was handed ("create a detailed summary of the conversation"), the
+    continuation carries that summary as a user text block, and the block then
+    rides along in the history of every subsequent request. Detection keys on
+    the LAST user message — the position a compaction instruction actually
+    occupies — so the quoted copies never re-trigger it. Scanning every user
+    message instead let one compaction flag the entire remainder of a trial,
+    inflating ``num_compactions`` and deflating ``root_rounds`` by the same
+    amount (observed live: 74 reported vs 17 real on a 190-call trial).
+    """
+    msgs = [_user("long task")]
+    entries = []
+    for i in range(3):
+        entries.append(_entry(i, system=ROOT_SYS, messages=msgs, in_tok=10_000 + i * 5_000))
+        msgs = _grow(msgs, i)
+    # index 3: the genuine compaction call — the instruction is the LAST message.
+    entries.append(_entry(
+        3,
+        system=ROOT_SYS,
+        messages=msgs + [_user("Your task is to create a detailed summary of the conversation so far.")],
+        in_tok=40_000,
+    ))
+    # index 4+: the continuation, whose summary quotes the instruction verbatim.
+    quoted = (
+        "This session is being continued from a previous conversation that ran out of "
+        "context. <analysis> I was asked to create a detailed summary of the conversation "
+        "so far, covering the work below. </analysis> <summary> prior work </summary>"
+    )
+    cont = [_user(quoted)]
+    for i in range(4, 9):
+        entries.append(_entry(i, system=ROOT_SYS, messages=cont, in_tok=6_000 + i * 100))
+        cont = _grow(cont, i)
+
+    forest = reconstruct_forest(entries)
+    root = forest.conversations[0]
+    assert root.compaction_calls == [3]
+    assert forest.structure["num_compactions"] == 1
+    # 9 calls - 1 compaction call = 8 agent rounds. Scanning every user message
+    # would also flag 4..8 and report 3.
+    assert forest.root_rounds == 8

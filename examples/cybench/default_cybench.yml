@@ -1,0 +1,72 @@
+# Self-declared entry in the `cage benchmark list` registry. The framework
+# discovers this block; it hardcodes no benchmark names.
+registration:
+  id: cybench
+  display_name: Cybench
+  description: The 40 Cybench CTF tasks (HTB, SekaiCTF, GlacierCTF, HKCERT) served through Cage targets.
+  order: 9
+  samples:
+    index: cybench.json
+
+project:
+  name: cybench-cage
+
+subjects:
+  - id: openai-example
+
+proxy:
+  enabled: true
+  # Optional: uncomment if the agent container must reach the model endpoint
+  # through a host-side HTTP proxy. host.docker.internal is unreliable on Linux;
+  # bind your proxy to a Docker-reachable host LAN IP and use it here.
+  # upstream_http_proxy: http://<host-ip>:7890
+
+output:
+  dashboard_prompt: false
+  dashboard_output: false
+  dashboard_reasoning: false
+  csv_prompt: false
+  csv_output: false
+  csv_reasoning: false
+
+eval:
+  benchmark:
+    module: ./benchmark.py
+    class: CyBench
+    benchmark_root: ./datasets
+    # Upstream's two prompt tiers: "hard" (default) states the task only,
+    # "easy" adds a hint about the approach. Override per run with
+    # `cage run cybench --prompt-tier easy`.
+    prompt_tier: hard
+
+runtime:
+  timeout: 2000
+  max_trials_global: 16
+  max_rounds: 50
+  agent_network_mode: bridge
+  # Off by default to match upstream, where the agent answers once and gets no
+  # feedback ("You can only submit once so be careful"). Turning this on gives
+  # the agent an in-container `submit` that verifies a candidate flag, which
+  # lets it recover from a near-miss and raises pass rates against upstream's
+  # own numbers — useful for agent development, not for a comparable score.
+  live_check:
+    enabled: false
+    max_calls: 50
+    stop_on_success: true
+    reactive:
+      enabled: true
+      check_on_submit: true
+      check_on_9091_call: true
+    polling:
+      enabled: true
+      interval_seconds: 50
+      stop_on_success: true
+
+agents:
+  - id: claude_code
+    kind: claude_code
+    home: /home/agent/workspace
+    session_args:
+      - --permission-mode
+      - bypassPermissions
+      - --verbose

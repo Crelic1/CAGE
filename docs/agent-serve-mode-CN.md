@@ -97,13 +97,14 @@ cage benchmark serve agent_pentest_bench
 #   judge   : deepseek-v4-pro (benchmark default)
 ```
 
-该命令自动发现并挂载此 benchmark 的全部题目索引(`web_exploit_bench` 与 `post_exploit_bench`)。裁判模型可经 `--judge-model <id>` 覆盖(见第 2 节);对外暴露(供他机访问)可用 `--host 0.0.0.0 --external-token "$(openssl rand -hex 16)"`。
+该命令自动发现并挂载此 benchmark 的全部题目索引(`web_exploit_bench` 与 `post_exploit_bench`)。裁判模型可经 `--judge-model <id>` 覆盖(见第 2 节)。将 **API** 暴露给他机可用 `--host 0.0.0.0 --external-token "$(openssl rand -hex 16)"`——但这仅允许远程调用方*驱动* API,靶机仍留在 docker 网络上。若要让**他机上的 Agent 真正访问靶机**,需追加 `--public-host`(见第 5 节与 [serve-external-audience](serve-external-audience.md#external-access-serving-an-agent-that-is-not-on-this-host))。
 
 其他可用参数:
 
 - `--namespace <name>`(缺省 `default`)——本服务靶标所归属的 docker 资源命名空间。两台同机并跑的服务各取不同命名空间,其容器 / 网络即可相互隔离。
 - `--adapter path/to/module.py:ClassName`——额外加载一个 benchmark adapter(可重复),补充在 benchmark 目录下自动发现之外的适配器。
 - `--open`——启动后在浏览器中打开只读控制台。
+- `--public-host [addr]` / `--max-public-instances <n>`——将靶机服务于**他机上的 Agent**(见第 5 节);默认关闭。
 
 ## 4 评测回路(Python SDK)
 
@@ -124,7 +125,7 @@ for ch in client.list_challenges():
 inst = client.launch("pb-prestashop")
 print(inst.run_id, inst.container_addr)   # 如 ['172.31.x.y:80'],位于 inst.network_name 上
 
-# (3) 获取任务简报——与集成式一字不差的任务描述(任务、靶机地址、final_answer
+# (3) 获取任务简报——与集成式相同的任务描述(任务、靶机地址、final_answer
 #     输出契约),且已填入**本实例**的实时靶机地址,可直接下发给 Agent。
 task = inst.task_prompt()
 
@@ -144,7 +145,9 @@ client.close(inst)
 
 ### 4.1 任务简报的生成与字段
 
-`inst.task_prompt()` 返回可直接下发的简报,其中**本实例的实时靶机地址已完成填充**。若需未填充的原始模板,`inst.prompt()` 返回完整响应 `{task_prompt, task_prompt_template, prompt_level, …}`,其中 `task_prompt_template` 为同一简报、但靶机地址以占位符(如 `{{APPLICATION_TARGETS}}`)呈现。简报由 benchmark 自身的 `build_prompt` 渲染,故与 `cage run` 下发给集成式 Agent 的内容完全一致。
+`inst.task_prompt()` 返回可直接下发的简报,其中**本实例的实时靶机地址已完成填充**。若需未填充的原始模板,`inst.prompt()` 返回完整响应 `{task_prompt, task_prompt_template, prompt_level, …}`,其中 `task_prompt_template` 为同一简报、但靶机地址以占位符(如 `{{APPLICATION_TARGETS}}`)呈现。简报由 benchmark 自身的 `build_prompt` 渲染,故任务描述、靶机地址、报告契约与判分规则均与 `cage run` 下发给集成式 Agent 的内容一致。
+
+一处刻意的差异:serve 模式的简报**略去了"你的运行环境 / 工具"一节**。`cage run` 会描述 cage 为 Agent 预置的工作区与工具(Kali 容器,`nmap`/`sqlmap`/… );而 serve 模式下 cage 并不启动 Agent,也就不提供该环境——由你自带,故该节被删除,而非宣传实际并不存在的工具。
 
 ### 4.2 提示档位的实例级绑定
 
@@ -210,7 +213,9 @@ SDK 各调用(`list_challenges` / `launch` / `session` / `task_prompt` / `attach
 
 `container_addr` 是**该实例隔离 docker 网络上**的地址,而非宿主机端口。受支持且抗作弊的部署方式为:**将 Agent 以容器形式运行于 serve 宿主机,并接入该实例网络**——既可于启动时接入(`docker run --network <inst.network_name> your-agent`),亦可事后接入(`client.attach(inst, container)`)——继而以对等节点(peer)身份访问靶机。
 
-需要强调的是,**不得从宿主机直接访问靶机,亦不得向 Agent 授予 docker socket**。`network_only` 虽已剥离宿主机端口,却无法约束运行于宿主机之上的进程:宿主机对**每一个**实例的网桥子网均存在路由(宿主机进程既可访问自身靶机,亦可访问他人靶机);而一旦挂载 `/var/run/docker.sock`,进程即可经 `docker exec` 直接进入靶机读取 flag / marker。由于 docker 网络为宿主机本地资源,上述强隔离仅在"同机容器且仅接入自身实例网络"时成立;真正跨机的远程 Agent 无法加入该网络,只能退化为弱隔离的宿主机发布端口(`entry_urls`,`network_only=false`),此时端口将暴露于宿主机。
+需要强调的是,**不得从宿主机直接访问靶机,亦不得向 Agent 授予 docker socket**。`network_only` 虽已剥离宿主机端口,却无法约束运行于宿主机之上的进程:宿主机对**每一个**实例的网桥子网均存在路由(宿主机进程既可访问自身靶机,亦可访问他人靶机);而一旦挂载 `/var/run/docker.sock`,进程即可经 `docker exec` 直接进入靶机读取 flag / marker。由于 docker 网络为宿主机本地资源,上述强隔离仅在"同机容器且仅接入自身实例网络"时成立。
+
+真正跨机的远程 Agent 根本无法加入该网络。为其提供服务是一个**显式的服务端模式**——`cage benchmark serve … --public-host`——它将每个 challenge 声明的入口服务发布至宿主机、于 `entry_urls` 中公布、并在 `/prompt` 任务简报中改写为该地址,同时限制可同时对外发布的实例数(它们共用宿主机地址,并发实例之间可被端口扫描相互发现)。完整取舍参见 [serve-external-audience](serve-external-audience.md#external-access-serving-an-agent-that-is-not-on-this-host)。
 
 ## 6 评测结果的持久化与可视化
 

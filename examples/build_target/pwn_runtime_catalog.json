@@ -1,0 +1,56 @@
+{
+  "schema_version": "cage-pwn-runtime-catalog-v1",
+  "architecture": "amd64",
+  "bundles": [
+    {
+      "id": "ubuntu-16.04-glibc-2.23-amd64",
+      "ubuntu_release": "16.04",
+      "ubuntu_codename": "xenial",
+      "glibc_series": "2.23",
+      "architecture": "amd64",
+      "source_image": "ubuntu:16.04",
+      "libc_container_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_container_path": "/lib64/ld-linux-x86-64.so.2"
+    },
+    {
+      "id": "ubuntu-18.04-glibc-2.27-amd64",
+      "ubuntu_release": "18.04",
+      "ubuntu_codename": "bionic",
+      "glibc_series": "2.27",
+      "architecture": "amd64",
+      "source_image": "ubuntu:18.04",
+      "libc_container_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_container_path": "/lib64/ld-linux-x86-64.so.2"
+    },
+    {
+      "id": "ubuntu-20.04-glibc-2.31-amd64",
+      "ubuntu_release": "20.04",
+      "ubuntu_codename": "focal",
+      "glibc_series": "2.31",
+      "architecture": "amd64",
+      "source_image": "ubuntu:20.04",
+      "libc_container_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_container_path": "/lib64/ld-linux-x86-64.so.2"
+    },
+    {
+      "id": "ubuntu-22.04-glibc-2.35-amd64",
+      "ubuntu_release": "22.04",
+      "ubuntu_codename": "jammy",
+      "glibc_series": "2.35",
+      "architecture": "amd64",
+      "source_image": "ubuntu:22.04",
+      "libc_container_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_container_path": "/lib64/ld-linux-x86-64.so.2"
+    },
+    {
+      "id": "ubuntu-24.04-glibc-2.39-amd64",
+      "ubuntu_release": "24.04",
+      "ubuntu_codename": "noble",
+      "glibc_series": "2.39",
+      "architecture": "amd64",
+      "source_image": "ubuntu:24.04",
+      "libc_container_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_container_path": "/lib64/ld-linux-x86-64.so.2"
+    }
+  ]
+}

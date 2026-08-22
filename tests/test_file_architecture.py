@@ -602,7 +602,7 @@ def test_web_data_lives_in_data_package() -> None:
 def test_framework_source_never_names_a_benchmark() -> None:
     """The CLAUDE.md grep test, machine-enforced — including comments.
 
-    Layer 1 must know zero benchmark names. ``pentest_remote`` in
+    Layer 1 must know zero benchmark names. ``single_target`` in
     ``target/check_probes.py`` is NOT a benchmark name: it is a declarative
     check-profile key that datasets select via ``challenge.json``, so the
     token list below deliberately uses the benchmark directory names only.
@@ -627,3 +627,43 @@ def test_framework_source_never_names_a_benchmark() -> None:
             if token in text:
                 offenders.append(f"{path.relative_to(root)}: {token}")
     assert offenders == []
+
+
+def test_dockerfiles_deploy_the_sidecar_where_cage_expects_it() -> None:
+    """Every image's COPY target must equal ``CONTAINER_PROXY_SCRIPT_PATH``.
+
+    The path is agreed on across three places that never see each other: the
+    Dockerfile writes it, ``proxy.host`` launches it, and
+    ``Container.kill_agent`` matches its basename to SPARE the sidecar while
+    reaping the agent. That last one silently regressed once — the reaper
+    matched ``sidecar.py`` (the SOURCE name) while the container ran
+    ``container_proxy.py`` (the DEPLOYED name), so the sidecar was never
+    actually spared. A drift here is invisible at import time and only shows up
+    as a truncated proxy log, so pin it.
+    """
+
+    from cage.contracts.execution import CONTAINER_PROXY_SCRIPT_PATH
+
+    root = Path(__file__).resolve().parents[1]
+    dockerfiles = sorted(
+        p for p in (root / "docker").rglob("*Dockerfile") if p.is_file()
+    )
+    assert dockerfiles, "no agent Dockerfiles found"
+
+    offenders: list[str] = []
+    copied: list[str] = []
+    for path in dockerfiles:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("COPY ") or "sidecar.py" not in stripped:
+                continue
+            copied.append(str(path.relative_to(root)))
+            target = stripped.split()[-1]
+            if target != CONTAINER_PROXY_SCRIPT_PATH:
+                offenders.append(
+                    f"{path.relative_to(root)} copies the sidecar to {target}, "
+                    f"expected {CONTAINER_PROXY_SCRIPT_PATH}"
+                )
+
+    assert offenders == []
+    assert copied, "no Dockerfile copies the proxy sidecar"

@@ -12,18 +12,25 @@ record helpers, so this engine owns orchestration, not persistence.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cage.contracts.sample_keys import (
     SAMPLE_MAX_ROUNDS_KEY,
+    SAMPLE_STARTUP_REMINDER_AT_KEY,
+    SAMPLE_STARTUP_REMINDER_MESSAGE_KEY,
+    SAMPLE_STARTUP_REMINDER_UNTIL_KEY,
     SAMPLE_WRAPUP_BEFORE_KEY,
     SAMPLE_WRAPUP_MESSAGE_KEY,
 )
@@ -40,7 +47,10 @@ from cage.artifacts.canonical_marks import (
     _mark_canonical_trial_trajectory_artifact,
 )
 from cage.artifacts.record_snapshots import AGENT_HOME
-from cage.artifacts.run_storage import RunStorage
+from cage.artifacts.run_storage import RunStorage, TRIAL_ERROR_REPORT_FILENAME
+from cage.contracts.exceptions import AgentSetupError
+from cage.contracts.trial_phase import TrialPhase
+from cage.experiment.engine.trial_phase_tracker import TrialPhaseTracker
 from cage.experiment.engine.run_context import ExperimentRun
 from cage.experiment.engine.hooks import HookContext
 from cage.experiment.model import Trial, TrialResult, TrialStatus
@@ -202,6 +212,23 @@ def _effective_trial_wrapup(
         bag.get(SAMPLE_WRAPUP_MESSAGE_KEY),
     )
 
+
+def _effective_trial_startup_reminder(
+    sample: dict[str, Any],
+) -> tuple[int, int, str]:
+    """Resolve a benchmark-owned early reminder window."""
+
+    bag = sample if isinstance(sample, dict) else {}
+    try:
+        reminder_at = int(bag.get(SAMPLE_STARTUP_REMINDER_AT_KEY, -1))
+        reminder_until = int(bag.get(SAMPLE_STARTUP_REMINDER_UNTIL_KEY, -1))
+    except (TypeError, ValueError):
+        return -1, -1, ""
+    message = str(bag.get(SAMPLE_STARTUP_REMINDER_MESSAGE_KEY) or "").strip()
+    if reminder_at <= 0 or reminder_until < reminder_at or not message:
+        return -1, -1, ""
+    return reminder_at, reminder_until, message
+
 def _has_proxy_artifact_mount(container: Container) -> bool:
     """Return whether the current trial proxy dir is bind-mounted in the container."""
     for container_path in container.volumes.values():
@@ -216,6 +243,73 @@ def _append_session_args(command: str, session_args: list[str]) -> str:
         return command
     return f"{command} {' '.join(shlex.quote(str(arg)) for arg in session_args)}"
 
+
+#: Container path holding the task prompt for agents that read it from stdin.
+#: Outside the workspace (which ``reset_directory`` wipes and snapshots diff)
+#: and outside every agent's ``state_paths``, so it survives neither more nor
+#: less than one trial.
+STDIN_PROMPT_PATH = f"{AGENT_HOME}/.cage/prompt.txt"
+
+
+def _stage_stdin_prompt(container: Container, prompt: str) -> str:
+    """Copy *prompt* into the container and return the path it landed at.
+
+    The point is that the prompt text never appears in a command line. An agent
+    launched as ``cli -p '<whole prompt>'`` carries the prompt in its own
+    ``/proc/<pid>/cmdline`` for the entire trial, so its own ``pkill -f <port /
+    service / host the task mentions>`` matches the agent process and kills the
+    session mid-trial. ``docker cp`` (rather than ``Container.write_file``,
+    which shells out a heredoc) is what makes that airtight — even the transient
+    staging command carries only the path.
+    """
+    directory = str(PurePosixPath(STDIN_PROMPT_PATH).parent)
+    quoted = shlex.quote(STDIN_PROMPT_PATH)
+    container.exec(f"mkdir -p {shlex.quote(directory)}", timeout=10.0)
+    handle, host_path = tempfile.mkstemp(prefix="cage-prompt-", suffix=".txt")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+        container.copy_to(host_path, STDIN_PROMPT_PATH)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(host_path)
+    # ``docker cp`` lands the file as root; the agent runs unprivileged.
+    container.exec(f"chown agent:agent {quoted} && chmod 600 {quoted}", timeout=10.0)
+    return STDIN_PROMPT_PATH
+
+
+def _redirect_stdin(command: str, prompt_path: str) -> str:
+    """Feed *prompt_path* to *command* on stdin.
+
+    Applied after ``session_args`` and after the env-var prefix so the
+    redirection attaches to the agent process itself — appending it earlier
+    would leave later arguments dangling behind the ``<``.
+    """
+    if not prompt_path:
+        return command
+    return f"{command} < {shlex.quote(prompt_path)}"
+
+
+def _stdin_prompt_path(container: Container, agent: AgentInstance, prompt: str) -> str:
+    """Stage the prompt for stdin delivery, or return "" to keep it in argv.
+
+    Staging is best-effort: a container that refuses the copy falls back to the
+    argv form, which is merely the old behaviour, rather than failing a trial
+    that would otherwise have run.
+    """
+    if not agent.agent_type.supports_stdin_prompt:
+        return ""
+    try:
+        return _stage_stdin_prompt(container, prompt)
+    except Exception as exc:  # noqa: BLE001 - fall back to the argv form
+        logger.warning(
+            "Could not stage the prompt for stdin delivery (%s); passing it on "
+            "the command line instead — an agent that runs `pkill -f` on a "
+            "phrase from its own prompt may kill its own session",
+            exc,
+        )
+        return ""
+
 def _find_agent_pid(container: Container, pattern: str = "claude") -> str:
     """Find the agent process PID inside the container."""
     # Give the process a moment to start
@@ -229,6 +323,7 @@ def _create_container(
     agent: AgentInstance,
     name: str,
     *,
+    sample: dict[str, Any] | None = None,
     run_dir: Path | None = None,
     trial_id: str | None = None,
     run_id: str = "",
@@ -277,7 +372,7 @@ def _create_container(
         override = benchmark.container_image_override()
         if override:
             image = override
-    return Container(
+    container = Container(
         name=name,
         image=image,
         env_vars={
@@ -295,27 +390,98 @@ def _create_container(
         volumes=volumes,
         #extra_hosts=resolve_extra_hosts_for_url(str(agent.model.base_url)),
         network_mode=run.execution.agent_network_mode,
+        memory_limit=run.execution.agent_memory_limit,
+        cpu_limit=run.execution.agent_cpu_limit,
         cap_add=["NET_RAW", "NET_ADMIN"],
         group_add=group_add,
         labels=labels,
         privileged=privileged,
     )
+    if benchmark is not None and sample is not None and run_dir is not None and trial_id:
+        benchmark.configure_trial_container(
+            container,
+            sample,
+            trial_id=trial_id,
+            trial_dir=run_dir / "trials" / trial_id,
+        )
+    return container
 
-def _setup_container(container: Container, agent: AgentInstance) -> None:
-    """Start container, install agent CLI, run agent-specific setup, install plugins."""
+def _record_agent_cli_version(
+    storage: "RunStorage | None",
+    agent: AgentInstance,
+    *,
+    reported: str,
+    source: str,
+) -> None:
+    """Write down which build of the agent CLI this run actually used.
+
+    The configured value is usually ``latest``, which records an intention
+    rather than a fact — a year of runs all claim the same thing while the
+    binary underneath moves. When a run's behaviour changes for no visible
+    reason, this is the file that says whether the agent changed. Written on
+    the first trial that gets far enough to ask the CLI its version; later
+    trials in the same run rewrite the same answer.
+
+    Never fatal: a run that produced results should not be failed because a
+    bookkeeping file could not be written.
+    """
+    if storage is None or not reported:
+        return
+    try:
+        storage.save_agent_version({
+            "agent": agent.agent_type.name,
+            "configured": agent.version,
+            "reported": reported,
+            "source": source,
+            "image": agent.image or agent.agent_type.default_image,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not record agent CLI version: %s", exc)
+
+
+def _setup_container(
+    container: Container,
+    agent: AgentInstance,
+    phases: "TrialPhaseTracker | None" = None,
+    storage: "RunStorage | None" = None,
+) -> None:
+    """Start container, install agent CLI, run agent-specific setup, install plugins.
+
+    Two phases, not one. Booting the sandbox and preparing the agent inside it
+    fail for unrelated reasons with unrelated fixes — a saturated Docker daemon
+    or a missing image versus an expired credential, an unreachable npm
+    registry, or a plugin that does not exist. Marking the whole function
+    ``setting_up_container`` attributed every agent-setup failure to the
+    container, and left ``agent_setup_error`` unreachable.
+    """
     container.start()
     container.setup_workspace(agent.home)
+
+    if phases is not None:
+        phases.enter(TrialPhase.SETTING_UP_AGENT)
 
     # Install agent CLI (skip if already pre-installed in image)
     version_check = container.exec(agent.agent_type.version_command(), timeout=10.0)
     if version_check.exit_code == 0 and version_check.stdout.strip() not in ("", "unknown"):
         logger.info("Agent CLI already installed: %s", version_check.stdout.strip())
+        _record_agent_cli_version(
+            storage, agent, reported=version_check.stdout.strip(), source="image",
+        )
     else:
         install_cmd = agent.agent_type.install_command(agent.version)
         logger.info("Installing agent CLI: %s", install_cmd)
         install_result = container.exec(install_cmd, timeout=120.0)
         if install_result.exit_code != 0:
-            raise RuntimeError(f"CLI install failed: {install_result.stderr[:500]}")
+            raise AgentSetupError(
+                f"Agent CLI install failed for {agent.agent_type.name} "
+                f"(version={agent.version or 'default'}).\n"
+                f"  Command: {install_cmd}\n"
+                f"  {install_result.stderr[:500]}"
+            )
+        after_install = container.exec(agent.agent_type.version_command(), timeout=10.0)
+        _record_agent_cli_version(
+            storage, agent, reported=after_install.stdout.strip(), source="installed",
+        )
 
     agent.agent_type.setup_container(
         container, home_dir=AGENT_HOME, model=agent.model,
@@ -382,7 +548,11 @@ def run_trial_isolated(
     # surface that as a cancelled TrialResult.
     try:
         gate_cm = scheduler.concurrency_gate(agent)
-        gate_cm.__enter__()
+        # The gate hands back the endpoint this trial holds a slot on (None for
+        # single-endpoint agents). Taking the slot IS the choice of endpoint, so
+        # this value — not a positional round-robin — decides which box the
+        # agent talks to further down.
+        gated_endpoint = gate_cm.__enter__()
     except RuntimeError as exc:
         logger.info("Trial %s cancelled at concurrency gate: %s", trial.id, exc)
         return TrialResult(
@@ -423,6 +593,18 @@ def run_trial_isolated(
     # though the CLI correctly counted only the N trials past the gate.
     _mark_canonical_trial_started(storage=storage, agent=agent, trial=trial)
 
+    # Phase tracking starts here and follows the trial to its terminal status.
+    # ``status="running"`` alone leaves a blind spot that can span hours; the
+    # tracker publishes each stage boundary so both the liveness probe and a
+    # post-mortem know where the trial actually was.
+    phases = TrialPhaseTracker(storage=storage, agent=agent, trial=trial)
+    phases.enter(TrialPhase.STARTING_CONTAINER)
+
+    # Wall-clock start of the executing trial — used to stamp a terminal result
+    # if setup (container launch / target attach) raises below, so the trial is
+    # never left recorded as "running".
+    started = int(time.time() * 1000)
+
     container_name = _build_agent_container_name(
         agent_dir_name,
         run_id,
@@ -432,6 +614,7 @@ def run_trial_isolated(
         run,
         agent,
         container_name,
+        sample=trial.sample,
         run_dir=run_root,
         trial_id=trial.id,
         run_id=run_id,
@@ -455,7 +638,8 @@ def run_trial_isolated(
     target_launch_error: str | None = None
 
     try:
-        _setup_container(container, agent)
+        phases.enter(TrialPhase.SETTING_UP_CONTAINER)
+        _setup_container(container, agent, phases, storage=storage)
         _record_agent_container_resource(
             storage=storage,
             run_id=run_id,
@@ -466,6 +650,7 @@ def run_trial_isolated(
         )
 
         # Launch target stack + connect to network
+        phases.enter(TrialPhase.LAUNCHING_TARGET)
         attach = _launch_and_attach_target(
             agent=agent,
             challenge_client=challenge_client,
@@ -537,9 +722,37 @@ def run_trial_isolated(
             challenge_client=None,  # target already handled above
             run_id=run_id,
             reporter=reporter,
+            phases=phases,
+            endpoint=gated_endpoint,
+        )
+
+    except Exception as exc:
+        # Setup (container ``docker run`` / target attach) raised. ``execute_trial``
+        # classifies its own execution-phase failures, but a setup failure here
+        # used to escape run_trial_isolated entirely — leaving the trial recorded
+        # "running", which the run-end sweep (``finalize_running_trials_as_interrupted``)
+        # then stamped ``user_interrupted``. That mis-attributes an infra failure
+        # (e.g. an agent-container ``docker run`` that timed out because the Docker
+        # daemon was saturated) as a user Ctrl+C. Classify it honestly here, exactly
+        # as execute_trial does: a genuine stop → interrupted; otherwise the real
+        # cause (``trial_error`` with the docker error text), and persist a terminal
+        # result so the trial is never left "running".
+        if scheduler.is_stopped():
+            return _trial_setup_interrupted_result(
+                started=started, storage=storage, trial=trial, trial_id=trial.id,
+            )
+        return _trial_failure_result(
+            exc=exc,
+            run=run,
+            started=started,
+            storage=storage,
+            trial=trial,
+            trial_id=trial.id,
+            failed_phase=phases.current,
         )
 
     finally:
+        phases.enter(TrialPhase.TEARING_DOWN)
         _cleanup_trial_resources(
             agent=agent,
             agent_isolation=agent_isolation,
@@ -636,27 +849,34 @@ def _model_for_trial(model: ModelConfig, trial_index: int) -> ModelConfig:
     return replace(model, api_key=pool[trial_index % len(pool)])
 
 
-def _trial_model_for_agent(agent: AgentInstance, trial_index: int) -> ModelConfig:
+def _trial_model_for_agent(
+    agent: AgentInstance,
+    trial_index: int,
+    *,
+    endpoint: ModelConfig | None = None,
+) -> ModelConfig:
     """Resolve the concrete endpoint a trial should use for ``agent``.
 
-    Composes two round-robins keyed on the global ``trial.index``:
-
     * **Multi-source** (``agent.model_sources``) — interchangeable registered
-      endpoints behind one logical model key. Each trial picks one source, so
-      base_url / api_key / upstream model-name / protocol rotate. The run is
-      still grouped under ``agent.model.id`` (the logical key); the chosen
-      source's own id rides along on the returned model for per-trial
-      traceability and does not change grouping.
+      endpoints behind one logical model key. Which one this trial gets is
+      decided by the scheduler's :class:`EndpointPool`: taking a concurrency
+      slot IS the choice, so a box with more slots naturally takes more trials
+      and a saturated one is skipped. That endpoint arrives here as
+      ``endpoint``. The run is still grouped under ``agent.model.id`` (the
+      logical key); the chosen source's own id rides along on the returned
+      model for per-trial traceability and does not change grouping.
+      Falling back to ``trial_index % n`` covers callers with no pool (single
+      endpoint, or a scheduler that took no slot).
     * **Multi-account** (``api_keys`` on the chosen source) — keys rotate within
-      the source, advancing once per full pass over the sources so every
-      (source, key) pair is used before any repeats.
+      the source by ``trial_index``, so a long run spreads across accounts even
+      though the endpoint itself is no longer picked positionally.
 
     Single source + single key is a no-op. The returned model feeds the agent
     launch command, per-trial credential seeding, and the proxy upstream alike.
     """
     sources = getattr(agent, "model_sources", None) or [agent.model]
     n_src = len(sources)
-    base = sources[trial_index % n_src]
+    base = endpoint if endpoint is not None else sources[trial_index % n_src]
     pool = getattr(base, "api_key_pool", []) or []
     if len(pool) <= 1:
         return base
@@ -960,28 +1180,62 @@ def _trial_failure_result(
     storage: RunStorage,
     trial: Trial,
     trial_id: str,
+    failed_phase: str = "",
 ) -> TrialResult:
-    """Build the FAILED TrialResult + persist meta for an unexpected trial exception."""
+    """Build the FAILED TrialResult + persist meta for an unexpected trial exception.
+
+    Records three things ``str(exc)`` alone cannot answer:
+
+    * ``error_type`` — the exception class. A ``ContainerError`` and a
+      ``KeyError`` from a benchmark's ``prepare_trial`` are different
+      diagnoses that read identically once flattened to a message.
+    * ``failed_phase`` — the lifecycle stage the exception escaped from. This is
+      usually the more useful half: "docker error" is ambiguous, "docker error
+      while launching the target" is not.
+    * the full **traceback**, written to its own trial artifact. It used to
+      reach only ``<run_dir>/.cage.runlog``, a hidden JSON-lines file the
+      inspector never surfaced — so a failed trial showed one truncated line and
+      the actual cause had to be grepped for by hand.
+    """
     ended = int(time.time() * 1000)
     error = str(exc)
+    error_type = type(exc).__name__
     logger.exception("Trial %s failed", trial_id)
 
     trial.status = TrialStatus.FAILED
     trial.error = error
+
+    error_ref = _save_trial_error_report(
+        storage=storage,
+        trial_id=trial_id,
+        exc=exc,
+        error_type=error_type,
+        failed_phase=failed_phase,
+    )
+
+    failure_fields = {
+        "error": error,
+        "error_type": error_type,
+        "failed_phase": failed_phase,
+        "error_report_ref": error_ref,
+    }
+    termination_meta = _trial_termination_metadata(
+        exit_code=-1,
+        timed_out=False,
+        terminated_by_limit=False,
+        error=error,
+        timeout_seconds=run.execution.timeout,
+        error_type=error_type,
+        failed_phase=failed_phase,
+    )
 
     storage.save_trial_meta(trial_id, {
         "trial_id": trial_id,
         "trial_index": trial.index,
         "trial_type": trial.type.value,
         "sample_id": trial.sample_id,
-        "error": error,
-        **_trial_termination_metadata(
-            exit_code=-1,
-            timed_out=False,
-            terminated_by_limit=False,
-            error=error,
-            timeout_seconds=run.execution.timeout,
-        ),
+        **failure_fields,
+        **termination_meta,
         "timing": {
             "started_at_ms": started,
             "ended_at_ms": ended,
@@ -998,14 +1252,43 @@ def _trial_failure_result(
         exit_code=-1,
         timing=Timing(started_at_ms=started, ended_at_ms=ended, duration_ms=ended - started),
         error=error,
-        metadata=_trial_termination_metadata(
-            exit_code=-1,
-            timed_out=False,
-            terminated_by_limit=False,
-            error=error,
-            timeout_seconds=run.execution.timeout,
-        ),
+        metadata={**failure_fields, **termination_meta},
     )
+
+
+def _save_trial_error_report(
+    *,
+    storage: RunStorage,
+    trial_id: str,
+    exc: BaseException,
+    error_type: str,
+    failed_phase: str,
+) -> str:
+    """Persist the full traceback for a failed trial; return its trial-relative ref.
+
+    Best-effort: a trial that already failed must not fail differently because
+    its post-mortem could not be written. Returns "" when nothing was saved.
+    """
+
+    try:
+        report = {
+            "error_type": error_type,
+            "message": str(exc),
+            "failed_phase": failed_phase,
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
+        }
+        path = storage.trial_dir(trial_id) / TRIAL_ERROR_REPORT_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return TRIAL_ERROR_REPORT_FILENAME
+    except Exception as write_exc:  # noqa: BLE001
+        logger.debug("error report not saved for %s: %s", trial_id, write_exc)
+        return ""
 
 
 def _cleanup_trial_resources(
@@ -1097,8 +1380,14 @@ def execute_trial(
     challenge_client: ChallengeClient | None = None,
     run_id: str = "",
     reporter: Any | None = None,
+    phases: TrialPhaseTracker | None = None,
+    endpoint: ModelConfig | None = None,
 ) -> TrialResult:
     """Execute a single trial inside a container.
+
+    ``endpoint`` is the source this trial holds a concurrency slot on, handed
+    down from the scheduler gate. ``None`` means the caller took no slot (no
+    endpoint pool), and the model is resolved positionally instead.
 
     When challenge_client is provided, this will:
     1. Launch a target instance (per_agent mode) via ChallengeClient
@@ -1116,8 +1405,16 @@ def execute_trial(
     trial_id = trial.id
     workspace_dir = agent.home
     started = int(time.time() * 1000)
+    # ``run_trial_isolated`` hands down the tracker it has been feeding since
+    # the concurrency gate, so the phase timeline is continuous across the two
+    # functions. Direct callers (tests, embedders) get a fresh one rather than
+    # having to construct it — an untracked trial would silently reintroduce
+    # the blind spot this exists to close.
+    if phases is None:
+        phases = TrialPhaseTracker(storage=storage, agent=agent, trial=trial)
 
     # target stack lifecycle: launch + connect network
+    phases.enter(TrialPhase.LAUNCHING_TARGET)
     attach = _launch_and_attach_target(
         agent=agent,
         challenge_client=challenge_client,
@@ -1157,6 +1454,7 @@ def execute_trial(
             )
 
         # 1. Snapshot pre-state
+        phases.enter(TrialPhase.SNAPSHOTTING_PRE)
         pre_snapshot = snapshot_state(
             container,
             state_paths=agent.effective_state_paths,
@@ -1172,6 +1470,7 @@ def execute_trial(
         )
 
         # 2. Reset workspace (always fresh per trial)
+        phases.enter(TrialPhase.PREPARING_WORKSPACE)
         container.reset_directory(workspace_dir)
 
         # 2b. Restore shared paths that were wiped by workspace reset.
@@ -1239,6 +1538,7 @@ def execute_trial(
                 )
 
         # 4. Build prompt (user-controlled)
+        phases.enter(TrialPhase.BUILDING_PROMPT)
         prompt = run.benchmark.build_prompt(trial.sample)
         storage.save_trial_prompt(trial_id, prompt)
         _mark_canonical_trial_prompt_artifact(
@@ -1266,13 +1566,12 @@ def execute_trial(
         # rotated key flows to both the proxy upstream and the agent's
         # per-trial credential seeding below, so it's the key that reaches the
         # endpoint. No-op for single-key models.
-        model = _trial_model_for_agent(agent, trial.index)
+        model = _trial_model_for_agent(agent, trial.index, endpoint=endpoint)
         _srcs = getattr(agent, "model_sources", None) or []
         if len(_srcs) > 1:
             logger.info(
-                "Trial %s pinned to source %d/%d (%s -> %s)",
-                trial_id, trial.index % len(_srcs), len(_srcs),
-                agent.model.id, model.id,
+                "Trial %s on source %s of %d (%s -> %s)",
+                trial_id, model.id, len(_srcs), agent.model.id, model.id,
             )
         _pool = getattr(model, "api_key_pool", []) or []
         if len(_pool) > 1:
@@ -1283,6 +1582,7 @@ def execute_trial(
             )
 
         # 5. Start per-trial proxy (inside container)
+        phases.enter(TrialPhase.STARTING_PROXY)
         proxy = None
         proxy_url = ""
         if run.proxy.enabled:
@@ -1299,6 +1599,11 @@ def execute_trial(
             # ``container_proxy.py`` passes it through verbatim.
             _sub_mode = bool(model.auth_source) and not model.base_url
             _sub_upstream = agent.agent_type.subscription_upstream_base_url
+            if _sub_mode and not _sub_upstream:
+                raise RuntimeError(
+                    f"agent {agent.agent_type.name!r} does not support "
+                    f"subscription auth for model {model.id!r}"
+                )
             # RL mode: tag every upstream LLM call with the trial's join key so an
             # external trainer can group one trajectory's calls. Rides the
             # existing ``extra_headers`` channel (host writes it into the proxy
@@ -1314,6 +1619,11 @@ def execute_trial(
             _trial_wrapup_at, _trial_wrapup_message = _effective_trial_wrapup(
                 trial.sample, run, _trial_max_requests
             )
+            (
+                _trial_startup_reminder_at,
+                _trial_startup_reminder_until,
+                _trial_startup_reminder_message,
+            ) = _effective_trial_startup_reminder(trial.sample)
             proxy_config = ProxyInstanceConfig(
                 upstream_base_url=(
                     _sub_upstream if _sub_mode
@@ -1329,11 +1639,15 @@ def execute_trial(
                 http_proxy=run.proxy.upstream_http_proxy,
                 extra_headers=_extra_headers,
                 upstream_extra_body=dict(model.upstream_extra_body or {}),
+                preserve_thinking=model.preserve_thinking,
                 container_log_dir=(
                     _container_trial_proxy_dir(trial_id) if proxy_logs_mounted else ""
                 ),
                 logs_mounted=proxy_logs_mounted,
                 max_requests=_trial_max_requests,
+                startup_reminder_at=_trial_startup_reminder_at,
+                startup_reminder_until=_trial_startup_reminder_until,
+                startup_reminder_message=_trial_startup_reminder_message,
                 wrapup_at=_trial_wrapup_at,
                 wrapup_message=_trial_wrapup_message,
                 max_input_tokens=run.execution.max_input_tokens,
@@ -1341,7 +1655,6 @@ def execute_trial(
                 max_cost=run.execution.max_cost,
                 input_cost_per_1m=model.input_cost_per_1m,
                 output_cost_per_1m=model.output_cost_per_1m,
-                upstream_max_retries=max(0, int(model.max_retries or 0)),
             )
             proxy = start_container_proxy(container, proxy_config)
             proxy_url = proxy.base_url
@@ -1356,6 +1669,7 @@ def execute_trial(
 
         try:
             # 6. Build env vars and execute agent
+            phases.enter(TrialPhase.RUNNING_AGENT)
             agent_env = agent.agent_type.env_vars(
                 proxy_url=proxy_url,
                 model=model,
@@ -1366,14 +1680,18 @@ def execute_trial(
                 workspace_dir=agent.home,
             )
 
+            # Keep the prompt out of the agent's own /proc/<pid>/cmdline where
+            # the CLI can read it from stdin instead; see _stage_stdin_prompt.
+            prompt_path = _stdin_prompt_path(container, agent, prompt)
             launch_cmd = agent.agent_type.build_launch_command(
                 prompt, model=model, max_rounds=effective_max_rounds,
-                proxy_url=proxy_url,
+                proxy_url=proxy_url, stdin_prompt=bool(prompt_path),
             )
             launch_cmd = _append_session_args(launch_cmd, agent.session_args)
 
             env_exports = " ".join(f"{k}='{v}'" for k, v in agent_env.items())
             agent_cmd = f"{env_exports} {launch_cmd}" if env_exports else launch_cmd
+            agent_cmd = _redirect_stdin(agent_cmd, prompt_path)
             full_cmd = f"cd {shlex.quote(workspace_dir)} && {agent_cmd}"
             # Launch agent via exec_async so runtime monitors can stop it on success.
             # Run as the unprivileged ``agent`` user. claude-code's CLI
@@ -1475,7 +1793,7 @@ def execute_trial(
                 # below would block indefinitely on its still-open stdout pipe.
                 # Reap the in-container agent tree first, then guard the drain so
                 # a wedged pipe can never hang the worker thread.
-                container.kill_agent()
+                reaped = container.kill_agent()
                 proc.kill()
                 try:
                     stdout, stderr = proc.communicate(timeout=30)
@@ -1483,6 +1801,16 @@ def execute_trial(
                     proc.kill()
                     stdout, stderr = "", ""
                 exit_code = -1
+                if not reaped:
+                    # Surface it in the trial's own record: this warning goes to
+                    # a logger the run log does not capture, and a surviving
+                    # agent keeps burning host memory and model quota long after
+                    # cage has written the trial off as timed out.
+                    stderr = (stderr or "") + (
+                        "\n[cage] the in-container agent tree could not be "
+                        "confirmed dead after the timeout; it may still be "
+                        "running and consuming host resources.\n"
+                    )
                 logger.warning("Agent execution timed out after %ss", run.execution.timeout)
 
             # Stop monitors
@@ -1560,6 +1888,7 @@ def execute_trial(
         # alive, so materialize its output to the host (e.g. copy the workspace)
         # BEFORE the scoring gather runs — gather then reads agent output from the
         # host, exactly as serve-only does, instead of the live container.
+        phases.enter(TrialPhase.COLLECTING_ARTIFACTS)
         try:
             run.benchmark.on_agent_finish(
                 container=container,
@@ -1636,6 +1965,7 @@ def execute_trial(
             proxy_jsonl.unlink()
 
         # 7. Snapshot post-state + diff
+        phases.enter(TrialPhase.SNAPSHOTTING_POST)
         # Before snapshotting, chown the workspace back to the host user so
         # files docker-cp'd out are readable by the user running `cage`.
         # Even though the agent runs as the unprivileged ``agent`` user
@@ -1784,6 +2114,7 @@ def execute_trial(
         # Failures are swallowed (logged in _score_one_trial); the end-of-
         # agent pass is the recovery path.
         if getattr(run.benchmark.scorer(), "strategy", "per_trial") == "per_trial":
+            phases.enter(TrialPhase.SCORING)
             _score_one_trial(result, run.benchmark, storage)
 
         return result
@@ -1804,9 +2135,11 @@ def execute_trial(
             storage=storage,
             trial=trial,
             trial_id=trial_id,
+            failed_phase=phases.current,
         )
 
     finally:
+        phases.enter(TrialPhase.TEARING_DOWN)
         _cleanup_trial_resources(
             agent=agent,
             agent_isolation=agent_isolation,
@@ -1836,6 +2169,8 @@ def _trial_termination_metadata(
     max_output_tokens: int | None = None,
     max_cost: float | None = None,
     interrupted: bool = False,
+    error_type: str = "",
+    failed_phase: str = "",
 ) -> dict[str, str]:
     """Return stable trial termination metadata for dashboards and web UI.
 
@@ -1857,6 +2192,11 @@ def _trial_termination_metadata(
     classifier then returns ``user_interrupted`` regardless of what
     ``docker exec`` reported as exit_code, because docker exec returncode
     is unreliable when the container is force-removed mid-stream.
+
+    ``error_type`` (exception class name) and ``failed_phase`` (the lifecycle
+    stage it escaped from) are what turn a generic ``trial_error`` into a real
+    category — a container failure, a benchmark bug, a scorer crash. Both are
+    only available on the exception path; every other caller omits them.
     """
     return classify_trial_termination(
         exit_code=exit_code,
@@ -1872,6 +2212,8 @@ def _trial_termination_metadata(
         max_output_tokens=max_output_tokens,
         max_cost=max_cost,
         interrupted=interrupted,
+        error_type=error_type,
+        failed_phase=failed_phase,
     ).to_metadata()
 
 def _looks_like_model_timeout(text: str) -> bool:

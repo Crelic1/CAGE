@@ -142,8 +142,12 @@ cage benchmark serve agent_pentest_bench
 This discovers and serves all of the benchmark's challenge indices
 (`web_exploit_bench` and `post_exploit_bench`) together. The server is
 **long-lived and lazy**: no target container starts until an agent launches one.
-Override the judge with `--judge-model <id>` (§2); expose it to other machines
-with `--host 0.0.0.0 --external-token "$(openssl rand -hex 16)"`.
+Override the judge with `--judge-model <id>` (§2). Expose the **API** to other
+machines with `--host 0.0.0.0 --external-token "$(openssl rand -hex 16)"` — but
+that alone lets a remote caller only *drive* the API; the targets stay on the
+docker network. For an agent on another machine to actually *reach* a target, add
+`--public-host` (see §5 and
+[serve-external-audience](serve-external-audience.md#external-access-serving-an-agent-that-is-not-on-this-host)).
 
 Other flags:
 
@@ -153,6 +157,8 @@ Other flags:
 - `--adapter path/to/module.py:ClassName` — load an extra benchmark adapter
   (repeatable) beyond those discovered under the benchmark.
 - `--open` — open the read-only console in a browser after startup.
+- `--public-host [addr]` / `--max-public-instances <n>` — serve targets to
+  agents **not on this host** (§5); off by default.
 
 ## 4. The evaluation loop (Python SDK)
 
@@ -205,8 +211,14 @@ template, `inst.prompt()` returns the full response
 `{task_prompt, task_prompt_template, prompt_level, …}`, where
 `task_prompt_template` is the same briefing with target addresses shown as
 placeholders (e.g. `{{APPLICATION_TARGETS}}`). The briefing is rendered by the
-benchmark's own `build_prompt`, so it is identical to what `cage run` hands a
-CAGE-managed agent.
+benchmark's own `build_prompt`, so the task, target address, reporting contract,
+and scoring rules match what `cage run` hands a CAGE-managed agent.
+
+One difference by design: the serve briefing **omits the "your environment /
+tooling" section**. `cage run` describes the workspace and tools cage installs
+(a Kali container, `nmap`/`sqlmap`/…); in serve mode cage does not launch the
+agent, so it does not provide that environment — you bring your own, and the
+section is dropped rather than advertise tools that aren't there.
 
 ### 4.2 Per-instance hint tier
 
@@ -313,27 +325,50 @@ instance's bridge subnet (a host process could hit its own target and others'),
 and a mounted `/var/run/docker.sock` lets a process `docker exec` straight into
 the target to read flags/markers. Because docker networks are host-local, this
 strong isolation holds only for a co-located container attached to just its own
-instance network; a genuinely remote agent cannot join that network and must fall
-back to the weaker host-published `entry_urls` (`network_only=false`), which
-exposes ports on the host.
+instance network.
+
+A genuinely remote agent cannot join that network at all. Serving one is an
+explicit server mode — `cage benchmark serve … --public-host` — which publishes
+each challenge's declared entry on the host, advertises it in `entry_urls`, names
+it in the `/prompt` briefing, and caps how many such instances may run at once
+(they share the host's address, so concurrent ones are mutually discoverable).
+See [serve-external-audience](serve-external-audience.md#external-access-serving-an-agent-that-is-not-on-this-host)
+for the trade in full.
 
 ## 6. Results persistence and audit
 
-Each submission is persisted as one trial under
-`.cage_runs/serve__agent_<client_id>/serve/` (the server prefixes the client id
-with `agent_`) — the **same `.cage_runs` tree the inspector reads** — so
-`cage inspect` lists it alongside `cage run` results.
-Semantically, one served benchmark corresponds to "one experiment per external
-agent" (each distinct `client_id` has its own scored run), and each submission
-appends a trial.
+Each submission is persisted as one self-describing directory under the
+benchmark's `.cage_serve/<client_id>/<submission_id>/` (the server prefixes the
+client id with `agent_`). Serve mode has no CAGE-launched agent, so it does not
+reuse the agent-centric `cage run` experiment record — it has its own,
+target-centric log carrying the trial's information minus the agent half:
+
+```
+.cage_serve/<client_id>/<submission_id>/
+  record.json                     # which challenge, which target launch, which
+                                  # grader version, and every scoring pass
+  task_output.json                # the scorer's sample
+  runtime/check_done_output.txt   # frozen verifier evidence
+  workspace/final_answer/…        # your persisted findings (the judge's input)
+  scores/<scorer>.json            # the current verdict
+  scores/passes/…                 # each earlier verdict, never overwritten
+  scores/judge_io.jsonl           # judge audit log
+```
 
 What the caller receives is the **verdict, not a trajectory**:
-`trials/<id>/scores/<scorer>.json` holds the full scoring detail (per-vuln
-`passed` / `verifier_status` / `judge_status`, plus the raw `verifier_results`
-and `judge_findings`), which is exactly what `submit` returns. Because CAGE never
+`scores/<scorer>.json` holds the full scoring detail (per-vuln `passed` /
+`verifier_status` / `judge_status`, plus the raw `verifier_results` and
+`judge_findings`), which is exactly what `submit` returns. Because CAGE never
 ran your agent, there is **no step-by-step LLM/tool trajectory** — the inherent
 limitation of serve mode. If you need the trajectory, use the
 [CAGE-managed path](agent-cage-managed.md).
+
+The findings and the verifier evidence are persisted rather than discarded so a
+verdict can be **re-judged offline later** — when the judge model failed for an
+operational reason (an expired key, a rate limit) rather than because of your
+submission. See [`POST /rescores`](serve-external-audience.md#re-judging-a-scored-submission-post-rescores--get-rescoresrun_id):
+it needs no running instance, re-runs only the judge, and appends the result as
+a new pass without destroying the one it supersedes.
 
 ## Reference
 

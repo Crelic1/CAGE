@@ -1,0 +1,95 @@
+{# Exploit-generation entry. Proves the rebuilt target is FAITHFULLY exploitable
+   by running an exploit against a live clean instance from the player's vantage.
+   Composition: mission -> surfaced materials + live target -> route strategy
+   (adapt vs generate) -> category -> target access -> exp validator workflow ->
+   safety -> output contract. `instance_data.route` carries the RoutePipeline. #}
+# MISSION
+
+Prove that the rebuilt CAGE target for this challenge is *faithfully
+exploitable*: produce an exploit under `solve/` that, run from the player's
+network vantage against a freshly launched clean instance, reaches the
+challenge's intended success signal (captures the flag / triggers the intended
+crash or primitive). A target that boots and answers a readiness probe is NOT
+yet proven — the environment is only faithful once the intended exploit works
+against it.
+
+- challenge: `{{ instance_data.name }}` ({{ instance_data.category }})
+- material profile: `{{ instance_data.route.material_profile }}`
+- pipeline route: `{{ instance_data.route.pipeline_route }}` — {{ instance_data.route.summary }}
+- exploit source: `{{ instance_data.route.exploit_source }}`
+- target maturity: exploit `{{ instance_data.target_maturity.get("exploit", "X1") if instance_data.target_maturity else "X1" }}`
+
+# INPUT MATERIALS
+
+Paths are relative to `{{ workspace }}`. For THIS route you are given exactly
+the roles its exploit source needs:
+
+{% for role in instance_data.route.exp_context_roles %}{% if instance_data.materials.get(role) %}## {{ role }}
+{% for path in instance_data.materials.get(role) %}- `{{ path }}`
+{% endfor %}{% endif %}{% endfor %}
+The frozen environment (Compose, Dockerfiles, `challenge.json`) produced by the
+environment stage is also in the workspace — read it to learn service names,
+ports, protections, and the exact binary/service you must exploit.
+
+# ROUTE STRATEGY
+
+{% include "routes/" ~ instance_data.route.pipeline_route ~ ".j2" %}
+
+# CATEGORY-SPECIFIC REQUIREMENTS
+
+{% include "categories/" ~ instance_data.category_profile ~ ".j2" %}
+
+# TARGET ACCESS (PLAYER VANTAGE)
+
+- CAGE launches a clean instance of the just-built target and attaches you to
+  its private network. Reach the service the way a contestant would: at its
+  container IP and internal port. You have NO host/loopback/docker-socket access
+  to the target and must not seek any.
+- A fresh flag is provisioned into the instance by the harness (via the declared
+  flag contract). You are NOT told its value. The only way to output it is to
+  actually exploit the live service — a hardcoded or writeup-copied flag proves
+  nothing and is rejected.
+
+# EXP VALIDATOR WORKFLOW
+
+- Write your exploit under `solve/` (e.g. `solve/solve.py`). Keep it
+  deterministic and self-contained; it must target the live instance address
+  the harness passes in, not a hardcoded host/port.
+- Use `cage-exploit` to ask the host-side validator to launch a clean instance
+  and run your `solve/` against it from the player vantage. It returns a
+  structured **factual observation** — reached banner, leaked value, crash site,
+  control primitive, whether the provisioned flag was captured — NOT a verdict
+  that blames the environment or the exploit.
+- A failed `(environment, exploit)` pair is not attributable to one side from
+  one observation. If the observation shows an environment fidelity gap (e.g. a
+  leaked libc address inconsistent with the intended runtime, a wrong loader, a
+  mismatched protection), fix the ENVIRONMENT files; if it shows an exploit
+  logic error against a faithful runtime, fix the EXPLOIT. Re-run `cage-exploit`.
+- Iterate within the check budget. If the pair cannot be closed with the
+  supplied evidence, stop and emit a structured `unresolved` blocker naming the
+  last confirmed milestone — do not fabricate success.
+
+# SAFETY AND AUTHENTICITY RULES
+
+- Exploit only the challenge's intended vulnerability and solve path. Do not
+  attack the harness, the grader, the flag provisioning, or the Docker host, and
+  do not read the flag through any channel other than the intended exploit.
+- Do not weaken the environment to make the exploit "work" (e.g. disabling
+  protections the authentic target has). Environment changes must stay faithful;
+  the exploit must succeed against the faithful runtime.
+- Preserve the intended primitive. A shortcut that prints the flag without
+  exercising the real vulnerability is a failure, not a pass.
+
+# OUTPUT CONTRACT
+
+Always create `solve_report.json` with: `status` (`solved`|`unresolved`),
+`material_profile`, `pipeline_route`, `exploit_source`, the exploit entrypoint
+under `solve/`, the intended primitive, the success signal, every environment
+fidelity change you had to request, and — for `unresolved` — a non-empty
+`blockers` array (each with `code`, `stage`, `reason`, non-empty `evidence`,
+`next_action`, and the last confirmed exploitation milestone).
+
+For `status: solved`, `solve/` must contain the exploit that the validator ran
+to capture the provisioned flag from the live instance, and `solve_report.json`
+must quote the validator's captured-flag observation. Your own text and any
+local `solve/output.txt` cannot promote the result by themselves.

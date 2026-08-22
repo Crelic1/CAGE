@@ -63,14 +63,39 @@ models:
 | `model` | model name sent upstream |
 | `agent_model_names` | optional per-agent CLI model names, keyed by agent kind |
 | `base_url` | API base URL |
-| `api_key` / `api_keys` | a single key, or a list CAGE pins per-trial round-robin |
+| `api_key` / `api_keys` | a single key, or a pool CAGE pins per-trial round-robin — see [Key & Endpoint Rotation](/model-rotation) |
 | `auth_source` | host credential directory for supported subscription auth |
 | `input_cost_per_1m` / `output_cost_per_1m` | prices used to estimate `max_cost` when the provider reports no cost |
 | `timeout` / `max_retries` | upstream request timeout (default `360`) and retry count |
 | `extra_headers` | headers attached to every upstream model request |
-| `max_context_size` (alias `context_window_size`) | the endpoint's real context window, in tokens — a model capability. Honoured by `kimi_code` / `qwen_code`; unset ⇒ the agent CLI keeps its own default. `claude_code` **cannot** honour it (the Claude Code CLI has no custom-window knob). |
-| `reserved_context_size` | output headroom (tokens) an agent keeps free below `max_context_size` before auto-compacting (`kimi_code`) |
+| `max_context_size` (alias `context_window_size`) | **Required.** The endpoint's context window, in tokens. Agents compact their conversation before it outgrows the window, and every CLI CAGE drives takes that budget as an absolute token count — so CAGE passes this straight through (`claude_code`, `codex`, `kimi_code`, `qwen_code`). It is a property of the *deployment*, not the model: the same weights on two hosts can enforce very different limits, and a server's advertised limit is not always the one it enforces. CAGE will not guess — a missing value is a load-time error. See [Choosing the value](#choosing-max_context_size). |
+| `reserved_context_size` | optional; how much of the window to hold back for the reply, for CLIs that want it spelled out separately rather than deriving it (`kimi_code`). Most CLIs pick their own reply ceiling and subtract it themselves, so leaving this unset is normal. |
 | `rl_reward_sink` | RL-mode switch: URL an external trainer's reward sink listens on. Set it and every LLM call carries an `X-Trial-Id` header and each trial's reward is POSTed here; unset ⇒ an ordinary model. Also settable via `cage model set --rl-reward-sink`. |
+
+### Choosing `max_context_size`
+
+The number you want is the largest prompt the endpoint will actually accept —
+which is often **not** the number on the model card.
+
+Read it out of the endpoint rather than looking it up. Send a deliberately
+oversized request; most servers name their limit in the rejection, and that
+rejection costs nothing because it happens before any generation:
+
+```
+This model's maximum context length is 262144 tokens. However, you requested …
+Input length (500013 tokens) exceeds the maximum allowed length (224314 tokens).
+```
+
+Do not trust a server's self-report. One endpoint in our own registry answers
+`GET /models` with `max_model_len: 1048576` while refusing anything past
+~224k — the model was built for a 1M window, the server was started with far
+less. The advertised figure describes the weights; only the rejection
+describes the deployment.
+
+If you have to guess, **guess low**. Too small only makes the agent compact
+sooner than it had to. Too large means it never compacts at all: the CLI keeps
+appending until the endpoint refuses the request outright, and a long trial
+dies at the wall with nothing to show for the hours it spent.
 
 > `cage model set --provider` only accepts `openai` / `anthropic` / `vllm`. To
 > register a `gemini` / `google` / `sglang` endpoint, hand-edit
@@ -122,5 +147,7 @@ gets a host-gateway mapping. To egress through a host proxy, set
 ## Related
 
 - [Quick Start](/getting-started/) — register one model and run a trial.
+- [Key & Endpoint Rotation](/model-rotation) — spread a run's load over several
+  API keys (`api_keys`) or several endpoints (`sources`).
 - [The CLI › cage model](/cli-design).
 - [Experiment YAML Reference](/reference/project-yml) — full field tables.

@@ -19,7 +19,10 @@ from cage.contracts.coerce import (
     positive_float_or_none,
     positive_int_or_none,
 )
-from cage.contracts.execution import normalize_max_rounds_config
+from cage.contracts.execution import (
+    DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S,
+    normalize_max_rounds_config,
+)
 from cage.experiment.model._serde import _json_ready
 
 
@@ -333,13 +336,19 @@ def experiment_spec_from_project_mapping(
                     )
                     or 0.0
                 ),
-                request_timeout_s=float(proxy_raw.get("request_timeout", 3600.0) or 3600.0),
+                request_timeout_s=float(
+                    proxy_raw.get("request_timeout", DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S)
+                    or DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
+                ),
                 target_startup_timeout_s=optional_float(target_raw.get("startup_timeout")),
                 target_compose_timeout_s=optional_float(target_raw.get("compose_up_timeout")),
             ),
             proxy=ProxySpec(
                 enabled=bool(proxy_raw.get("enabled", True)),
-                request_timeout_s=float(proxy_raw.get("request_timeout", 3600.0) or 3600.0),
+                request_timeout_s=float(
+                    proxy_raw.get("request_timeout", DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S)
+                    or DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
+                ),
                 upstream_http_proxy=str(proxy_raw.get("upstream_http_proxy", "") or ""),
             ),
             target_enabled=bool(target_raw.get("enabled", True)),

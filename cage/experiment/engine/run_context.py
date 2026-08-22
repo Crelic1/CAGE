@@ -50,6 +50,10 @@ class ExperimentRun:
     benchmark: "Benchmark | None" = None
     agents: "list[AgentInstance]" = field(default_factory=list)
     models: "dict[str, ModelConfig]" = field(default_factory=dict)
+    # Path the registry above was loaded from. Kept so a live run can RE-read it:
+    # ``cage run --tune`` may name an endpoint registered after this run started,
+    # and resolving it needs the file, not the snapshot taken at launch.
+    models_file: str = ""
     benchmark_dir: Path | None = None
     # The pure, declarative view of the same project mapping this run was
     # resolved from (one parser: ``experiment_spec_from_project_mapping``).

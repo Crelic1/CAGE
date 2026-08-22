@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from cage.agents.base.output import normalize_recorded_output
 from cage.artifacts.live_success import load_live_success
+from cage.contracts.jsonio import read_jsonl_entries
 
 if TYPE_CHECKING:
     from cage.experiment.model import TrialRecord
@@ -187,16 +188,10 @@ class ScoringContext:
         )
         if not p.is_file():
             return []
-        entries: list[dict[str, Any]] = []
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return entries
+        # Line-safe read: a scorer that silently loses the tail of a trial's
+        # calls (see cage.contracts.jsonio) would judge on a truncated
+        # trajectory without anything saying so.
+        return read_jsonl_entries(p)
 
     @cached_property
     def live_success(self) -> dict[str, Any] | None:

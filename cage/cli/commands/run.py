@@ -500,10 +500,21 @@ def _normalize_explicit_sample_ids(sample_ids: tuple[str, ...]) -> tuple[str, ..
     help="Max seconds to wait with --wait-for-model (0 = wait indefinitely).",
 )
 @click.option(
-    "--wait-interval", "wait_interval", type=float, default=30.0,
-    help="Seconds between --wait-for-model polls / status refresh (default 30).",
+    "--wait-interval", "wait_interval", type=float, default=None,
+    help="Seconds between --wait-for-model polls / status refresh. "
+         "Unset falls through to runtime.wait_interval (default 10).",
 )
 @click.option("--timeout", type=float, default=None, help="Override runtime.timeout.")
+@click.option(
+    "--image",
+    "image",
+    default=None,
+    help=(
+        "Override the selected agent's container image. Needed when a fleet's "
+        "hosts do not all carry the project.yml default (`--set agents[0].image` "
+        "does not work — --set only walks mappings, not the agents list)."
+    ),
+)
 @click.option(
     "--max-concurrent",
     "--agent-max-concurrent",
@@ -627,6 +638,11 @@ def _normalize_explicit_sample_ids(sample_ids: tuple[str, ...]) -> tuple[str, ..
     ),
 )
 @click.option(
+    "--preflight-only", "preflight_only", is_flag=True,
+    help="Run pre-flight checks against this project's real agent/model config, "
+         "then exit without launching any trial.",
+)
+@click.option(
     "--dry-run", "dry_run", is_flag=True,
     help=(
         "Print which trials WOULD be re-run vs replayed under the current "
@@ -657,6 +673,7 @@ def run(
     wait_timeout: float,
     wait_interval: float,
     timeout: float | None,
+    image: str | None,
     max_concurrent: int | None,
     passk: int | None,
     max_rounds: str | None,
@@ -673,6 +690,7 @@ def run(
     run_id: str,
     resume: bool,
     force: bool,
+    preflight_only: bool,
     dry_run: bool,
     allow_launch_build: bool,
 ) -> None:
@@ -738,6 +756,7 @@ def run(
         max_cost=max_cost,
         set_values=set_values,
         param_values=param_values,
+        image=image,
     )
     if temp_project is not None:
         ctx.call_on_close(lambda path=temp_project: path.unlink(missing_ok=True))
@@ -917,6 +936,64 @@ def run(
             pass
 
     try:
+        # ``runtime.network_containment`` is one switch over three networks, and
+        # it has to be applied before preflight so the checks see the same
+        # networking the trials will get. Brings the egress proxy up (building
+        # its image on first use) and rewrites the switches; raises rather than
+        # letting a run believe it is contained when it is not.
+        from cage.experiment.engine.containment import apply_network_containment
+
+        containment = apply_network_containment(config)
+        if containment:
+            allowed = ", ".join(containment["allow_nets"])
+            click.echo("Network containment ON — the docker host is not on any network this run uses:")
+            click.echo(f"  agent network   {containment['network']} (host holds no address on it)")
+            click.echo(
+                f"  egress proxy    {containment['proxy']}"
+                + (f" → upstream {containment['upstream']}" if containment["upstream"]
+                   else " → direct (no upstream proxy configured)")
+            )
+            click.echo(
+                "  reachable       the internet and this run's targets"
+                + (f", plus model endpoints {allowed}" if allowed
+                   else " (no model endpoint needed a private-network exception)")
+            )
+            click.echo("  unreachable     the docker host: its LAN/tailscale/bridge addresses,")
+            click.echo("                  its published ports, and every other run's targets")
+            if containment["target_enabled"]:
+                click.echo("  target ranges   built the same way; the proxy joins each at launch")
+            click.echo("  dns             cached in the sidecar; queries to a resolver address")
+            click.echo("                  are answered by the egress proxy rather than leaving raw")
+            if containment["stale_proxy"]:
+                click.echo(
+                    f"  STALE PROXY     {containment['proxy']} is running from "
+                    f"{containment['stale_proxy']}, not {containment['image']} — it serves the"
+                )
+                click.echo(
+                    "                  older policy (no DNS caching, no conntrack warnings, no "
+                    "fail-closed egress). Once no run is in flight:"
+                )
+                click.echo(f"                  docker rm -f {containment['proxy']}")
+            click.echo("  verify          python3 scripts/agent_netproxy.py status")
+
+        if preflight_only:
+            # The same gate the run itself uses, on the same fully-resolved
+            # config — every agent with its real ``session_args``, ``home``,
+            # ``skill``, ``plugins`` and compaction settings, and every model
+            # source. ``cage agent debug --check`` builds an agent from flags
+            # and therefore cannot see any of that; this can, because it checks
+            # the project rather than a reconstruction of it.
+            from cage.experiment.engine.preflight import run_preflight
+
+            samples = list(
+                config.benchmark.iter_samples_limited(
+                    config.sample_limit, config.sample_ids, config.sample_slice,
+                )
+            )
+            run_preflight(config, samples=samples)
+            click.echo("\nPre-flight passed. Nothing was run.")
+            return
+
         summary = run_experiment(config, make_reporter=create_run_reporter_with_contract)
     except ResumeCompatibilityError as exc:
         raise click.UsageError(str(exc)) from exc

@@ -146,6 +146,7 @@ def prepare_project_for_run(
     max_cost: float | None,
     set_values: tuple[str, ...],
     param_values: tuple[str, ...] = (),
+    image: str | None = None,
 ) -> tuple[Path, Path | None, str]:
     """Resolve and materialize the effective project for a run.
 
@@ -184,6 +185,26 @@ def prepare_project_for_run(
                     field="max_concurrent",
                     value=max_concurrent,
                     flag="--max-concurrent",
+                )
+            except ValueError as exc:
+                raise click.UsageError(str(exc)) from exc
+        changed = True
+    if image:
+        # Agents live in a list, and `--set` only walks mappings — `--set
+        # agents[0].image=…` silently creates a junk top-level key instead of
+        # overriding anything. Route the image through the same selected-agent
+        # helper `--max-concurrent` uses so a fleet can pin one image per host
+        # without forking the project.yml.
+        if resume and not agent_ids:
+            _override_all_agents_field(raw, field="image", value=image, flag="--image")
+        else:
+            try:
+                override_selected_agent_field(
+                    raw,
+                    agent_ids=agent_ids,
+                    field="image",
+                    value=image,
+                    flag="--image",
                 )
             except ValueError as exc:
                 raise click.UsageError(str(exc)) from exc

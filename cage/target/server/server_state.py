@@ -30,13 +30,48 @@ TARGET_SERVER_NAMESPACE = os.getenv("TARGET_SERVER_NAMESPACE", "default")
 # When unset, the server runs in legacy single-audience mode: every caller
 # is treated as internal regardless of headers, preserving back-compat.
 EXTERNAL_TOKEN: Optional[str] = os.getenv("TARGET_SERVER_EXTERNAL_TOKEN") or None
+# External-access mode (``cage benchmark serve --public-host``). Empty = off:
+# every launch stays network-only and targets never touch the host. ``auto`` =
+# on with the advertised address derived per request; any other value = on with
+# that address pinned. See ``server/public_access.py`` for the whole contract.
+PUBLIC_HOST = os.getenv("TARGET_SERVER_PUBLIC_HOST", "").strip()
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, "") or default).strip())
+    except ValueError:
+        logger.warning("%s is not an integer; using %d", name, default)
+        return default
+
+
+# How many host-published instances may run at once. Once entries are on
+# ``0.0.0.0`` the host's address is a shared namespace: concurrent public
+# instances are mutually discoverable by a port scan, so the default is one.
+# 0 = unlimited (the operator accepting that trade explicitly).
+MAX_PUBLIC_INSTANCES = max(0, _int_env("TARGET_SERVER_MAX_PUBLIC_INSTANCES", 1))
+# How often the reaper looks for instances whose ``?ttl=`` lease has run out.
+INSTANCE_REAP_INTERVAL_S = float(os.getenv("TARGET_SERVER_INSTANCE_REAP_INTERVAL_S", "10"))
+# Largest ``POST /submit`` body accepted, in bytes. The upload is an agent's
+# ``final_answer/`` archive — kilobytes in practice — and it is read into memory
+# to be unpacked, so an unbounded body is a memory lever for any caller. 1 GiB.
+MAX_SUBMIT_UPLOAD_BYTES = _int_env("TARGET_SERVER_MAX_SUBMIT_UPLOAD_BYTES", 1024 * 1024 * 1024)
 DOCKER_NETWORK = f"cage_bench_{TARGET_SERVER_NAMESPACE}"
-STARTUP_TIMEOUT_S = float(os.getenv("TARGET_SERVER_STARTUP_TIMEOUT_S", "120"))
+# Startup/health budgets are aligned to the 20-minute ``COMPOSE_UP_TIMEOUT_S``
+# so a slow-but-valid target counts as success as long as it comes up within
+# ~20 min. Heavy multi-service stacks (e.g. a Spring Cloud cluster whose gateway
+# JVM + nacos registration take ~6 min, with frontends health-gated behind it)
+# would otherwise be failed by the 120s readiness stages or — worse — repeatedly
+# torn down and restarted by the background health monitor's short per-instance
+# check. ``HEALTH_TIMEOUT_S`` stays small on purpose: it is the timeout for a
+# *single* probe request, not a readiness budget; inflating it would let one hung
+# probe stall a whole check.
+STARTUP_TIMEOUT_S = float(os.getenv("TARGET_SERVER_STARTUP_TIMEOUT_S", "1200"))
 STARTUP_POLL_INTERVAL_S = float(os.getenv("TARGET_SERVER_STARTUP_POLL_INTERVAL_S", "1.0"))
 PORT_OPEN_STABILITY_CHECKS = max(1, int(os.getenv("TARGET_SERVER_PORT_OPEN_STABILITY_CHECKS", "2")))
 HEALTH_TIMEOUT_S = float(os.getenv("TARGET_SERVER_HEALTH_TIMEOUT_S", "2.0"))
 INSTANCE_HEALTH_TIMEOUT_S = float(
-    os.getenv("TARGET_SERVER_INSTANCE_HEALTH_TIMEOUT_S", str(max(10.0, HEALTH_TIMEOUT_S)))
+    os.getenv("TARGET_SERVER_INSTANCE_HEALTH_TIMEOUT_S", "1200")
 )
 HEALTH_POLL_INTERVAL_S = float(os.getenv("TARGET_SERVER_HEALTH_POLL_INTERVAL_S", "0.5"))
 NETWORK_REMOVE_RETRY_TIMEOUT_S = float(os.getenv("TARGET_SERVER_NETWORK_REMOVE_RETRY_TIMEOUT_S", "60"))

@@ -42,6 +42,12 @@ class TrialRuntimeSession:
 
         self.run_dir = Path(run_dir).expanduser().resolve()
         self.trial_id = trial_id
+        # A trial's record path is fixed the moment the run is planned, so it is
+        # resolved once and reused. Without this every record write and every
+        # lifecycle event would rescan the run record's full trial-ref list —
+        # O(trials) per call, O(trials²) per run once phase marks made those
+        # calls frequent.
+        self._record_ref: str | None = None
 
     def mark_started(
         self,
@@ -68,6 +74,64 @@ class TrialRuntimeSession:
             event_type="trial_started",
             timestamp=started_at,
         )
+        return record
+
+    def mark_phase(
+        self,
+        *,
+        phase: str,
+        timestamp: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> TrialRecord:
+        """Advance this trial's phase and append a ``trial_phase`` event.
+
+        Two durable effects, deliberately both:
+
+        * the **record** carries the current phase, so any consumer can ask
+          "what is this trial doing right now?" without replaying a log; and
+        * the **event log** gains a timestamped row, so "target launch took
+          eight minutes" is answerable after the fact.
+
+        Best-effort by design. A phase mark is observability, never correctness:
+        losing one must not fail the trial it describes, so persistence errors
+        are logged and swallowed. The caller gets the record it would have
+        written, or the unchanged current one.
+        """
+
+        try:
+            record = ExperimentArtifactWriter(self.run_dir).mark_trial_phase(
+                self.trial_id,
+                phase=phase,
+                timestamp=timestamp,
+                record_ref=self._resolve_record_ref(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "trial phase mark %s skipped for %s in %s: %s",
+                phase,
+                self.trial_id,
+                self.run_dir,
+                exc,
+            )
+            return self.load_record()
+        try:
+            self.append_event(
+                phase=phase,
+                event_type="trial_phase",
+                timestamp=timestamp,
+                payload=payload,
+                # Trial-local only: ~10 of these fire per trial, and the
+                # run-level timeline is shared by every trial in the run.
+                run_level=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "trial phase event %s skipped for %s in %s: %s",
+                phase,
+                self.trial_id,
+                self.run_dir,
+                exc,
+            )
         return record
 
     def mark_finished(
@@ -111,6 +175,7 @@ class TrialRuntimeSession:
         artifact_refs: tuple[str, ...] = (),
         resource_refs: tuple[str, ...] = (),
         error: str | None = None,
+        run_level: bool = True,
     ) -> TrialEvent:
         """Append a lifecycle event to run-level and trial-local logs.
 
@@ -119,6 +184,13 @@ class TrialRuntimeSession:
         requiring consumers to scan and filter the global timeline. Both logs
         use the same ``TrialEvent`` schema so inspect, resume, score, and debug
         tools can share parsers during the migration.
+
+        ``run_level=False`` writes only the trial-local log. High-frequency
+        per-trial events must use it: every append derives its id by counting
+        the existing lines in the target log, so writing them to the run-level
+        timeline — which every trial in the run shares — costs O(events) per
+        append and O(events²) per run. The trial-local log stays a few dozen
+        lines, where that cost is irrelevant.
         """
 
         record = self.load_record()
@@ -135,7 +207,12 @@ class TrialRuntimeSession:
             artifact_refs=artifact_refs,
             resource_refs=resource_refs,
             error=error,
+            log_ref=(
+                "events.jsonl" if run_level else self._trial_event_log_ref()
+            ),
         )
+        if not run_level:
+            return event
         writer.append_trial_event(
             run_id=record.run_id,
             trial_id=record.trial_id,
@@ -214,13 +291,20 @@ class TrialRuntimeSession:
     def _load_record_and_ref(self) -> tuple[TrialRecord, str]:
         """Load the current trial record and its run-relative record ref."""
 
+        record_ref = self._resolve_record_ref()
+        record = ExperimentArtifactReader(self.run_dir).load_trial_record(record_ref)
+        return record, record_ref
+
+    def _resolve_record_ref(self) -> str:
+        """Return this trial's run-relative record ref, resolving it once."""
+
+        if self._record_ref is not None:
+            return self._record_ref
         run_record = ExperimentArtifactReader(self.run_dir).load_record()
         for trial_ref in run_record.trials.records:
             if trial_ref.trial_id == self.trial_id:
-                record = ExperimentArtifactReader(self.run_dir).load_trial_record(
-                    trial_ref.record_ref
-                )
-                return record, trial_ref.record_ref
+                self._record_ref = trial_ref.record_ref
+                return trial_ref.record_ref
         raise KeyError(f"unknown trial_id: {self.trial_id}")
 
     def _append_resource_event(self, record: ResourceRecord) -> None:

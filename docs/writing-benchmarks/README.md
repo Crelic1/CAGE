@@ -93,6 +93,16 @@ Optional hooks:
 | `build_dashboard()` | Emit benchmark-owned dashboard sections |
 | live-check hooks | Customize mid-trial success confirmation |
 
+**`build_prompt()` in serve mode.** When an outside agent drives your target
+([serve mode](/agent-serve-mode)), CAGE does not launch the agent, so it does not
+provide the agent's execution environment. It marks the sample with
+`sample["self_hosted_agent"] = True`. If your prompt describes a workspace or
+pre-installed tooling CAGE would normally supply, gate that part on the flag
+(`include_env = not sample.get("self_hosted_agent")`) so the served briefing does
+not advertise tools the external operator may not have. Everything else — task,
+target address, output contract — stays. Ignoring the flag is fine; the prompt is
+then just used verbatim.
+
 Live scoring evidence is no longer a benchmark hook — it moved to the scorer's
 `gather()` (see [Scoring](#scoring)). Order per trial:
 `on_agent_finish()` → `Scorer.gather()` → `on_trial_complete()`.

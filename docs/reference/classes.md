@@ -44,10 +44,12 @@ Important fields:
 - `extra_headers`;
 - `timeout` (default `360`) and `max_retries`;
 - `input_cost_per_1m` / `output_cost_per_1m`: optional cost accounting;
-- `max_context_size` / `reserved_context_size`: the endpoint's real context
-  window and the response headroom to reserve. `None` ⇒ undeclared (agent falls
-  back to its CLI default). The Claude Code CLI has no window knob, so it cannot
-  honour these;
+- `max_context_size`: the endpoint's context window, in tokens. **Required** —
+  agents use it to decide when to compact, and the registry refuses to load an
+  entry without one. Passed through to `claude_code`, `codex`, `kimi_code` and
+  `qwen_code`;
+- `reserved_context_size`: optional; how much of the window to hold back for the
+  reply, for CLIs that want it stated rather than derived;
 - `rl_reward_sink`: URL that puts this model in RL mode (per-call `X-Trial-Id`
   header + per-trial reward POST). Empty ⇒ ordinary model;
 - `extra`: free-form inference knobs routed off the registry (sampling,
@@ -152,6 +154,15 @@ Other optional hooks:
   score, clamped); only consulted when the model declares `rl_reward_sink`;
 - `build_targets(samples, ...)`: build benchmark target images for samples;
 - `build_dashboard(run_dir)`;
+- `summarize_scores(results)`: how this benchmark rolls trials up into a run
+  summary, as `{metrics: [{label, value, detail?}], pass_at_k: {...}}` — either
+  key optional, default `None` ⇒ the framework's generic answers stand.
+  `metrics` is rendered verbatim on the run card; `pass_at_k` replaces the
+  generic block in `summary.json` and is consumed as data. Neither generic
+  answer is universal: the mean of per-trial ratios weighs a 3-objective sample
+  the same as a 16-objective one, and generic pass@k counts a sample solved only
+  at score `>= 1.0`, writing off every partially-solved target. Layer 1 renders
+  what it is handed and never recomputes it;
 - `cli_options()`: benchmark-owned `cage run` options (`BenchmarkOption`);
 - `variant_display_axes()`: active per-run variant axes for the run summary;
 - live-check hooks: `live_check_triggers()`, `live_check_confirm_polls()`,
@@ -415,7 +426,10 @@ The web package under `cage/web/` owns:
 - trajectory parsing from proxy logs.
 
 Framework web code should stay generic. Benchmark-specific meaning belongs in
-`Benchmark.build_dashboard()`.
+`Benchmark.build_dashboard()` (the dashboard page) and
+`Benchmark.summarize_scores()` (the run-card headline). Both are rendered
+verbatim — if a template ever needs to know *which* benchmark it is drawing, the
+seam is in the wrong place.
 
 ## Related Docs
 

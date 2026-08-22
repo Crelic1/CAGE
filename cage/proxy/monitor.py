@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from cage.contracts.jsonio import iter_jsonl_entries
 from cage.contracts.telemetry import ModelRequestEvent
 from cage.proxy.usage import extract_entry_usage
 from cage.sandbox.containers import Container
@@ -314,7 +315,14 @@ def _parse_proxy_stats(proxy_log_path: Path | None) -> dict[str, Any]:
       - input_tokens, output_tokens, reasoning_tokens (totals)
       - num_requests (successful upstream calls = agent rounds shown as "steps")
       - total_requests (every record incl. failures), errors (failed attempts)
+      - malformed (records that could not be decoded — normally 0)
       - reasoning_content (concatenated thinking from all requests)
+
+    Reads through :func:`cage.contracts.jsonio.iter_jsonl_entries`. Splitting the
+    file any other way (notably ``read_text().splitlines()``) silently drops
+    every record containing a raw U+0085 / U+2028 / U+2029 — which is how a
+    500-call trial once reported 433 requests here while the trial page,
+    reading the same file line-by-line, showed all 500.
     """
     stats: dict[str, Any] = {
         "input_tokens": 0,
@@ -323,22 +331,17 @@ def _parse_proxy_stats(proxy_log_path: Path | None) -> dict[str, Any]:
         "num_requests": 0,
         "total_requests": 0,
         "errors": 0,
+        "malformed": 0,
         "reasoning_content": "",
     }
     if not proxy_log_path or not proxy_log_path.exists():
         return stats
 
-    import json as json_mod
+    def _note_malformed(_line: str) -> None:
+        stats["malformed"] += 1
 
     reasoning_parts: list[str] = []
-    for line in proxy_log_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json_mod.loads(line)
-        except json_mod.JSONDecodeError:
-            continue
+    for entry in iter_jsonl_entries(proxy_log_path, on_malformed=_note_malformed):
         stats["total_requests"] += 1
         if entry.get("status") != "success":
             stats["errors"] += 1
@@ -360,4 +363,12 @@ def _parse_proxy_stats(proxy_log_path: Path | None) -> dict[str, Any]:
                 reasoning_parts.append(rc)
 
     stats["reasoning_content"] = "\n---\n".join(reasoning_parts)
+    if stats["malformed"]:
+        # Never silent: undecodable records mean every downstream total derived
+        # from this file (dashboard usage, results.csv) is an undercount.
+        logger.warning(
+            "%s: %d undecodable record(s) skipped — usage totals are incomplete",
+            proxy_log_path,
+            stats["malformed"],
+        )
     return stats

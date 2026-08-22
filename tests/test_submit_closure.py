@@ -18,7 +18,6 @@ import pytest
 
 from cage.contracts import RUNTIME_STATE_KEY
 from cage.target.server import serve_log
-from cage.target.server import submit as submit_mod
 from cage.target.server.submit import (
     SubmissionError,
     _prompt_level_to_hint,
@@ -118,7 +117,7 @@ def test_score_to_dict_handles_dataclass_and_ducktype():
         explanation: str = ""
         metadata: dict = dataclasses.field(default_factory=dict)
 
-    assert submit_mod._score_to_dict(_Score(1.0, "a", "e"))["value"] == 1.0
+    assert serve_log.score_to_dict(_Score(1.0, "a", "e"))["value"] == 1.0
 
     class _Duck:
         value = 0.5
@@ -126,7 +125,7 @@ def test_score_to_dict_handles_dataclass_and_ducktype():
         explanation = "y"
         metadata = {"m": 1}
 
-    d = submit_mod._score_to_dict(_Duck())
+    d = serve_log.score_to_dict(_Duck())
     assert d["value"] == 0.5 and d["metadata"] == {"m": 1}
 
 
@@ -141,14 +140,14 @@ def test_prompt_level_to_hint_clamps():
 def test_render_task_prompt_threads_operator_level_and_agent_input(tmp_path):
     # Uses the stub benchmark's build_prompt, which echoes the sample.
     challenge = _write_stub_benchmark(tmp_path)
-    challenge["task_profile"] = "pentest_remote"
+    challenge["task_profile"] = "single_target"
     challenge["source_fields"]["agent_input"] = {"application_targets": "http://t:80"}
     instance = {"chal_id": "stub-chalX", "project_name": "p", "services": []}
 
     task_prompt, template = render_task_prompt("rid", instance, challenge, prompt_level="l2")
     assert "http://t:80" in task_prompt        # agent_input from source_fields flows in
     assert "hint=2" in task_prompt             # OPERATOR level is threaded, not agent-chosen
-    assert "profile=pentest_remote" in task_prompt
+    assert "profile=single_target" in task_prompt
     # the template is the same briefing with the target masked to a placeholder
     assert "http://t:80" not in template
     assert "{{APPLICATION_TARGETS}}" in template

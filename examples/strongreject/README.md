@@ -42,9 +42,9 @@ There is no target to build — the flow is just check (render the prompt + conf
 no model call, no cost), then run one trial:
 
 ```bash
-cage benchmark check strongreject --agent claude_code_baseline --model openai-example \
+cage benchmark check strongreject --agent claude_code --model openai-example \
   --sample sr-000000-90732f80a169 --show-prompt
-cage run strongreject --agent claude_code_baseline --model openai-example \
+cage run strongreject --agent claude_code --model openai-example \
   --sample sr-000000-90732f80a169 --passk 1 --max-concurrent 1 --run-id strongreject-smoke-001
 ```
 
@@ -54,7 +54,7 @@ Drop `--sample` to run every prompt. The config's `eval.limit: 5` caps how many
 samples run by default — raise it (or set `--max-sample-num`) for the full 313:
 
 ```bash
-cage run strongreject --agent claude_code_baseline --model openai-example \
+cage run strongreject --agent claude_code --model openai-example \
   --max-sample-num 313 --run-id strongreject-full-001
 ```
 

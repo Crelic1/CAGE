@@ -20,8 +20,10 @@ class AgentInstance:
     # with endpoint fields from the first source. Empty means single-endpoint:
     # the run always uses ``model``.
     model_sources: list[ModelConfig] = field(default_factory=list)
-    # Per-source concurrency caps (source model id → max in-flight trials). A
-    # source absent here takes the default even share of the run's total. Only
+    # Per-source concurrency caps (source model id → max in-flight trials).
+    # A source absent here is UNCAPPED: the framework does not invent a number
+    # for a box whose size it cannot know, so only the agent/global gates apply
+    # to it. ``0`` drains a source — no new trials, in-flight ones finish. Only
     # meaningful with model_sources.
     source_concurrency: dict[str, int] = field(default_factory=dict)
     id: str = ""

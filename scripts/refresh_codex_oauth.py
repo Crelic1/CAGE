@@ -55,6 +55,7 @@ import datetime
 import fcntl
 import json
 import os
+import stat
 import sys
 import time
 import urllib.error
@@ -146,9 +147,11 @@ def _write_inplace(path: Path, data: dict) -> None:
     Deliberately NOT an atomic tmp+rename: a single-file Docker bind mount
     binds the inode at container-start, so a rename (new inode) would leave
     running containers reading the orphaned old inode forever. Writing the same
-    inode lets bind-mounted containers see the refreshed token. Codex writes
-    auth.json ``0o600``; we preserve that.
+    inode lets bind-mounted containers see the refreshed token. Preserve the
+    owner-selected mode as well: CAGE may add group-read permission so the
+    unprivileged container user can consume a read-only mount.
     """
+    original_mode = stat.S_IMODE(path.stat().st_mode)
     payload = (json.dumps(data, indent=2) + "\n").encode()
     with open(path, "r+b") as fp:
         fp.seek(0)
@@ -156,10 +159,7 @@ def _write_inplace(path: Path, data: dict) -> None:
         fp.truncate(len(payload))
         fp.flush()
         os.fsync(fp.fileno())
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    os.chmod(path, original_mode)
 
 
 def _refresh(refresh_token: str, http_proxy: str | None, timeout: float) -> dict:

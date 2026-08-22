@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from cage.experiment.engine.live import fs_signals as _fs_signals
+from cage.experiment.engine.live.run_heartbeat import run_process_is_alive
 
 # Re-exports kept identical to the original module surface so the web package
 # can migrate internally without changing its local imports in the same batch.
@@ -42,15 +43,26 @@ T = TypeVar("T")
 def run_has_live_activity(run_dir: Path) -> bool:
     """True when the run actually has something running right now.
 
-    A trial whose record was never finalized past ``running`` (the process was
-    Ctrl+C-killed mid-flight) leaves a phantom "running" row long after the run
-    is dead. The authoritative liveness signal is filesystem activity: a trial
-    is genuinely live only if a progress file is currently active or the newest
-    progress tick is within the live window. Mirrors the run-level liveness used
-    by the index (``RunInfo.running``) so a dead run never shows "Running".
+    The orchestrator's recorded pid answers this directly, so it is checked
+    first: ``progress.json`` only ticks when the agent makes an LLM call, which
+    means a healthy run reads as dead here during every long quiet stretch — a
+    target image pull, a rate-limit backoff, a single multi-minute agent turn.
+    That inference is what used to demote a live run's trials to "Interrupted".
+
+    The progress-file heuristic below remains the fallback for runs recorded
+    before the heartbeat existed. There, a trial whose record was never
+    finalized past ``running`` (the process was Ctrl+C-killed mid-flight) leaves
+    its ``proxy/progress.json`` on disk with no ``task_output.json``, so it still
+    counts as an *active* trial dir long after the run is dead. Presence of an
+    active dir therefore cannot mean "live"; only a *recent* tick can. That is
+    the same pair of conditions ``_build_run_info`` applies, and the two must
+    keep agreeing.
     """
+    process_alive = run_process_is_alive(run_dir)
+    if process_alive is not None:
+        return process_alive
     signals = scan_run_signals(run_dir)
-    return signals.active_count > 0 or is_recently_active(signals.newest_progress_mtime_ns)
+    return signals.active_count > 0 and is_recently_active(signals.newest_progress_mtime_ns)
 
 
 def dashboard_projection_is_stale(run_dir: Path) -> bool:

@@ -38,11 +38,13 @@ def test_registry_parses_reward_sink(tmp_path) -> None:
         "  rl-policy:\n"
         "    provider: openai\n"
         "    model: rl-policy\n"
+        "    max_context_size: 131072\n"
         "    base_url: http://host:8900/v1\n"
         "    rl_reward_sink: http://host:8900/rl/reward\n"
         "  plain:\n"
         "    provider: openai\n"
-        "    model: plain\n",
+        "    model: plain\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     models = load_models(path)

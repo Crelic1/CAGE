@@ -14,6 +14,28 @@ from typing import Any
 from cage.contracts.coerce import positive_int_or_none
 
 
+# The single default for the proxy's upstream request timeout (seconds). It
+# lives in the dependency-free ``contracts`` floor so every layer that needs the
+# fallback — ``config.sections.ProxyConfig``, the host-side proxy
+# (``proxy.host.ProxyInstanceConfig``), the CLI, and the model spec parser —
+# references one value instead of re-hardcoding ``3600.0``. The in-container
+# sidecar (``proxy.sidecar``) cannot import cage code, so it keeps a literal
+# mirror of this number with a pointer comment.
+DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S: float = 3600.0
+
+# Where the in-container proxy sidecar lands inside every agent image. The
+# Dockerfiles ``COPY cage/proxy/sidecar.py`` to this path, so the process the
+# container actually runs is named ``container_proxy.py`` — NOT ``sidecar.py``.
+# Two layers must agree on the name: the host-side launcher (``proxy.host``)
+# starts it, and the container reaper
+# (``sandbox.containers.Container.kill_agent``) matches on it to SPARE the
+# sidecar, which has to outlive the agent long enough to flush its request log.
+# They sit on opposite sides of the sandbox/proxy boundary, so the string lives
+# on the dependency-free contracts floor instead of being spelled twice.
+CONTAINER_PROXY_SCRIPT_PATH: str = "/opt/cage-proxy/container_proxy.py"
+CONTAINER_PROXY_SCRIPT_NAME: str = "container_proxy.py"
+
+
 @dataclass(frozen=True)
 class Timing:
     """Wall-clock timing captured for a trial or command execution."""

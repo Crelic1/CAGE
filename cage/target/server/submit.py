@@ -28,7 +28,6 @@ scorer; it does not know what any benchmark is.
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import time
 import uuid
@@ -38,6 +37,7 @@ from typing import Any
 from cage.benchmarks.loader import load_benchmark_from_module
 from cage.contracts import RUNTIME_STATE_KEY
 from cage.scoring import ScoringContext
+from cage.target.server.public_access import rewrite_targets_for_public_host
 from cage.scoring.scorer import GatherRuntime
 from cage.target.server import serve_log
 
@@ -125,6 +125,14 @@ def reconstruct_sample(
     return {
         "id": challenge.get("id") or instance.get("chal_id") or run_id,
         "challenge_name": challenge.get("name") or challenge.get("challenge_name"),
+        # The challenge dir on disk (from discovery's ``full_path``). The scorer
+        # resolves each vuln's ground-truth material — ``vulnerability/<id>/``
+        # metadata.json, report.md, verify.py, exploits — relative to this. Serve
+        # / PULL scoring rebuilds the sample here, so without this the LLM judge
+        # gets empty ground truth and every ``LLM_judge`` vuln fails no_match,
+        # even when the exploit actually verified. (The prompt-render path already
+        # carries it — scoring must too.)
+        "challenge_dir": str(challenge.get("full_path") or ""),
         "target_info": target_info,
         RUNTIME_STATE_KEY: {
             "project_name": str(instance.get("project_name") or ""),
@@ -195,6 +203,7 @@ def render_task_prompt(
     challenge: dict[str, Any],
     *,
     prompt_level: str = "l0",
+    public_host: str = "",
 ) -> tuple[str, str]:
     """Render the agent-facing task briefing for a launched instance.
 
@@ -218,6 +227,12 @@ def render_task_prompt(
     tier. Best-effort: returns ``("", "")`` if the benchmark exposes no
     ``build_prompt`` or a field is missing, so a render failure never blocks the
     loop.
+
+    ``public_host`` (set only for an external caller against a host-published
+    instance) rewrites the briefing's docker-internal target addresses to the
+    published ones, so a remote agent is briefed with an address it can reach.
+    The template is masked BEFORE that rewrite, so it keeps its placeholder
+    tokens either way.
     """
     try:
         benchmark = load_benchmark_from_module(resolve_benchmark_module(challenge))
@@ -239,6 +254,18 @@ def render_task_prompt(
     sample["task_profile"] = (
         challenge.get("task_profile") or source_fields.get("task_profile") or ""
     )
+    # The challenge dir on disk — the cage-run orchestrator sets this in
+    # iter_samples; the serve reconstruction must too, because build_prompt reads
+    # it to load the challenge's ``subnet_pool`` when resolving the ``{{ VAR }}``
+    # subnet placeholders in a post-exploitation l1/l2 hint. Without it those
+    # placeholders can't resolve and the hinted briefing renders empty.
+    sample["challenge_dir"] = challenge.get("full_path") or ""
+    # Serve / PULL mode: cage does not launch the agent, so it does not provide
+    # the agent's execution environment (workspace, tooling). Signal that to the
+    # benchmark so its briefing can drop any "here are your installed tools"
+    # section — the external operator supplies their own env. Generic flag, not
+    # a benchmark detail: a benchmark that ignores it just keeps the full prompt.
+    sample["self_hosted_agent"] = True
     # build_prompt's post-exploitation branch turns metadata.entry_services into
     # entry-host URLs from the live inner IPs already in target_info.
     metadata = dict(sample.get("metadata") or {})
@@ -253,19 +280,15 @@ def render_task_prompt(
     except Exception as exc:  # noqa: BLE001
         logger.warning("serve task-prompt render failed for %s: %s", run_id, exc)
         return "", ""
-    return task_prompt, _mask_targets(task_prompt, sample)
-
-
-def _score_to_dict(score: Any) -> dict[str, Any]:
-    """Serialize a benchmark ``Score`` (dataclass or duck-typed) to plain JSON."""
-    if dataclasses.is_dataclass(score) and not isinstance(score, type):
-        return dataclasses.asdict(score)
-    return {
-        "value": getattr(score, "value", None),
-        "answer": getattr(score, "answer", ""),
-        "explanation": getattr(score, "explanation", ""),
-        "metadata": getattr(score, "metadata", {}) or {},
-    }
+    template = _mask_targets(task_prompt, sample)
+    if public_host:
+        task_prompt = rewrite_targets_for_public_host(
+            task_prompt,
+            services=instance.get("services") or [],
+            entry_service_keys=instance.get("entry_service_keys") or [],
+            public_host=public_host,
+        )
+    return task_prompt, template
 
 
 _JUDGE_MODEL_KEYS = ("model_id", "id", "model")
@@ -386,20 +409,11 @@ def score_submission(
         canonical_trial_id=submission_id,
     )
     scores = scorer.score(ctx)
-    scores_out = {name: _score_to_dict(score) for name, score in (scores or {}).items()}
-
-    scores_dir = sub_dir / "scores"
-    scores_dir.mkdir(parents=True, exist_ok=True)
-    score_refs: dict[str, str] = {}
-    for name, payload in scores_out.items():
-        safe = name.replace("/", "_")
-        rel = f"scores/{safe}.json"
-        # Nested under the scorer name — ``{"<scorer>": {value, answer, …}}``.
-        (sub_dir / rel).write_text(
-            json.dumps({name: payload}, ensure_ascii=False), encoding="utf-8"
-        )
-        score_refs[name] = rel
-    canonical_score_ref = next(iter(score_refs.values()), "")
+    scores_out = {
+        name: serve_log.score_to_dict(score) for name, score in (scores or {}).items()
+    }
+    # Nested under the scorer name — ``{"<scorer>": {value, answer, …}}``.
+    canonical_score_ref = serve_log.write_canonical_scores(sub_dir, scores_out)
 
     # Timestamps + provenance.
     ts = now if now is not None else time.time()

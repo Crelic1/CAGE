@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from cage.sandbox.containers import Container
 
 
-DEFAULT_BENCHMARK_ROOT = Path(__file__).resolve().parent / "datasets"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_BENCHMARK_ROOT = _PACKAGE_DIR / "datasets"
 PROOF_PORT_RE = re.compile(r":(?P<port>\d+)")
 CHECK_DONE_OUTPUT_REL_PATH = Path("runtime") / "check_done_output.txt"
 
@@ -45,6 +46,13 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 def _profile_dir_exists(variant: str) -> bool:
     return (PROMPTS_DIR / variant).is_dir()
+
+
+def _as_bool(value: Any) -> bool:
+    """Coerce a yml bool or a CLI ``--expose-check-done true`` string to bool."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _normalize_variant_filter(value: list[str] | str | None) -> set[str] | None:
@@ -63,7 +71,14 @@ def _resolve_benchmark_root(benchmark_root: str | os.PathLike[str] | None = None
         or os.getenv("EVOLVE_CTF_BENCHMARK_ROOT")
         or DEFAULT_BENCHMARK_ROOT
     )
-    root = Path(raw).expanduser().resolve()
+    root = Path(raw).expanduser()
+    # A relative ``benchmark_root`` in the project yml (e.g. ``./datasets``) is
+    # relative to this example package, not the process CWD. Resolving it against
+    # CWD breaks ``cage run cvebench`` / ``cage benchmark check`` from the repo
+    # root (the documented invocation), so anchor relative paths to the package.
+    if not root.is_absolute():
+        root = _PACKAGE_DIR / root
+    root = root.resolve()
     index_path = root / "cvebench.json"
     challenges_root = root / "cvebench"
     if not index_path.is_file():
@@ -274,6 +289,9 @@ def _cvebench_instance_data(sample: dict[str, Any]) -> dict[str, Any]:
             metadata.get("outbound_service_endpoint") or "localhost:8000"
         ),
         "cve_description": sample.get("cve_description") or sample.get("description") or "",
+        "additional_info": sample.get("additional_info")
+        or (dict(sample.get("metadata", {}) or {})).get("additional_info")
+        or "",
         "workspace": "/home/agent/workspace",
     }
 
@@ -290,13 +308,25 @@ class CVEBench(Benchmark):
         *,
         server_url: str | None = None,
         variants: list[str] | str | None = None,
+        expose_check_done: bool | str = False,
     ) -> None:
+        # Keep a relative ``benchmark_root`` relative here; ``setup()`` anchors
+        # it to the package via ``_resolve_benchmark_root``. Pre-resolving would
+        # bake in the process CWD and break repo-root invocations.
         self.benchmark_root = (
-            Path(benchmark_root).expanduser().resolve() if benchmark_root else None
+            Path(benchmark_root).expanduser() if benchmark_root else None
         )
         self._index: dict[str, dict[str, Any]] = {}
         self.challenge_client: ChallengeClient | None = None
         self._server_url = server_url
+        # Opt-in switch: expose the target:9091/done status endpoint to the agent
+        # as a self-check "tool" in the prompt. Upstream CVE-Bench never does this
+        # (completion is checked harness-side), so it defaults OFF. When ON, the
+        # agent may query /done each round, which also fires the reactive
+        # check_on_9091_call monitor for per-round verdict latency. Task-specific
+        # /done semantics (CVE-2024-2624 reload) ship via additional_info
+        # regardless of this flag.
+        self._expose_check_done = _as_bool(expose_check_done)
         # Optional variant allowlist (e.g. ``variants: [one_day]`` in the
         # eval.benchmark yml). When set, iter_samples emits only these variants —
         # this replaces the former CVEBenchOneDayOnly subclass; the difference is
@@ -336,9 +366,17 @@ class CVEBench(Benchmark):
             category = str(challenge.get("category", source_fields.get("category", "")))
             runtime_scoring = _runtime_scoring(source_fields)
             proof_upload = _proof_upload(source_fields)
+            # Upstream CVEBench appends a per-task ``Additional information:``
+            # block to the prompt (metadata.additional_info in eval.yml). Only
+            # 4/40 tasks carry it — e.g. CVE-2024-2624's "GET target:9091/done
+            # reloads the application" hint, which its official exploit path
+            # depends on. Thread it through so build_prompt can render it.
+            eval_payload = _read_yaml(challenge_dir / "eval.yml")
+            additional_info = str(
+                (eval_payload.get("metadata") or {}).get("additional_info") or ""
+            ).strip()
             variant_names = list(challenge.get("variant_names", []) or [])
             if not variant_names:
-                eval_payload = _read_yaml(challenge_dir / "eval.yml")
                 variant_names = list(dict(eval_payload.get("variants", {}) or {}).keys())
             # Drop variants we never want to emit (e.g. `solution`) or that
             # have no matching prompt profile on disk.
@@ -367,11 +405,13 @@ class CVEBench(Benchmark):
                     "variant_prompt": variant_prompt,
                     "description": cve_description,
                     "cve_description": cve_description,
+                    "additional_info": additional_info,
                     "challenge_dir": str(challenge_dir),
                     "challenge_path": str(challenge_path),
                     "compose_files": list(source_fields.get("compose_files", []) or []),
                     "metadata": {
                         "benchmark_family": challenge.get("benchmark_family"),
+                        "additional_info": additional_info,
                         "variant_names": variant_names,
                         "internal_port": source_fields.get("internal_port"),
                         "service_ports": dict(source_fields.get("service_ports", {}) or {}),
@@ -456,10 +496,12 @@ class CVEBench(Benchmark):
 
     def build_prompt(self, sample: dict[str, Any]) -> str:
         variant = str(sample.get("variant") or sample.get("test_type") or "zero_day")
+        instance_data = _cvebench_instance_data(sample)
+        instance_data["expose_check_done"] = self._expose_check_done
         return render_prompt(
             template_dir=PROMPTS_DIR / variant,
             template_type="instance",
-            instance_data=_cvebench_instance_data(sample),
+            instance_data=instance_data,
             workspace="/home/agent/workspace",
             command_docs="",
             skill_descriptions="",

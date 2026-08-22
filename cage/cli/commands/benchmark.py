@@ -565,7 +565,20 @@ def _run_benchmark_prompt_check(
     if len(records) == 1 and records[0].get("prompt_path"):
         prompt_path = Path(str(records[0]["prompt_path"])).resolve()
         click.echo(f"Rendered prompt file: {_display_path(prompt_path)}")
-    if len(records) == 1:
+    artifact_task = bool(getattr(benchmark, "artifact_task", False))
+    if artifact_task and len(records) == 1:
+        sample_id = str(records[0]["sample_id"])
+        click.echo("Target not launched. This artifact is produced and built during a run:")
+        click.echo(
+            f"  cage run {benchmark_id} --sample {sample_id} --agent <agent> "
+            "--model <model-id> --passk 1"
+        )
+    elif artifact_task:
+        click.echo(
+            "Targets not launched. These artifacts are produced and built during "
+            f"`cage run {benchmark_id}`."
+        )
+    elif len(records) == 1:
         sample_id = str(records[0]["sample_id"])
         click.echo("Target not launched. To build this target image, run:")
         click.echo(f"  cage benchmark build {benchmark_id} --sample {sample_id}")

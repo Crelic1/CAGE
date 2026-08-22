@@ -137,7 +137,12 @@ class CustomAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
+        # ``stdin_prompt`` is ignored: the manifest's ``command`` template owns
+        # where ``{task_instruction}`` goes, so the framework cannot know
+        # whether this particular agent would read stdin instead.
+        del stdin_prompt
         tokens = self._base_tokens(model=model, max_rounds=max_rounds, proxy_url=proxy_url)
         tokens["task_instruction"] = shlex.quote(prompt)  # safe to drop into argv
         cmd = self._subst(self.manifest.command, tokens)

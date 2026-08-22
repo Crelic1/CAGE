@@ -224,7 +224,16 @@ def probe_inner_service(
     protocol = str(service.protocol or "tcp").strip().lower() or "tcp"
 
     ext_port = getattr(service, "external_port", None)
-    if ext_port is not None:
+    # A published host port is how the *external audience* reaches the service; it
+    # is not how we verify liveness. For UDP there is no host-side connect probe
+    # (``is_port_open`` is TCP-only), so a published UDP service must skip this
+    # branch and be verified over its inner address via the protocol-aware
+    # docker-exec path below. Otherwise a TCP connect to a UDP-only port (e.g.
+    # SNMP 161/udp) never succeeds and the whole instance false-times-out at
+    # launch — which is exactly what breaks a ``--public-host`` serve (it
+    # publishes every entry, whereas ``cage run`` stays network-only and already
+    # verifies UDP via the exec path).
+    if ext_port is not None and protocol != "udp":
         if protocol == "http":
             try:
                 resp = requests.get(
@@ -267,27 +276,29 @@ def probe_inner_service(
                     ["bash", "-c", f"echo > /dev/tcp/{ip}/{port}"],
                     demux=False,
                 )
-                if exit_code == 127:
+                if exit_code != 0:
                     nc_cmd = f"(echo | nc -w2 {ip} {port}) 2>/dev/null"
                     exit_code, _ = exec_container.exec_run(
                         ["sh", "-c", nc_cmd], demux=False,
                     )
             if exit_code == 0:
                 return True
-            if exit_code == 127:
-                logger.info(
-                    "[InnerProbe] No networking tools in container for %s, using host TCP fallback",
-                    service.service_name,
-                )
-            else:
-                logger.info(
-                    "[InnerProbe] docker exec probe failed for %s on %s:%s (exit=%s)",
-                    service.service_name, ip, port, exit_code,
-                )
-                return False
+            logger.info(
+                "[InnerProbe] in-container probes failed for %s on %s:%s (exit=%s); "
+                "using host TCP fallback",
+                service.service_name, ip, port, exit_code,
+            )
     except Exception as e:
         logger.info("[InnerProbe] docker exec probe unavailable: %s", e)
 
+    if protocol == "udp":
+        # Invariant: a UDP service is never gated on a TCP connect. If the
+        # docker-exec probe above could not run (no peer container on the
+        # network, no ``nc``, or an exec error), treat a running UDP container as
+        # ready rather than failing it on ``is_port_open`` (TCP-only). Mirrors the
+        # exec udp branch's best-effort ``; exit 0`` semantics — UDP is
+        # connectionless, so there is no host-side liveness signal to demand here.
+        return True
     return is_port_open(service.inner_ip, int(service.inner_port), timeout=min(timeout_s, 3.0))
 
 

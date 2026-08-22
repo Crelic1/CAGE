@@ -160,3 +160,30 @@ def test_write_and_load_record_round_trips(tmp_path):
 
 def test_load_record_absent_is_none(tmp_path):
     assert sl.load_record(tmp_path / "nope") is None
+
+
+# --- launch timestamp ------------------------------------------------------- #
+
+
+def test_instance_launch_time_converts_epoch_float_to_iso8601():
+    """The registry stores ``created_at`` as epoch seconds; the record wants ISO8601.
+
+    Regression: this used to ``str()`` the float straight through, persisting
+    ``"1784477577.5390918"`` into every serve submission record's ``launch_time``
+    while the field declared (and readers expected) an ISO8601 string.
+    """
+    got = sl._instance_launch_time({"created_at": 1784477577.5390918})
+    # UTC, so this assertion holds regardless of the machine's local timezone.
+    assert got == "2026-07-19T16:12:57Z"
+
+
+def test_instance_launch_time_passes_through_existing_iso8601():
+    got = sl._instance_launch_time({"launched_at": "2026-07-19T04:30:00Z"})
+    assert got == "2026-07-19T04:30:00Z"
+
+
+def test_instance_launch_time_missing_or_falsy_is_blank():
+    assert sl._instance_launch_time({}) == ""
+    assert sl._instance_launch_time({"created_at": 0}) == ""
+    # A bool is an int in Python but never a timestamp.
+    assert sl._instance_launch_time({"created_at": True}) == ""

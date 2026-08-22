@@ -1,0 +1,29 @@
+## Fast track — reuse the supplied deployment (profile AWPB)
+
+The deployment (`B`) is present and is the primary implementation. This is the
+highest-priority fast track: reuse `B` directly and change only what provably
+will not build or boot without the change.
+
+- Audit the deployment closure before writing anything. Read every supplied
+  deployment file:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  and the local files they reference (COPY/ADD sources, entrypoints, init
+  scripts, lockfiles). Reuse this stack; do not reinvent it.
+- Preserve every declared service (app, db, cache, browser/bot, proxy, init),
+  the topology between them, pinned versions, users, and the flag mechanism.
+- Apply only the smallest evidence-backed compatibility repairs (e.g. an
+  unreachable base tag, a path that no longer resolves). Record each one
+  individually in `build_report.json` with the file, before/after, and why it
+  does not alter the challenge.
+{% if instance_data.materials.get("writeups") %}- Use the writeup(s) only to understand expected behavior and the vulnerability
+  path, so your `runtime_probes` assert the real intended interaction:
+{% for path in instance_data.materials.get("writeups") %}  - `{{ path }}`
+{% endfor %}  Never treat writeup text as deployment source or as a validation flag.
+{% endif %}{% if instance_data.materials.get("source") %}- Cross-check the source when the deployment is ambiguous, but the deployment is
+  authoritative for how the service is actually built and run.
+{% endif %}- A confirmed exploit exists and the exp stage will run it against a fresh
+  instance of what you build. Keep the environment genuinely exploitable:
+  preserve the vulnerable dependency versions, protections, entrypoint, and
+  solve surface exactly. Do not harden the bug away.
+- If a required image or dependency in the closure is unavailable, report that
+  exact blocker before considering any evidence-backed substitution.

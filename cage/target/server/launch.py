@@ -21,7 +21,9 @@ from cage.target.server.launch_runtime import (
 )
 from cage.target.server.network_alloc import (
     allocate_octet_slot,
+    attach_egress_proxy,
     expand_subnet_pool_vars,
+    host_off_networks_enabled,
     release_octet_slot,
     release_reserved_project_local_subnet,
 )
@@ -29,6 +31,14 @@ from cage.target.server.network_admin import (
     capture_project_logs,
     resolve_service_inner_ips,
     self_heal_docker_network,
+)
+from cage.target.server.public_access import (
+    SOURCE_FLAG,
+    external_access_enabled,
+    instance_is_public,
+    max_public_instances,
+    resolve_public_host,
+    ttl_remaining_s,
 )
 from cage.target.server.schemas import EntryUrl, LaunchResponse, ServiceInfo
 from cage.target.server.server_state import (
@@ -42,7 +52,11 @@ from cage.target.server.server_state import (
     find_free_port,
     get_running_instance,
     load_all_challenges,
+    pop_running_instance,
+    running_instances_lock,
     set_running_instance,
+    snapshot_running_instance_ids,
+    update_running_instance,
 )
 from fastapi import HTTPException
 from pathlib import Path
@@ -67,12 +81,22 @@ logger = logging.getLogger(__name__)
 def _entry_service_keys_from_meta(meta: Dict[str, Any]) -> set[str]:
     """Pick the user-facing entry services declared by the challenge.
 
-    Source of truth is ``challenge.json: application_service_keys``. Order
-    is preserved by callers via ``meta['source_fields']``; the set form
-    here is only used for membership checks.
+    Web challenges declare them as ``application_service_keys``;
+    post-exploitation ranges declare them as ``entry_services``. Fall back the
+    same way ``submit._challenge_task`` (the agent prompt) and the
+    ``GET /challenges`` count already do, so the launch response's
+    ``container_addr``/``entry_urls`` advertise exactly the entries the prompt
+    names — not every service that merely happens to sit on the agent network.
+    A range that declares neither yields the empty set (see
+    ``build_container_addrs``: no entries → every internal address is listed).
+    The set form is only used for membership checks.
     """
     source_fields = meta.get("source_fields", {}) or {}
-    keys = source_fields.get("application_service_keys") or []
+    keys = (
+        source_fields.get("application_service_keys")
+        or source_fields.get("entry_services")
+        or []
+    )
     if isinstance(keys, str):
         keys = [keys]
     return {str(k) for k in keys if k}
@@ -225,22 +249,89 @@ def _benchmark_build_command_hint(chal_id: str, meta: dict[str, Any]) -> str:
     return f"cage benchmark build <benchmark> --sample {sample_id}"
 
 
+def _enforce_public_instance_limit(chal_id: str) -> None:
+    """Refuse a public launch when every host-published slot is taken.
+
+    Call with ``running_instances_lock`` held: the caller claims the slot in the
+    same critical section, so the check cannot be won twice.
+
+    The 409 body names the occupants — an agent that is merely queued behind
+    someone else needs to know whose instance is holding the slot and how long
+    is left on its lease, otherwise its only option is to poll blindly.
+    """
+    limit = max_public_instances()
+    if limit <= 0:  # 0 = operator explicitly accepted unlimited
+        return
+    occupants = []
+    for key in snapshot_running_instance_ids():
+        info = get_running_instance(key)
+        if info is None or not instance_is_public(info):
+            continue
+        created_at = info.get("created_at")
+        occupants.append({
+            "run_id": str(info.get("run_id") or key),
+            "chal_id": str(info.get("chal_id") or ""),
+            "uptime_s": (
+                round(time.time() - created_at, 1)
+                if isinstance(created_at, (int, float)) else None
+            ),
+            "ttl_s": info.get("ttl_s"),
+            "ttl_remaining_s": ttl_remaining_s(info),
+        })
+    if len(occupants) < limit:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "public_instance_limit_reached",
+            "message": (
+                f"cannot launch {chal_id!r}: {len(occupants)} of {limit} "
+                "host-published instance slot(s) in use. Once entries are "
+                "published on the host, concurrent instances are mutually "
+                "discoverable by a port scan, so this server caps them. Wait "
+                "for an occupant's lease to expire, DELETE one you own, or "
+                "restart serve with a higher --max-public-instances."
+            ),
+            "max_public_instances": limit,
+            "occupants": occupants,
+        },
+    )
+
+
+def _resolve_advertise_host(public_host: str, public_host_source: str) -> tuple[str, str]:
+    """Fill in the advertise address for call sites that carry no request.
+
+    The endpoints resolve it from the caller's ``Host`` header; the background
+    monitor and other in-process callers have no request, so they fall back to
+    the pinned/derived server-side value.
+    """
+    if public_host:
+        return public_host, (public_host_source or SOURCE_FLAG)
+    return resolve_public_host("")
+
+
 def _reused_launch_response(
     chal_id: str,
     instance: dict,
     *,
     audience: str = "internal",
+    public_host: str = "",
+    public_host_source: str = "",
 ) -> LaunchResponse:
     debug = instance.get("debug", {}) or {}
     network_debug = debug.get("network", {}) or {}
     services = instance["services"]
     entry_keys = set(instance.get("entry_service_keys") or [])
     entry_urls: List[EntryUrl] = []
-    if audience == "external":
+    entry_url_source = ""
+    if instance_is_public(instance):
+        advertise_host, entry_url_source = _resolve_advertise_host(
+            public_host, public_host_source
+        )
         entry_urls = _build_entry_urls(
             services=services,
             entry_service_keys=entry_keys,
-            host_ip=HOST_IP,
+            host_ip=advertise_host,
         )
     return LaunchResponse(
         status="reused",
@@ -254,7 +345,10 @@ def _reused_launch_response(
         debug=debug,
         services=services,
         entry_urls=entry_urls,
+        entry_url_source=entry_url_source if entry_urls else "",
         container_addr=build_container_addrs(services, entry_keys),
+        ttl_s=instance.get("ttl_s"),
+        ttl_remaining_s=ttl_remaining_s(instance),
     )
 
 
@@ -331,6 +425,9 @@ def _launch_challenge_impl(
     audience: str = "internal",
     network_only: bool = False,
     prompt_level: str = "l0",
+    public_host: str = "",
+    public_host_source: str = "",
+    ttl_s: Optional[int] = None,
 ) -> LaunchResponse:
     """Launch (or reuse, or rebuild) the runtime instance for a challenge.
 
@@ -344,6 +441,12 @@ def _launch_challenge_impl(
     first launched with a different audience, it is force-recreated:
     swapping bind IPs without recreate would leave dangling 0.0.0.0
     publishes that defeat the isolation.
+
+    A launch that will host-publish an entry for an external caller is a
+    *public* launch: it consumes one of the server's ``--max-public-instances``
+    slots (claimed atomically with the instance record below, so concurrent
+    launches cannot both slip past the cap) and may carry a ``ttl_s`` lease so
+    an agent that walks away cannot hold the slot forever.
     """
     challenges = load_all_challenges()
     if chal_id not in challenges:
@@ -355,15 +458,38 @@ def _launch_challenge_impl(
     allow_parallel_runs = effective_target_scope == "per_agent"
     entry_service_keys = _entry_service_keys_from_meta(meta)
 
+    # A PUBLIC launch = a --public-host server + this launch not opting back into
+    # network-only. Publish exactly the declared entries on the host, claim one
+    # of the server's public slots, and honour a lease. Publishing is a property
+    # of the server, not of the caller or the token — every launch on a
+    # --public-host server publishes unless it passed ?network_only=true.
+    publish_scope = (
+        "entry_only"
+        if external_access_enabled() and not network_only
+        else "declared"
+    )
+    public_intent = publish_scope == "entry_only"
+    lease_s = int(ttl_s) if isinstance(ttl_s, (int, float)) and ttl_s > 0 else None
+
     existing_instance = None if allow_parallel_runs else get_running_instance(chal_id)
     should_recreate = False
     reason = ""
 
     if existing_instance:
         cached_audience = str(existing_instance.get("audience") or "internal").lower()
+        cached_lifecycle = str(existing_instance.get("lifecycle_state") or "").lower()
         if force_recreate:
             should_recreate = True
             reason = "force_recreate=True"
+        elif cached_lifecycle != "running":
+            # Only a fully-launched ``running`` instance is reusable. A record in
+            # ``launching``/``waiting_health`` is a launch still in flight (for
+            # per_challenge, serialized by the lock, so this only happens if a
+            # prior launch was hard-killed before its cleanup ran) or ``stopping``
+            # a teardown in progress — recreate from scratch rather than hand back
+            # a half-built instance whose services/network fields aren't populated.
+            should_recreate = True
+            reason = f"stale non-running record (lifecycle={cached_lifecycle or 'unset'})"
         elif not is_instance_healthy(chal_id):
             should_recreate = True
             reason = "instance unhealthy (port(s) closed)"
@@ -372,7 +498,13 @@ def _launch_challenge_impl(
             reason = f"audience changed: {cached_audience} -> {audience}"
         else:
             logger.info(f"Reusing healthy instance for {chal_id}")
-            return _reused_launch_response(chal_id, existing_instance, audience=audience)
+            return _reused_launch_response(
+                chal_id,
+                existing_instance,
+                audience=audience,
+                public_host=public_host,
+                public_host_source=public_host_source,
+            )
 
     if should_recreate:
         logger.info(f"Recreating {chal_id} because: {reason}. Cleaning up old instance...")
@@ -424,6 +556,43 @@ def _launch_challenge_impl(
     # ``cleanup_instance`` couldn't find the instance. ``pop_all()``
     # commits on success.
     with contextlib.ExitStack() as failure_cleanup:
+        # Register the instance in a ``launching`` state up front, before any of
+        # the slow work below. The launch is fully synchronous and standing up a
+        # multi-host range (image pull + N containers + readiness probes) can
+        # take minutes, far longer than a caller's client timeout. Without this
+        # early record the in-flight instance is invisible to ``GET /instances``
+        # until the very end, so a caller whose client timed out cannot tell a
+        # slow-but-progressing launch from a failed one, and cannot safely retry
+        # a side-effecting launch. The cleanup callback pops this record on ANY
+        # failure so a crashed launch never leaves a phantom entry; ``pop_all()``
+        # cancels it on success, and the full ``set_running_instance`` below
+        # overwrites this minimal record with the ``running`` instance.
+        #
+        # The public-instance cap is checked and claimed inside the SAME lock
+        # acquisition that writes this record: the slot is taken by intent,
+        # before any port exists, so two concurrent external launches cannot
+        # both read "0 public instances" and both proceed.
+        with running_instances_lock:
+            if public_intent:
+                _enforce_public_instance_limit(chal_id)
+            set_running_instance(
+                run_id,
+                {
+                    "chal_id": chal_id,
+                    "run_id": run_id,
+                    "project_name": project_name,
+                    "cage_run_id": cage_run_id or "",
+                    "audience": audience,
+                    "target_scope": effective_target_scope,
+                    "prompt_level": prompt_level,
+                    "public_intent": public_intent,
+                    "ttl_s": lease_s,
+                    "lifecycle_state": "launching",
+                    "created_at": time.time(),
+                },
+            )
+        failure_cleanup.callback(pop_running_instance, run_id)
+
         saved_existing_instance = existing_instance if should_recreate else None
         runtime_plan = materialize_compose_runtime(
             spec=launch_spec,
@@ -437,6 +606,7 @@ def _launch_challenge_impl(
             audience=audience,
             entry_service_keys=entry_service_keys,
             network_only=network_only,
+            publish_scope=publish_scope,
             challenge_id=chal_id,
         )
         failure_cleanup.callback(_unlink_runtime_compose, runtime_compose_path)
@@ -556,6 +726,22 @@ def _launch_challenge_impl(
             logger.error(f"Up failed:\n{res.stderr}")
             raise HTTPException(500, detail=f"Docker up failed: {res.stderr}")
 
+        # The networks exist only now, and the range's services are already
+        # starting — the proxy has to claim the gateway address before any of
+        # them tries to reach the outside, or those attempts stall on ARP.
+        if host_off_networks_enabled():
+            try:
+                attach_egress_proxy(project_name)
+            except Exception as exc:
+                logger.error("egress proxy attach failed for %s: %s", project_name, exc)
+                raise HTTPException(500, detail=str(exc))
+
+        # Containers created; the remaining time is spent probing readiness.
+        # Advance the visible lifecycle so a reconciling caller can tell "still
+        # pulling/creating" (``launching``) from "up, waiting to become ready"
+        # (``waiting_health``).
+        update_running_instance(run_id, lifecycle_state="waiting_health")
+
         # docker compose can return 0 even if containers exit immediately — verify before reporting success.
         try:
             containers_err = wait_for_containers_running(
@@ -662,18 +848,33 @@ def _launch_challenge_impl(
         # run at different tiers without restarting serve.
         "prompt_level": prompt_level,
         "entry_service_keys": sorted(entry_service_keys),
-        # Wall-clock launch time (epoch seconds). Read only by the management
-        # console's ``GET /instances`` to show per-instance uptime; nothing in
-        # the trial path depends on it.
+        # Holds one of the server's host-published slots (see
+        # ``_enforce_public_instance_limit``); re-stated here because this
+        # record replaces the ``launching`` one wholesale.
+        "public_intent": public_intent,
+        # Lease requested at launch (``?ttl=``). ``None`` = runs until deleted.
+        "ttl_s": lease_s,
+        # Wall-clock launch time, EPOCH SECONDS — the numeric form, because the
+        # readers below do arithmetic on it. Both of them convert to RFC 3339
+        # (``schemas.epoch_to_rfc3339``) before the value escapes this process:
+        # ``GET /instances`` publishes it as ``created_at`` (and derives
+        # ``uptime_s`` from the raw number), and ``serve_log`` records it as a
+        # submission's ``launch_time``. It is also the start of the TTL lease —
+        # stamped here, when the instance is actually up, so a slow launch does
+        # not eat the agent's lease. Nothing in the trial path depends on it.
         "created_at": time.time(),
     })
 
     entry_urls: List[EntryUrl] = []
-    if audience == "external":
+    entry_url_source = ""
+    if public_intent or runtime_plan.external_ports:
+        advertise_host, entry_url_source = _resolve_advertise_host(
+            public_host, public_host_source
+        )
         entry_urls = _build_entry_urls(
             services=final_services,
             entry_service_keys=entry_service_keys,
-            host_ip=HOST_IP,
+            host_ip=advertise_host,
         )
 
     status = "launched" if not should_recreate else "recreated"
@@ -689,5 +890,8 @@ def _launch_challenge_impl(
         debug=debug,
         services=final_services,
         entry_urls=entry_urls,
+        entry_url_source=entry_url_source if entry_urls else "",
         container_addr=build_container_addrs(final_services, entry_service_keys),
+        ttl_s=lease_s,
+        ttl_remaining_s=float(lease_s) if lease_s else None,
     )

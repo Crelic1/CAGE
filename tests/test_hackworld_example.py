@@ -149,5 +149,7 @@ def test_hackworld_project_config_points_to_local_benchmark():
     assert raw["project"]["name"] == "hackworld-cage"
     assert raw["eval"]["benchmark"]["module"] == "./benchmark.py"
     assert raw["eval"]["benchmark"]["class"] == "HackWorld"
-    assert raw["eval"]["benchmark"]["benchmark_root"].endswith("examples/hackworld/datasets")
+    # CTF-family convention: a package-relative ``./datasets`` (resolved against
+    # the benchmark package dir by CtfBenchmark), not an absolute path.
+    assert raw["eval"]["benchmark"]["benchmark_root"] == "./datasets"
     assert raw["runtime"]["agent_network_mode"] == "bridge"

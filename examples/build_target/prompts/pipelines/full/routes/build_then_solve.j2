@@ -1,0 +1,71 @@
+{# Combined build⊕exploit route strategy for the R5 fusion pipeline.
+   Build half copied from env/routes/build_then_solve.j2, exploit half from
+   exp/routes/build_then_solve.j2, made self-contained so `{% include %}` resolves
+   under pipelines/full/ (its own routes/, categories/, _templates/). #}
+## Build the environment — route strategy
+
+Rebuild a faithful, bootable target using the strategy for this route.
+
+## Build then solve — reuse the deployment, exploit comes later (profile AB)
+
+The deployment (`B`) is present and primary. There is no exploit and no writeup:
+an exploit will be GENERATED later from the attachment against what you build, so
+the environment must faithfully preserve the bug and the intended solve surface.
+
+- Audit and reuse the deployment closure; smallest evidence-backed compatibility
+  repairs only, each recorded in `build_report.json`:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  Read every referenced local file (COPY/ADD sources, entrypoints, init
+  scripts, lockfiles) before editing.
+- Preserve every declared service, topology, pinned versions, users, and the
+  flag mechanism. Do not touch the vulnerable component — the later stage needs
+  the exact primitive to stay reachable.
+- With no writeup, derive the intended interaction for `runtime_probes` from the
+  deployment and the attachment only. Cite the exact supplied file for each
+  probe expectation; record inferred behavior as uncertainty, not fact.
+- The exploit generator will analyze the attachment against a fresh instance.
+  Keep the intended solve path intact and reachable: exposed service, correct
+  I/O contract, vulnerable dependency versions, protections, and entrypoint. Do
+  not patch, mock, or harden the target — that would make generation impossible.
+- If a required image or dependency is unavailable, report that exact blocker
+  rather than substituting silently.
+
+## Prove it exploitable — route strategy
+
+With the target frozen, prove it faithfully exploitable: run the exploit
+under `solve/` from the player vantage against a fresh clean instance until
+it captures the harness-minted flag.
+
+Material profile `{{ instance_data.route.material_profile }}`: build material
+(`B`) anchors a faithful environment, but there is no exploit and no writeup —
+nothing describes the intended path. Derive the exploit from the attachment
+alone. This is the hardest route; work the analysis in explicit stages and
+prove each before the next.
+
+## 1. Analysis — locate the vulnerability
+- Triage {% for p in instance_data.materials.attachments %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}{% if instance_data.materials.source %} and source {% for p in instance_data.materials.source %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}:
+  file type, architecture, loader, linked libraries, and protection state
+  (NX/PIE/canary/RELRO).
+- Map the input surface (menu/parser/protocol) and find the bug — overflow,
+  UAF, format string, off-by-one, type confusion. Record the exact
+  function/offset and the evidence (disassembly or decompiler output) that
+  establishes it.
+
+## 2. Primitive — turn the bug into control
+- Decide the primitive the bug yields (write-what-where, PC control, arbitrary
+  read) and build toward it: defeat each protection the target actually has and
+  resolve leaks at runtime against the rebuilt instance's real libc/loader.
+- Confirm the primitive via the R5 `cage-check` replay (control of PC / arbitrary read)
+  before attempting the finish.
+
+## 3. Flag — reach the success signal
+- Drive the primitive to the intended win: shell, win function, or a read of
+  the provisioned flag path. Capture the live-provisioned flag; never a
+  hardcoded one.
+
+## Honest unresolved
+- The environment is build-anchored, so failures are exploit-side. If the
+  attachment does not let you locate an exploitable bug, or the primitive cannot
+  be built from the supplied evidence, stop and emit `unresolved` naming the
+  last confirmed stage (analysis / primitive / flag) and the missing evidence.
+  Do not ship an exploit that only appears to work.

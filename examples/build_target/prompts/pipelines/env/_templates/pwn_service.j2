@@ -1,0 +1,100 @@
+{# Reusable pwn TCP-service scaffold for routes with NO build material.
+   Included only by infer_* env route fragments, guarded to pwn. This is a
+   STARTING POINT to fill in, not a mandate — see the authenticity note. #}
+## Starting scaffold (fill in the placeholders; adapt, do not blindly copy)
+
+Most pwn challenges just expose one binary over TCP via `socat`. The hard part is
+**not** the wrapper — it is reproducing the exact C runtime the exploit is bound
+to. Do the runtime step first; the base image barely matters.
+
+### Step 1 — reproduce the EXACT libc/loader (the #1 fidelity trap)
+
+A dynamic pwn exploit computes every address from ONE specific `libc` build:
+`system`, `__free_hook`, one_gadgets are offsets into *that file*. The version
+number is NOT enough — `Ubuntu GLIBC 2.27-3ubuntu1` and `2.27-3ubuntu1.6` are
+both "2.27" yet put `system` at different offsets (e.g. 0x4f440 vs 0x4f420). Pick
+a base image "because it's glibc 2.27" and the exploit lands on the wrong address
+→ no shell → no flag. This is exactly what libc-database / LibcSearcher exist to
+disambiguate: they fingerprint the exact build from symbol offsets.
+
+Inspect the interpreter, then bind the runtime:
+
+```
+readelf -l chall | grep -i interp     # /lib/ld-musl-* = musl ;  /lib64/ld-linux-* = glibc
+```
+
+- **A libc/loader was shipped** (attachment — the common case): use *those exact
+  files*. Do not substitute a distro libc. `patchelf` the binary onto them:
+  `patchelf --set-interpreter ./ld-linux-x86-64.so.2 --set-rpath . ./chall`
+  (or run `pwninit`, which auto-fetches the matching loader for a shipped libc
+  via libc-database and patchelfs for you). The base image is then irrelevant —
+  a binary built on 18.04 runs correctly on a 20.04 base once patchelf'd to its
+  own libc.
+- **Only `libc.so.6` shipped, no loader** → `pwninit` / libc-database fetches the
+  loader matching that exact build; then patchelf as above.
+- **Neither shipped, only the exploit/writeup** → fingerprint the build from a
+  runtime leak (or the exploit's assumed offsets) with libc-database `find`, pull
+  the exact libc+loader, then patchelf.
+- **musl** (`/lib/ld-musl-*`, NEEDED `libc.so`) → use the matching Alpine base
+  (`FROM alpine` + `apk add socat`); a musl binary on a glibc base will not load
+  at all (`not found`), silent at R3, caught at R5.
+
+### Step 2 — the Dockerfile (glibc + provided libc via patchelf)
+
+```dockerfile
+FROM ubuntu:22.04            # base is just a host; the libc below is what runs
+RUN apt-get update && apt-get install -y socat patchelf && rm -rf /var/lib/apt/lists/*
+WORKDIR /chal
+COPY chall libc.so.6 ld-linux-x86-64.so.2 ./   # the challenge's OWN runtime files
+RUN chmod +x chall libc.so.6 ld-linux-x86-64.so.2 && \
+    patchelf --set-interpreter /chal/ld-linux-x86-64.so.2 --set-rpath /chal /chal/chall
+COPY flag.txt /flag.txt                        # placeholder; the real flag is injected at scoring
+RUN chmod 444 /flag.txt
+CMD ["socat","-T","120","TCP-LISTEN:1024,reuseaddr,fork","EXEC:/chal/chall,stderr"]
+```
+
+Verify the binding before you trust it: `ldd /chal/chall` must resolve
+`libc.so.6 => /chal/libc.so.6`, not the distro path. (For musl: `FROM alpine`,
+`apk add socat`, no patchelf — the Alpine musl already matches.)
+
+Root `docker-compose.yml` (no `ports:` — CAGE allocates the network and reaches the service by container IP):
+```yaml
+services:
+  challenge:
+    image: {{ instance_data.image_names[0] if instance_data.image_names else "ctfenv/example:infer-r3-x0" }}
+    build:
+      context: ./build
+```
+
+`challenge.json` (`target_ports` is an OBJECT keyed by the compose service name, values are integers):
+```json
+{
+  "compose_files": ["docker-compose.yml"],
+  "compose_target_services": ["challenge"],
+  "compose_dependency_services": [],
+  "target_ports": {"challenge": 1024},
+  "target_port_protocols": {"challenge": "tcp"}
+}
+```
+
+**Authenticity note**: `socat` is faithful only when the wrapper is *just* TCP
+exposure. If the original uses nsjail/seccomp AND that sandbox is part of the
+vulnerability or intended solve (sandbox-escape, seccomp-bypass, chroot jail),
+reproduce that sandbox faithfully instead of replacing it with `socat`. When in
+doubt, prefer the authentic wrapper and record the choice in `build_report.json`.
+
+**When a connection connects but immediately dies / stays silent, check in this
+order** (verify each with `cage-check`, which reaches the service like a player):
+1. **Wrong libc/loader (most common)** — a distro libc instead of the challenge's
+   exact build, or a musl binary on a glibc base. Confirm the binding with
+   `readelf -l chall | grep interp` and `ldd chall`; fix per Step 1. This explains
+   the majority of "boots at R3 but no exploit at R5" cases.
+2. **Wrong working directory** — the binary reads its flag by a *relative* path
+   (`system("cat flag.txt")`), so the process CWD must contain the flag. `socat
+   EXEC:` inherits socat's CWD; align it (and the declared `flag_contract.path`)
+   with where the binary reads.
+3. **Block-buffered stdout (rare)** — only if, on the *correct* runtime, the
+   prompt still never reaches the client: the binary neither `setvbuf`s nor
+   flushes and relied on the original wrapper's tty. Reproduce that wrapper
+   (xinetd/nsjail) or `LD_PRELOAD` a `setvbuf(stdout,NULL,_IONBF,0)` shim. Avoid
+   a bare `pty` — it rewrites `\n`↔`\r\n` and can corrupt byte-exact pwn I/O.

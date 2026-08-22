@@ -2,11 +2,16 @@
 
 import gzip
 import json
+import socket
+import ssl
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cage.proxy import sidecar as container_proxy
 from cage.proxy.host import (
@@ -131,6 +136,76 @@ class TestMessageTranslation:
         ]}]
         result = _translate_messages_anthropic_to_openai(msgs)
         assert result == [{"role": "assistant", "content": "answer"}]
+
+
+class TestDirectorReminderInjection:
+    """Director ``reminder`` mode must inject a SIBLING <system-reminder> text
+    block on the last user turn (native Claude Code topology → OpenAI
+    ``role=user``), never nested inside ``tool_result.content`` (which would fold
+    it into the ``role=tool`` observation — a prompt no native turn produces).
+    See CAGE-private issue #3.
+    """
+
+    def _apply(self, request, *, hint="probe the auth path next", mode="reminder"):
+        with patch.object(container_proxy, "_director_cfg", return_value={"mode": mode}), \
+             patch.object(container_proxy, "_director_current_hint", return_value=hint):
+            return container_proxy._director_apply(request, "SYS")
+
+    def _tool_turn_request(self):
+        return {"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {"command": "ls"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "out"},
+            ]},
+        ]}
+
+    def test_reminder_is_sibling_block_not_wedged_into_tool_result(self):
+        request = self._tool_turn_request()
+        self._apply(request)
+        user_blocks = request["messages"][-1]["content"]
+        tool_results = [b for b in user_blocks if b.get("type") == "tool_result"]
+        assert len(tool_results) == 1
+        # the observation is untouched — reminder is NOT folded into it
+        assert tool_results[0]["content"] == "out"
+        # a fresh sibling text block, after the tool_result, carries the reminder
+        assert user_blocks[-1]["type"] == "text"
+        assert user_blocks[-1] is not tool_results[0]
+        assert "<system-reminder>" in user_blocks[-1]["text"]
+        assert "probe the auth path next" in user_blocks[-1]["text"]
+
+    def test_sibling_injection_translates_to_role_user(self):
+        request = self._tool_turn_request()
+        self._apply(request)
+        translated = container_proxy._translate_messages_anthropic_to_openai(request["messages"])
+        assert [m["role"] for m in translated] == ["assistant", "tool", "user"]
+        # reminder reaches the model as a user turn, not as tool-observation text
+        assert translated[1]["content"] == "out"
+        assert "system-reminder" not in translated[1]["content"]
+        assert "<system-reminder>" in translated[-1]["content"]
+
+    def test_string_content_user_turn_stays_single_user_message(self):
+        request = {"messages": [{"role": "user", "content": "please continue"}]}
+        self._apply(request)
+        translated = container_proxy._translate_messages_anthropic_to_openai(request["messages"])
+        assert [m["role"] for m in translated] == ["user"]
+        assert "please continue" in translated[0]["content"]
+        assert "<system-reminder>" in translated[0]["content"]
+
+    def test_system_mode_touches_system_prompt_only(self):
+        request = self._tool_turn_request()
+        original_messages = json.loads(json.dumps(request["messages"]))
+        new_system = self._apply(request, mode="system")
+        assert "<system-reminder>" in new_system
+        assert request["messages"] == original_messages  # messages left untouched
+
+    def test_empty_hint_is_a_noop(self):
+        request = self._tool_turn_request()
+        original_messages = json.loads(json.dumps(request["messages"]))
+        new_system = self._apply(request, hint="")
+        assert new_system == "SYS"
+        assert request["messages"] == original_messages
 
 
 class TestResponseTranslation:
@@ -473,6 +548,114 @@ class TestBuildOpenaiRequest:
 
 
 class TestContainerProxyStartup:
+    def test_start_container_proxy_reports_bounded_stderr_on_failure(self):
+        container = Container(name="test", image="image")
+        container._started = True
+
+        def fake_exec(command: str, **kwargs) -> ExecResult:
+            if "healthz" in command:
+                return ExecResult(
+                    command=command, stdout="000", stderr="", exit_code=7,
+                )
+            if command.startswith("tail -n 20"):
+                return ExecResult(
+                    command=command,
+                    stdout="Traceback\nPermissionError: cannot open log dir\n",
+                    stderr="",
+                    exit_code=0,
+                )
+            return ExecResult(command=command, stdout="", stderr="", exit_code=0)
+
+        container.exec = fake_exec  # type: ignore[method-assign]
+        container.copy_to = MagicMock()
+        container.write_file = MagicMock()
+        container.exec_background = MagicMock(return_value="123")
+
+        config = ProxyInstanceConfig(
+            upstream_base_url="https://example.com/v1",
+            upstream_api_key="key",
+            upstream_protocol="openai",
+            artifact_dir=Path("/tmp/not-used"),
+            trial_id="trial",
+        )
+        with patch("cage.proxy.host.time.sleep"):
+            with pytest.raises(RuntimeError, match="PermissionError: cannot open"):
+                start_container_proxy(container, config)
+
+    def test_start_container_proxy_retries_transient_health_timeout(self):
+        container = Container(name="test", image="image")
+        container._started = True
+        health_timeouts: list[float | None] = []
+
+        def fake_exec(command: str, **kwargs) -> ExecResult:
+            if "healthz" in command:
+                health_timeouts.append(kwargs.get("timeout"))
+                if len(health_timeouts) == 1:
+                    return ExecResult(
+                        command=command,
+                        stdout="000",
+                        stderr="Timed out after 10.0s",
+                        exit_code=-1,
+                    )
+                return ExecResult(command=command, stdout="200", stderr="", exit_code=0)
+            return ExecResult(command=command, stdout="", stderr="", exit_code=0)
+
+        container.exec = fake_exec  # type: ignore[method-assign]
+        container.copy_to = MagicMock()
+        container.write_file = MagicMock()
+        container.exec_background = MagicMock(return_value="123")
+
+        with TemporaryDirectory() as tmpdir:
+            config = ProxyInstanceConfig(
+                upstream_base_url="https://example.com/v1",
+                upstream_api_key="key",
+                upstream_protocol="openai",
+                artifact_dir=Path(tmpdir),
+                trial_id="trial",
+            )
+            with patch("cage.proxy.host.time.sleep"):
+                start_container_proxy(container, config)
+
+        assert health_timeouts == [10.0, 10.0]
+
+    def test_start_container_proxy_retries_transient_setup_timeout(self):
+        container = Container(name="test", image="image")
+        container._started = True
+
+        setup_timeouts: list[float | None] = []
+
+        def fake_exec(command: str, **kwargs) -> ExecResult:
+            if "mkdir -p" in command:
+                setup_timeouts.append(kwargs.get("timeout"))
+                if len(setup_timeouts) == 1:
+                    return ExecResult(
+                        command=command,
+                        stdout="",
+                        stderr="Timed out after 30.0s",
+                        exit_code=-1,
+                    )
+            if "healthz" in command:
+                return ExecResult(command=command, stdout="200", stderr="", exit_code=0)
+            return ExecResult(command=command, stdout="", stderr="", exit_code=0)
+
+        container.exec = fake_exec  # type: ignore[method-assign]
+        container.copy_to = MagicMock()
+        container.write_file = MagicMock()
+        container.exec_background = MagicMock(return_value="123")
+
+        with TemporaryDirectory() as tmpdir:
+            config = ProxyInstanceConfig(
+                upstream_base_url="https://example.com/v1",
+                upstream_api_key="key",
+                upstream_protocol="openai",
+                artifact_dir=Path(tmpdir),
+                trial_id="trial",
+            )
+            with patch("cage.proxy.host.time.sleep"):
+                start_container_proxy(container, config)
+
+        assert setup_timeouts == [30.0, 30.0]
+
     def test_start_container_proxy_uses_configured_mounted_log_dir(self):
         container = Container(name="test", image="image")
         container._started = True
@@ -499,11 +682,15 @@ class TestContainerProxyStartup:
                 trial_id="range1-L0",
                 container_log_dir="/var/lib/cage/proxy",
                 logs_mounted=True,
+                startup_reminder_at=4,
+                startup_reminder_until=16,
+                startup_reminder_message="deliver now",
             )
 
             proxy = start_container_proxy(container, config)
 
         setup_cmd = next(c for c in exec_calls if "mkdir -p" in c)
+        assert "chmod 0644 /opt/cage-proxy/container_proxy.py" in exec_calls
         assert "/var/lib/cage/proxy" in setup_cmd
         assert "progress.json" in setup_cmd
 
@@ -512,6 +699,10 @@ class TestContainerProxyStartup:
         assert ">/var/lib/cage/proxy/stdout.log" in bg_cmd
         assert proxy.log_dir == "/var/lib/cage/proxy"
         assert proxy.logs_mounted is True
+        proxy_config = json.loads(container.write_file.call_args.args[1])
+        assert proxy_config["startup_reminder_at"] == 4
+        assert proxy_config["startup_reminder_until"] == 16
+        assert proxy_config["startup_reminder_message"] == "deliver now"
 
     def test_start_container_proxy_preserves_mounted_log_dir_owner(self):
         container = Container(name="test", image="image")
@@ -708,24 +899,103 @@ class TestContainerProxyStartup:
 
 
 class TestContainerProxyHttpClient:
-    def test_make_http_client_enables_http2(self):
-        captured: dict[str, object] = {}
+    """The transport carries what this proxy used to hand-roll above it."""
 
-        class DummyClient:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        original = container_proxy.httpx.Client
-        container_proxy.httpx.Client = DummyClient  # type: ignore[assignment]
+    def test_transport_pools_connections_and_retries_connects(self):
+        client = container_proxy._make_http_client(12.5)
         try:
-            client = container_proxy._make_http_client(12.5)
+            assert client.timeout.connect == 12.5
+            assert client.trust_env is False
+            pool = client._transport._pool
+            # Keepalive is the fix: a held connection is a name not resolved
+            # again and a handshake not repeated.
+            # Keepalive capacity must equal the ceiling: a connection handed
+            # back while that many are already idle is closed, not kept, so a
+            # lower value silently returns bursts to one connection per call.
+            assert pool._max_keepalive_connections == pool._max_connections
+            # Replaying a failed CONNECT is the transport's job, not ours.
+            assert pool._retries == container_proxy.UPSTREAM_CONNECT_RETRIES
         finally:
-            container_proxy.httpx.Client = original  # type: ignore[assignment]
+            client.close()
 
-        assert isinstance(client, DummyClient)
-        assert captured["timeout"] == 12.5
-        assert captured["trust_env"] is False
-        assert captured["http2"] is True
+    def test_clients_are_shared_per_timeout_and_proxy(self):
+        a = container_proxy._shared_http_client(30.0)
+        b = container_proxy._shared_http_client(30.0)
+        c = container_proxy._shared_http_client(30.0, http_proxy="http://p:3128")
+        assert a is b, "a per-request client is the bug this replaced"
+        assert c is not a, "a proxied client must not be reused for direct calls"
+
+
+class TestContainerProxyTransientErrors:
+    def test_classification_separates_unreachable_from_broken(self):
+        """Drives the 503-vs-502 split the agent's SDK reacts to."""
+        assert container_proxy._is_transient_upstream(socket.gaierror(-3, "again"))
+        assert container_proxy._is_transient_upstream(ssl.SSLEOFError("eof"))
+        assert container_proxy._is_transient_upstream(ConnectionResetError())
+        # A malformed upstream reply is a real error, not something to retry.
+        assert not container_proxy._is_transient_upstream(ValueError("bad json"))
+        # A certificate that does not verify fails identically every time.
+        assert not container_proxy._is_transient_upstream(
+            ssl.SSLCertVerificationError("verify failed"),
+        )
+
+
+class TestProxyServerAcceptsBursts:
+    def test_listen_backlog_is_raised_above_socketserver_s_default(self):
+        """Five is socketserver's default and is not enough.
+
+        Several connections arriving together — subagents, background calls, a
+        retry storm — are then refused by the kernel before this process sees
+        them, and the agent is told "connection reset by peer" about something
+        that never involved the model. Measured: 200 concurrent callers lost 72
+        of 400 requests at the default and none after raising it.
+        """
+        assert container_proxy._ProxyServer.request_queue_size >= 128
+
+
+class TestNetproxyBringupLock:
+    """One proxy per host means bringing it up is host-wide critical section.
+
+    Without it two runs starting together both decide the proxy is absent, and
+    the second force-removes the first one's container as if it were a leftover.
+    """
+
+    def test_holders_do_not_overlap(self, tmp_path, monkeypatch):
+        from cage.sandbox import netproxy
+
+        monkeypatch.setattr(netproxy, "BRINGUP_LOCK_PATH", tmp_path / "bringup.lock")
+        inside = []
+        overlapped = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()
+            with netproxy._bringup_lock(timeout=30) as held:
+                assert held
+                inside.append(1)
+                if len(inside) > 1:
+                    overlapped.append(1)
+                time.sleep(0.25)
+                inside.pop()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert overlapped == [], "two runs were inside the bring-up sequence at once"
+
+    def test_an_unusable_lock_path_does_not_fail_the_run(self, tmp_path, monkeypatch):
+        from cage.sandbox import netproxy
+
+        # A directory can never be opened O_RDWR: stands in for a lock file
+        # owned by another user on a shared host.
+        blocked = tmp_path / "not-a-file"
+        blocked.mkdir()
+        monkeypatch.setattr(netproxy, "BRINGUP_LOCK_PATH", blocked)
+        with netproxy._bringup_lock(timeout=5) as held:
+            assert held is False, "should report it is unserialised, not raise"
 
 
 class TestContainerProxyProgress:
@@ -1780,3 +2050,61 @@ class TestGeminiProjection:
         out = container_proxy._gemini_response_to_openai(acc, request_id="r3")
         assert out["choices"][0]["message"]["content"] == "Hello"
         assert out["usage"]["prompt_tokens"] == 3
+
+
+class TestBillingHeaderStripping:
+    """Claude Code prepends a billing header whose ``cch`` field is re-randomised
+    on every call. Anthropic caches from explicit ``cache_control`` breakpoints
+    and doesn't care, but every OpenAI-protocol upstream caches by *prefix*, and
+    the header sits at the head of a 25 KB system prompt — so those five hex
+    characters cost the full uncached price on every single turn. Measured
+    against boyue/deepseek-v4-flash: 0% cache hit with it, 97% without.
+    """
+
+    HEADER = (
+        "x-anthropic-billing-header: cc_version=2.1.150.aa4; "
+        "cc_entrypoint=sdk-cli; cch={cch};\n"
+    )
+    BODY = "You are a Claude agent.\n\nDo the thing."
+
+    def _req(self, cch):
+        return {
+            "model": "claude-3",
+            "system": self.HEADER.format(cch=cch) + self.BODY,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+
+    def test_host_strips_billing_header(self):
+        payload, _, mod = _build_openai_request(self._req("7ddef"), modify_rules=[])
+        assert "billing-header" not in payload["messages"][0]["content"]
+        assert mod == self.BODY
+
+    def test_container_strips_billing_header(self):
+        payload, _, mod = container_proxy._build_openai_request(self._req("7ddef"))
+        assert "billing-header" not in payload["messages"][0]["content"]
+        assert mod == self.BODY
+
+    def test_system_is_byte_stable_across_calls(self):
+        """The invariant that actually matters: two calls that differ only in
+        the volatile ``cch`` must produce a byte-identical system prompt."""
+        for build, kwargs in (
+            (_build_openai_request, {"modify_rules": []}),
+            (container_proxy._build_openai_request, {}),
+        ):
+            a, _, _ = build(self._req("7ddef"), **kwargs)
+            b, _, _ = build(self._req("930ba"), **kwargs)
+            assert a["messages"][0]["content"] == b["messages"][0]["content"]
+
+    def test_stripped_even_when_a_template_wraps_it(self):
+        payload, _, _ = container_proxy._build_openai_request(
+            self._req("7ddef"), system_template="PREFIX\n{{ system_raw }}\nSUFFIX",
+        )
+        assert "billing-header" not in payload["messages"][0]["content"]
+        assert "PREFIX" in payload["messages"][0]["content"]
+
+    def test_leaves_an_ordinary_system_prompt_alone(self):
+        req = {"model": "claude-3", "system": "You are helpful",
+               "messages": [{"role": "user", "content": "Hi"}]}
+        payload, _, mod = _build_openai_request(req, modify_rules=[])
+        assert mod == "You are helpful"
+        assert payload["messages"][0]["content"] == "You are helpful"

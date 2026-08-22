@@ -1188,6 +1188,7 @@ agents:
     _save_canonical_experiment_snapshot(config, agent, storage, [trial], run_id)
 
     def _fake_run_trial(*_args, **_kwargs):
+        _mark_canonical_trial_started(storage=storage, agent=agent, trial=trial)
         return TrialResult(
             trial_id=trial.id,
             trial_index=trial.index,
@@ -1233,6 +1234,102 @@ agents:
     assert trial_record["completed_at"]
     assert trial_record["termination"]["reason"] == "agent_exit_nonzero"
     assert trial_record["termination"]["exit_code"] == 2
+
+
+def test_parallel_trial_runner_terminalizes_escaped_bootstrap_error(
+    tmp_path, monkeypatch,
+):
+    """A container/bootstrap exception must not leave record.json running."""
+    project_dir = tmp_path / "examples" / "demo"
+    project_dir.mkdir(parents=True)
+    project_file = project_dir / "project.yml"
+    project_file.write_text("project:\n  name: demo\n", encoding="utf-8")
+    agent = SimpleNamespace(
+        subject_plan_id="demo_agent:demo-model:stateless",
+        id="demo_agent",
+        label=lambda: "demo_agent:demo-model:stateless",
+        model=SimpleNamespace(id="demo-model"),
+        agent_type=SimpleNamespace(name="demo_agent"),
+        stateful=False,
+        shared_paths=[],
+        trial_max_workers=1,
+        max_concurrent=1,
+    )
+    config = ExperimentRun(
+        name="demo",
+        project_file=project_file,
+        benchmark=_OneSampleBenchmark(),
+        benchmark_dir=project_dir,
+        agents=[agent],
+        models={},
+        hooks=HookRegistry(),
+        logging=LoggingConfig(),
+        execution=ExecutionConfig(max_trials_global=1, passk=1, max_rounds=5),
+        target=TargetConfig(enabled=False),
+    )
+    run_id = "run-bootstrap-error"
+    storage = RunStorage(
+        project_dir
+        / ".cage_runs"
+        / "demo_agent:demo-model:stateless"
+        / run_id,
+        agent_label=agent.label(),
+    )
+    trial = Trial(
+        id="range1",
+        index=0,
+        type=TrialType.TASK,
+        sample={"id": "range1", "content": "task"},
+    )
+    _save_canonical_experiment_snapshot(config, agent, storage, [trial], run_id)
+
+    def _fake_bootstrap_failure(*_args, **_kwargs):
+        # Reproduce the real ordering: run_trial_isolated marks the trial
+        # running, then docker run/exec raises before execute_trial starts.
+        _mark_canonical_trial_started(storage=storage, agent=agent, trial=trial)
+        raise RuntimeError("docker run failed: timed out after 600s")
+
+    monkeypatch.setattr(
+        "cage.experiment.engine.conductor.run_trial_isolated",
+        _fake_bootstrap_failure,
+    )
+
+    results = _run_agent_trials_parallel(
+        config,
+        agent,
+        storage,
+        [trial],
+        HookContext(
+            experiment_config={"name": config.name},
+            samples=[trial.sample],
+            trials_completed=[],
+            trials_pending=[],
+            run_artifacts_dir=str(storage.run_dir),
+        ),
+        max_workers=1,
+    )
+
+    assert len(results) == 1
+    assert results[0].metadata["status"] == "failed"
+    assert results[0].metadata["termination_reason"] == "trial_error"
+    meta = json.loads(
+        (storage.run_dir / "trials" / trial.id / "meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert meta["status"] == "failed"
+    assert meta["termination_reason"] == "trial_error"
+
+    record = json.loads(
+        (storage.run_dir / "experiment_record.json").read_text(encoding="utf-8")
+    )
+    trial_ref = record["trials"]["records"][0]["record_ref"]
+    trial_record = json.loads((storage.run_dir / trial_ref).read_text(encoding="utf-8"))
+    assert record["trials"]["failed"] == 1
+    assert record["trials"].get("running", 0) == 0
+    assert trial_record["status"] == "failed"
+    assert trial_record["status_reason"] == "trial_error"
+    assert trial_record["completed_at"]
 
 
 def test_run_single_agent_records_canonical_trial_scoring_refs(tmp_path, monkeypatch):
@@ -3232,7 +3329,7 @@ def test_create_container_mounts_only_current_trial_proxy_dir_for_realtime_proxy
     )
     config = SimpleNamespace(
         project_file=project_file,
-        execution=SimpleNamespace(agent_network_mode=None),
+        execution=SimpleNamespace(agent_network_mode=None, agent_memory_limit="", agent_cpu_limit=""),
         proxy=SimpleNamespace(enabled=True),
     )
 
@@ -3280,7 +3377,7 @@ def test_create_container_includes_agent_container_resources(tmp_path):
     )
     config = SimpleNamespace(
         project_file=project_file,
-        execution=SimpleNamespace(agent_network_mode=None),
+        execution=SimpleNamespace(agent_network_mode=None, agent_memory_limit="", agent_cpu_limit=""),
         proxy=SimpleNamespace(enabled=False),
     )
 

@@ -1,0 +1,39 @@
+{
+  "source_db": "/mnt/olddata/home/yihe/workspace/arvo_env/metadata/datasets/arvo/index.db",
+  "selection": {
+    "v3_db_target": 1,
+    "all_non_cybergym_target": 1,
+    "has_poc": 1,
+    "has_vul_target_binary": 1,
+    "has_fix_target_binary": 1,
+    "has_repo_vul_tar_gz": 1,
+    "has_fix_commit_patch": 1,
+    "order_by": "CAST(case_id AS INTEGER) ASC",
+    "limit": 4000
+  },
+  "count": 4000,
+  "first_ids": [
+    "40096184",
+    "40096185",
+    "42470017",
+    "42470026",
+    "42470054",
+    "42470067",
+    "42470093",
+    "42470094",
+    "42470096",
+    "42470110"
+  ],
+  "last_ids": [
+    "42526759",
+    "42526813",
+    "42526835",
+    "42526893",
+    "42526895",
+    "42526897",
+    "42526928",
+    "42526931",
+    "42526932",
+    "42526950"
+  ]
+}

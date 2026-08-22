@@ -396,6 +396,20 @@ def _apply_modify_rules(
     return original, modified
 
 
+# Claude Code's per-call billing header. Its ``cch`` field is re-randomised on
+# every request and sits at the head of a 25 KB system prompt, so it breaks
+# prefix caching for every OpenAI-protocol upstream. See the twin comment in
+# ``proxy/sidecar.py``. Anthropic passthrough keeps it; the OpenAI path drops it.
+_BILLING_HEADER_RE = re.compile(r"^x-anthropic-billing-header:[^\n]*\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def _strip_billing_header(system: str) -> str:
+    """Drop Claude Code's per-call billing header so the prefix stays stable."""
+    if not system or "billing-header" not in system.lower():
+        return system
+    return _BILLING_HEADER_RE.sub("", system)
+
+
 def _apply_system_template(original: str, template: str) -> str:
     """Render system template. {{ system_raw }} is replaced with original."""
     return template.replace("{{ system_raw }}", original).replace("{{system_raw}}", original)
@@ -421,6 +435,9 @@ def _build_openai_request(
         modified_system = _apply_system_template(system_content, system_template)
     else:
         original_system, modified_system = _apply_modify_rules(system_content, modify_rules)
+
+    # Last, so it also catches a header a template or a modify rule wrapped.
+    modified_system = _strip_billing_header(modified_system)
 
     if modified_system:
         messages.append({"role": "system", "content": modified_system})

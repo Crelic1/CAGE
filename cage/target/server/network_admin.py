@@ -1,6 +1,8 @@
 """Docker network/container administration helpers."""
 from __future__ import annotations
 
+import ipaddress
+
 import logging
 import os
 import time
@@ -11,6 +13,9 @@ from typing import Any, Dict, List, Optional
 from docker.errors import APIError, NotFound
 
 from cage.target.server.network_alloc import (
+    HOST_OFF_BRIDGE_OPT,
+    attach_egress_proxy_to_network,
+    host_off_networks_enabled,
     allocate_agent_home_subnet,
     release_agent_home_subnet,
     release_cage_trial_subnet,
@@ -362,6 +367,28 @@ def _create_agent_home_network() -> None:
         labels = _server_network_labels("agent_home")
         if chosen_cidr:
             labels["cage.target.subnet"] = chosen_cidr
+        # The server's own shared network is created here rather than by compose,
+        # so the compose-side injection does not reach it — and it is a network
+        # the agent and the targets both sit on. Left alone it puts the host back
+        # on their doorstep, which is the whole thing we are preventing.
+        create_options: dict[str, str] | None = None
+        if host_off_networks_enabled():
+            if chosen_cidr:
+                gateway = str(next(ipaddress.ip_network(chosen_cidr).hosts()))
+                ipam = IPAMConfig(
+                    pool_configs=[IPAMPool(subnet=chosen_cidr, gateway=gateway)]
+                ) if _IPAM_SUPPORT else ipam
+                create_options = {HOST_OFF_BRIDGE_OPT: "true"}
+            else:
+                # Without a subnet we cannot declare the gateway the proxy must
+                # claim, and a host-off network with no gateway leaves every
+                # container on it without a route. Better to say so than to
+                # create something half-contained.
+                logger.error(
+                    "host-off networks requested but no subnet could be allocated "
+                    "for %s — it will be created with the host ON it",
+                    DOCKER_NETWORK,
+                )
         try:
             if ipam is not None:
                 client.networks.create(
@@ -369,13 +396,17 @@ def _create_agent_home_network() -> None:
                     driver="bridge",
                     ipam=ipam,
                     labels=labels,
+                    options=create_options,
                 )
             else:
                 client.networks.create(
                     DOCKER_NETWORK,
                     driver="bridge",
                     labels=labels,
+                    options=create_options,
                 )
+            if create_options:
+                attach_egress_proxy_to_network(DOCKER_NETWORK)
             logger.info(
                 "Created network %r (subnet=%s)",
                 DOCKER_NETWORK,

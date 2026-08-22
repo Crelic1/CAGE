@@ -51,6 +51,11 @@ class RunAgentContract:
     max_concurrent: int | str = ""
     max_rounds: str = ""
     session_args: str = ""
+    # Endpoint pool, in declaration order: (source id, capacity or None for
+    # uncapped). Empty for a single-endpoint agent. The banner shows it because
+    # a multi-source run is otherwise indistinguishable from a single-box one —
+    # you could not tell three machines were in play, let alone their sizes.
+    endpoints: tuple[tuple[str, int | None], ...] = ()
 
 
 @dataclass
@@ -216,6 +221,9 @@ def format_run_parameter_text(contract: RunContract, *, color: bool = False) -> 
         ("model", agent.model_id or "n/a"),
         ("provider", agent.provider or "n/a"),
         ("endpoint model", agent.model_name or "n/a"),
+        *(
+            [("endpoints", _format_endpoints(agent))] if agent.endpoints else []
+        ),
     ]
     if agent.agent_model_name and agent.agent_model_name != agent.model_name:
         agent_rows.append(("agent model", agent.agent_model_name))
@@ -559,30 +567,72 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
+def _format_endpoints(agent: RunAgentContract) -> str:
+    """One-line endpoint pool: ``box1 x16  box2 x4  box3 uncapped``."""
+    # ``x0`` is easy to skim past, and a drained endpoint is exactly the state
+    # you want to notice — it silently receives no work at all.
+    parts = [
+        f"{sid} uncapped" if cap is None
+        else f"{sid} DRAINED" if cap == 0
+        else f"{sid} x{cap}"
+        for sid, cap in agent.endpoints
+    ]
+    total = _endpoint_slot_total(agent)
+    suffix = f"{len(agent.endpoints)} sources, "
+    suffix += "unbounded total" if total is None else f"{total} slots total"
+    return "  ".join(parts) + f"   ({suffix})"
+
+
+def _endpoint_slot_total(agent: RunAgentContract) -> int | None:
+    """Sum of endpoint capacities, or None when any endpoint is uncapped."""
+    total = 0
+    for _sid, cap in agent.endpoints:
+        if cap is None:
+            return None
+        total += max(0, cap)
+    return total
+
+
 def _format_run_concurrency(contract: RunContract, agent: RunAgentContract) -> str:
-    # The scheduling unit is the trial (one sample × one pass attempt). Two caps
-    # gate how many run AT ONCE: this agent's own max_concurrent, and the global
-    # max_trials_global shared across all agents. The effective in-flight count is
-    # the smaller of the two — lead with it so the banner isn't read as "16".
+    # The scheduling unit is the trial (one sample × one pass attempt). Up to
+    # three caps gate how many run AT ONCE: the endpoint pool's total slots,
+    # this agent's max_concurrent, and the global max_trials_global shared
+    # across agents. The effective in-flight count is the smallest — lead with
+    # it, and name which cap produced it, so a run that is quietly bottlenecked
+    # by one of the three is not read as "16".
     try:
         per_agent = int(agent.max_concurrent or 0)
     except (TypeError, ValueError):
         per_agent = 0  # 'n/a' / unset → no per-agent cap to display
     g = int(contract.max_trials_global or 0)
     global_cap = g if g > 0 else "unlimited"
-    if per_agent > 0 and g > 0:
-        effective: object = min(per_agent, g)
-    elif per_agent > 0:
-        effective = per_agent
-    elif g > 0:
-        effective = g
+    endpoint_total = _endpoint_slot_total(agent) if agent.endpoints else None
+
+    candidates: list[tuple[int, str]] = []
+    if endpoint_total is not None:
+        candidates.append((endpoint_total, "endpoint slots"))
+    if per_agent > 0:
+        candidates.append((per_agent, "max_concurrent"))
+    if g > 0:
+        candidates.append((g, "max_trials_global"))
+
+    if candidates:
+        value, source = min(candidates, key=lambda c: c[0])
+        effective: object = value
+        bound = f" — bounded by {source}"
     else:
         effective = "unlimited"
+        bound = ""
+
+    detail = f"max_concurrent={per_agent or 'n/a'} per agent, max_trials_global={global_cap}"
+    if agent.endpoints:
+        detail = (
+            f"endpoint slots={endpoint_total if endpoint_total is not None else 'unbounded'}, "
+            + detail
+        )
     return (
-        f"{effective} trials in flight "
-        f"(max_concurrent={per_agent or 'n/a'} per agent, "
-        f"max_trials_global={global_cap}, "
-        f"max_target_setups={contract.max_target_setups})"
+        f"{effective} trials in flight{bound} "
+        f"({detail}, max_target_setups={contract.max_target_setups})"
     )
 
 
@@ -614,6 +664,19 @@ def _agent_contract(agent: Any) -> RunAgentContract:
         max_concurrent=getattr(agent, "max_concurrent", "") or "n/a",
         max_rounds=max_rounds_config_label(getattr(agent, "max_rounds", None)),
         session_args=session_args,
+        endpoints=_endpoint_contract(agent),
+    )
+
+
+def _endpoint_contract(agent: Any) -> tuple[tuple[str, int | None], ...]:
+    """(source id, capacity) pairs for a multi-source agent, else empty."""
+    sources = list(getattr(agent, "model_sources", None) or [])
+    if len(sources) <= 1:
+        return ()
+    caps: dict[str, int] = dict(getattr(agent, "source_concurrency", None) or {})
+    return tuple(
+        (str(getattr(src, "id", "") or "?"), caps.get(str(getattr(src, "id", ""))))
+        for src in sources
     )
 
 

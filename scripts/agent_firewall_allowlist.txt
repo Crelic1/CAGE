@@ -1,0 +1,35 @@
+# Default domain allowlist for the agent firewall (scripts/agent_firewall.py).
+#
+# Squid dstdomain format: one entry per line, a LEADING DOT matches the domain
+# and all its subdomains (".pypi.org"), a bare name matches that host only.
+# Lines starting with # are ignored.
+#
+# Taken from upstream CyberGym's default allowlist
+# (references/cybergym/src/cybergym/firewall/default_allowlist.txt) so an agent
+# under our firewall can reach exactly what it can reach under theirs.
+#
+# NOT here on purpose: code hosts (github.com, gitlab), search, package indexes
+# beyond pip/apt. The whole point is that the agent cannot look the vulnerability
+# up. Add per-run exceptions with `--allow <domain>`, and endpoints reached by
+# bare IP (a self-hosted vLLM) with `--allow-ip <ip/cidr>` — dstdomain never
+# matches an address literal.
+
+# apt install
+archive.ubuntu.com
+security.ubuntu.com
+ppa.launchpadcontent.net
+api.launchpad.net
+launchpad.net
+old-releases.ubuntu.com
+
+# pip install
+pypi.org
+files.pythonhosted.org
+pypi.python.org
+bootstrap.pypa.io
+
+# llm apis
+api.openai.com
+api.anthropic.com
+generativelanguage.googleapis.com
+api.together.xyz

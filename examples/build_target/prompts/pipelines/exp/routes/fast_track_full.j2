@@ -1,0 +1,29 @@
+## Adapt the confirmed exploit (AWPB: exploit + writeup + build)
+
+A working exploit already exists and the environment was built from official
+deployment material, so the runtime is well-anchored. PORT that exploit to the
+live rebuilt instance — do not re-derive the attack.
+
+{% if instance_data.materials.exploit %}Confirmed exploit under:
+{% for path in instance_data.materials.exploit %}- `{{ path }}`
+{% endfor %}{% endif %}
+- Keep the exploit's approach, target vuln, and its leak → compute → overwrite
+  arithmetic intact. Rewriting the approach is out of scope for this route.
+- Retarget it at the instance address the harness passes in. Delete every
+  hardcoded historical host/port and every absolute address baked in for the
+  original environment.
+- Resolve every leak at runtime against THIS instance. Recompute libc base,
+  stack/heap/PIE bases, and one-gadget/target addresses from the live leak plus
+  the rebuilt libc's offsets — never reuse the writeup's or the exploit's
+  historical numbers.
+- Because B built the runtime, treat it as authoritative: a leak that disagrees
+  with the historical exploit almost always means the offset constants must be
+  re-derived from the live libc, not that the environment is wrong. Do not
+  disable protections the authentic target has to make the old numbers fit.
+- Use the writeup only as a diagnostic aid when adaptation stalls — to recover
+  the intended primitive, the meaning of a leak, an offset's role, or the
+  success signal.
+{% if instance_data.materials.writeups %}  Writeup(s): {% for path in instance_data.materials.writeups %}`{{ path }}`{% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}  Do not copy any literal (flag, address, gadget) from it into the solve.
+- Prove it: `cage-exploit` must capture the harness-provisioned flag from a
+  fresh clean instance. A local run that prints a copied flag is not a pass.

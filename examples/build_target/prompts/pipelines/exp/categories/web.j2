@@ -1,0 +1,18 @@
+This is a Web target. Drive the intended vulnerability over the application's
+real topology.
+
+- Reach the service the way a contestant does: through the real front door — the
+  reverse proxy or application entry port — traversing any intermediate services
+  (proxy, worker, Bot/browser) rather than poking an internal component directly.
+- Drive the intended chain end to end — authentication bypass, SQL/NoSQL/command
+  injection, SSRF, insecure deserialization, SSTI, or a Bot/XSS-triggered action
+  — using the vulnerable dependency versions and app logic the environment
+  preserves. Do not substitute a different, easier bug.
+- Establish the session/auth state the chain requires (login, token, CSRF,
+  cookie) and respect startup ordering: migrations, DB seed, and the Bot must be
+  live before the step that depends on them.
+- Capture the flag from wherever the app actually stores it — a database row, an
+  admin-only route, a file the exploited process can read, or a Bot-only page —
+  reached through the vulnerability, not through a maintenance or admin channel.
+- The provisioned flag is injected fresh each run. Output the value your exploit
+  pulls from the live app, never one copied from the writeup or seed data.

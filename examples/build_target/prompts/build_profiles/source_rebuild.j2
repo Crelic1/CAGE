@@ -1,0 +1,7 @@
+The input has service source but no complete deployment closure. Derive a minimal deployment from the source and recorded evidence.
+
+- Identify the real build command, runtime, entrypoint, working directory, user, dependencies, and listen address.
+- Preserve lockfiles, compiler flags, architecture, and vulnerable dependency versions whenever the evidence specifies them.
+- Add only the Dockerfiles, Compose services, wrappers, and initialization needed to expose the original program.
+- Use Writeups as behavioral evidence, not as permission to rewrite the vulnerable logic.
+- Distinguish facts derived from source from assumptions introduced during reconstruction.

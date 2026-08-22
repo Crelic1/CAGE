@@ -1,0 +1,24 @@
+## Build then generate — reuse the deployment, exploit from writeup (profile AWB)
+
+The deployment (`B`) is present and primary. There is no exploit yet, but the
+writeup (`W`) describes the intended path — an exploit will be generated from it
+against what you build. Preserve the exact primitive the writeup relies on.
+
+- Audit and reuse the deployment closure; smallest evidence-backed compatibility
+  repairs only, each recorded in `build_report.json`:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  Read every referenced local file before editing.
+- Preserve every declared service, topology, pinned versions, users, and the
+  flag mechanism.
+- Read the writeup to identify the intended vulnerability and primitive:
+{% for path in instance_data.materials.get("writeups") %}  - `{{ path }}`
+{% endfor %}  Whatever the writeup's solve chain depends on — a specific offset-exposing
+  endpoint, a leak, version-specific behavior, a reachable sink — must remain
+  present and reachable in your build. Cite the writeup line each such fact rests
+  on. Use the writeup for behavior only; never treat it as deployment source or
+  as a validation flag.
+- Base `runtime_probes` on the real intended interaction the writeup describes,
+  cited to a supplied file. The probe asserts readiness, not the exploit.
+- Keep the environment genuinely exploitable so exploit generation can succeed;
+  do not harden the bug away. If an image or dependency is unavailable, report
+  that exact blocker before substituting.

@@ -209,15 +209,32 @@ cage benchmark serve web_exploit_bench --host 0.0.0.0 --port 8000 --open
 | `--port N` | Port to listen on (default `8000`) |
 | `--namespace NAME` | Docker resource namespace isolating this server's targets (default `default`) |
 | `--external-token TOKEN` | Enable external-audience mode (see below); empty means every caller is internal (legacy single-audience) |
+| `--public-host [ADDR]` | Serve targets to agents **not on this host**: publish each challenge's declared entry service(s) on the host. Bare = advertise the address each caller reached the API at; `ADDR` pins it (reverse proxy / NAT). Off by default (targets stay network-only). See [external access](../serve-external-audience.md#external-access-serving-an-agent-that-is-not-on-this-host) |
+| `--max-public-instances N` | Cap on simultaneously host-published instances (default `1`, `0` = unlimited); over the cap `GET /launch` returns `409`. External-access mode only |
 | `--judge-model MODEL_ID` | Override the judge model for the `LLM_judge` signal; defaults to the benchmark's own declared judge |
 | `--prompt-level [l0\|l1\|l2]` | Default hint tier for `GET /prompt` (default `l0`); the effective tier is bound per instance at launch (`GET /launch?prompt_level=`) |
 | `--adapter MODULE:CLASS` | Load an extra benchmark adapter; repeatable |
 | `--open` | Open the console in a browser after start |
 
-With `--external-token` set, the server runs in two-audience mode: loopback
-callers are treated as internal, while non-loopback callers must present
+`--external-token` and `--public-host` are **independent axes**: the token guards
+who may call the API, `--public-host` decides whether a launched target gets a
+host port. With `--external-token` set, the server runs in two-audience mode:
+loopback callers are treated as internal, while non-loopback callers must present
 `Authorization: Bearer <token>`. Without the flag every caller is internal
 (legacy single-audience behaviour).
+
+`GET /launch` also accepts `?ttl=<seconds>` — a per-launch lease; the instance is
+reaped automatically when it expires. On a `--public-host` server this is how an
+agent gives back its capped slot; omit it and the instance runs until `DELETE`.
+`POST /submit` rejects bodies over the upload limit (1 GiB default,
+`TARGET_SERVER_MAX_SUBMIT_UPLOAD_BYTES`) with `413`.
+
+For **orchestration**, launch via the durable async operation instead of the
+synchronous `GET /launch`: `POST /launches` returns `202` immediately, you poll
+`GET /launches/{cage_run_id}` until `ready` (which guarantees a non-empty
+`run_id`, `entry_urls`, and `task_prompt`), and `DELETE /launches/{id}` cancels
+— idempotent on `cage_run_id` and durable across a Cage restart. See the
+[launch-operations contract](../serve-external-audience.md#launch-operations-post-launches-get-launchesid-delete-launchesid).
 
 ## `cage model`
 

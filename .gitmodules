@@ -29,3 +29,11 @@
 	path = third_party/cybergym_agent
 	url = https://github.com/bmz-q-q/cybergym_agent.git
 	branch = para_action
+[submodule "examples/cybench/datasets"]
+	path = examples/cybench/datasets
+	url = git@github.com:AgentCyberRange/Cybench.git
+	branch = main
+[submodule "examples/xbowbench/datasets"]
+	path = examples/xbowbench/datasets
+	url = git@github.com:AgentCyberRange/xbow.git
+	branch = main

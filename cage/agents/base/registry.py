@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from cage.agents.base.definition import AgentType
+from cage.contracts.exceptions import ConfigError
 
 _AGENT_TYPE_REGISTRY: dict[str, type[AgentType]] = {}
 
@@ -20,5 +21,9 @@ def get_agent_type(name: str) -> AgentType:
     cls = _AGENT_TYPE_REGISTRY.get(name)
     if cls is None:
         available = ", ".join(sorted(_AGENT_TYPE_REGISTRY.keys()))
-        raise ValueError(f"Unknown agent type: {name}. Available: {available}")
+        raise ConfigError(
+            f"Unknown agent kind: {name!r}\n"
+            f"  Available agent kinds: {available}\n"
+            f"  Set one of these as `kind:` on the agent in your project.yml."
+        )
     return cls()

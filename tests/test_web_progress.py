@@ -368,7 +368,7 @@ def test_load_trial_summary_explains_user_interrupted_trial(tmp_path: Path) -> N
     summary = load_trial_summary(trial_dir, {}, run_status="interrupted")
 
     assert summary["status_label"] == "Interrupted"
-    assert summary["status_detail"] == "Stopped by user (Ctrl+C)"
+    assert summary["status_detail"] == "Interrupted before the agent finished"
     assert summary["status_kind"] == "warning"
 
 
@@ -579,7 +579,7 @@ def test_load_trial_summary_marks_exit_zero_trial_interrupted_when_run_interrupt
     summary = load_trial_summary(trial_dir, {}, run_status="interrupted")
 
     assert summary["status_label"] == "Interrupted"
-    assert summary["status_detail"] == "Stopped by user (Ctrl+C)"
+    assert summary["status_detail"] == "Interrupted before the agent finished"
     assert summary["status_kind"] == "warning"
 
 
@@ -2256,9 +2256,13 @@ def test_trial_page_shows_scoring_after_final_output_without_termination_cards(t
     # full scorer result is surfaced after Final Output instead.
     assert "Why this trial ended" not in html
     assert ">More termination evidence<" not in html
-    assert ">Final Output<" in html
+    # This fixture timed out, so the panel names what it actually holds: the
+    # agent's last turn, not a conclusion it never reached.
+    output_panel = ">Last message before it was cut off"
+    assert output_panel in html
+    assert ">Final Output<" not in html
     assert "Scoring result" in html
-    assert html.index(">Final Output<") < html.index("Scoring result")
+    assert html.index(output_panel) < html.index("Scoring result")
     assert "one host compromised" in html  # explanation text
     assert "hosts_owned" in html  # metadata evidence row
 

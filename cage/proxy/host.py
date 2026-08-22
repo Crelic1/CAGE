@@ -27,6 +27,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from cage.contracts.execution import (
+    CONTAINER_PROXY_SCRIPT_PATH,
+    DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S,
+)
 from cage.proxy.anthropic_openai_translate import (  # noqa: F401
     ProxyModifyRule,
     _TEXT_TOOL_CALL_RE,
@@ -99,6 +104,38 @@ CONTAINER_PROXY_CONFIG_PATH = f"{CONTAINER_PROXY_RUNTIME_DIR}/config.json"
 CONTAINER_PROXY_LOG_DIR = "/var/lib/cage/proxy"
 
 
+# Docker can take several seconds to service even a trivial ``docker exec``
+# while many large agent containers are starting concurrently.  The setup
+# commands below are idempotent, so tolerate transient daemon latency instead
+# of turning a sample into an agent failure before its first model request.
+CONTAINER_PROXY_SETUP_TIMEOUT = 30.0
+CONTAINER_PROXY_SETUP_ATTEMPTS = 3
+# At 64-way launch the shared Docker daemon can need more than three seconds
+# to service a trivial exec even though the in-container proxy is already up.
+# A timeout is a scheduling observation, so each health probe gets enough room
+# to complete and the existing bounded retry loop remains authoritative.
+CONTAINER_PROXY_HEALTH_TIMEOUT = 10.0
+CONTAINER_PROXY_HEALTH_ATTEMPTS = 30
+
+
+def _exec_container_proxy_setup(container: Any, command: str) -> Any:
+    """Run an idempotent proxy setup command with timeout-only retries."""
+    result = None
+    for attempt in range(1, CONTAINER_PROXY_SETUP_ATTEMPTS + 1):
+        result = container.exec(command, timeout=CONTAINER_PROXY_SETUP_TIMEOUT)
+        timed_out = result.exit_code == -1 and "Timed out" in result.stderr
+        if result.exit_code == 0 or not timed_out:
+            return result
+        logger.warning(
+            "Container proxy setup timed out (attempt %d/%d); retrying",
+            attempt,
+            CONTAINER_PROXY_SETUP_ATTEMPTS,
+        )
+        if attempt < CONTAINER_PROXY_SETUP_ATTEMPTS:
+            time.sleep(0.25 * attempt)
+    return result
+
+
 def _pick_free_local_port() -> int:
     """Reserve an ephemeral localhost port number for a soon-to-start local server."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -119,7 +156,7 @@ class ProxyInstanceConfig:
     system_template: str = ""  # Jinja2-style template: {{ system_raw }} → original system
     bind_host: str = "0.0.0.0"
     port: int = 0  # 0 = auto-assign
-    request_timeout: float = 3600.0
+    request_timeout: float = DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
     max_output_tokens_cap: int | None = None
     http_proxy: str = ""
     # Extra headers injected onto every upstream request, overriding any
@@ -130,9 +167,19 @@ class ProxyInstanceConfig:
     # ``ModelConfig.upstream_extra_body`` — e.g. Qwen ``chat_template_kwargs``
     # / sampling). ``{}`` ⇒ nothing injected.
     upstream_extra_body: dict[str, Any] = field(default_factory=dict)
+    # Keep the upstream's chain of thought in the conversation instead of
+    # discarding it on translation (see ``ModelConfig.preserve_thinking``).
+    # Only meaningful for upstreams that return reasoning in its own field;
+    # a model that inlines ``<think>`` in ``content`` is unaffected either way.
+    preserve_thinking: bool = False
     container_log_dir: str = ""
     logs_mounted: bool = False
     max_requests: int = -1  # -1 = unlimited; 0 rejects before the first request
+    # Benchmark-owned early reminder window, expressed as absolute forwarded
+    # request numbers. -1 / empty message disables it.
+    startup_reminder_at: int = -1
+    startup_reminder_until: int = -1
+    startup_reminder_message: str = ""
     # Graceful pre-cap wrap-up. Once ``budgeted_round_count() >= wrapup_at``
     # (an ABSOLUTE round; the offset→absolute math happens in the orchestrator
     # where the cap is known), the proxy injects ``wrapup_message`` into the
@@ -145,10 +192,6 @@ class ProxyInstanceConfig:
     max_cost: float | None = None
     input_cost_per_1m: float | None = None
     output_cost_per_1m: float | None = None
-    # Per-call upstream retry budget (transient HTTP 408/425/429/5xx and
-    # provider-specific transient codes wrapped in 4xx — e.g. bigmodel
-    # ``code: "1234"``). 0 disables retries.
-    upstream_max_retries: int = 4
 
 
 class ProxyRecorder:
@@ -379,8 +422,12 @@ def start_container_proxy(
         "http_proxy": config.http_proxy,
         "extra_headers": {str(k): str(v) for k, v in (config.extra_headers or {}).items()},
         "upstream_extra_body": dict(config.upstream_extra_body or {}),
+        "preserve_thinking": bool(config.preserve_thinking),
         "trial_id": str(config.trial_id),
         "max_requests": config.max_requests,
+        "startup_reminder_at": int(config.startup_reminder_at),
+        "startup_reminder_until": int(config.startup_reminder_until),
+        "startup_reminder_message": str(config.startup_reminder_message),
         "wrapup_at": int(config.wrapup_at),
         "wrapup_message": str(config.wrapup_message),
         "max_input_tokens": config.max_input_tokens,
@@ -388,7 +435,6 @@ def start_container_proxy(
         "max_cost": config.max_cost,
         "input_cost_per_1m": config.input_cost_per_1m,
         "output_cost_per_1m": config.output_cost_per_1m,
-        "upstream_max_retries": int(config.upstream_max_retries),
     }
     config_json = json.dumps(proxy_config, ensure_ascii=False, indent=2)
     config_path = CONTAINER_PROXY_CONFIG_PATH
@@ -397,11 +443,25 @@ def start_container_proxy(
     quoted_config_path = shlex.quote(config_path)
     quoted_log_dir = shlex.quote(log_dir)
 
-    container.exec("rm -f /opt/cage-proxy/container_proxy.py")
+    container.exec(f"rm -f {shlex.quote(CONTAINER_PROXY_SCRIPT_PATH)}")
     container.copy_to(
         str(Path(__file__).with_name("sidecar.py")),
-        "/opt/cage-proxy/container_proxy.py",
+        CONTAINER_PROXY_SCRIPT_PATH,
     )
+    # ``docker cp`` preserves the source mode. A private checkout commonly has
+    # Python sources at 0600; the proxy intentionally runs as the unprivileged
+    # ``agent`` user, so such a copy exists but cannot be read by Python.
+    # Normalize only this container copy and keep it root-owned/non-writable by
+    # the agent.
+    script_permissions = _exec_container_proxy_setup(
+        container,
+        f"chmod 0644 {shlex.quote(CONTAINER_PROXY_SCRIPT_PATH)}",
+    )
+    if script_permissions.exit_code != 0:
+        raise RuntimeError(
+            "Failed to make the container proxy script readable: "
+            f"{script_permissions.stderr[:500] or script_permissions.stdout[:500]}"
+        )
     log_files = (
         "proxy.jsonl",
         "tool_calls.jsonl",
@@ -416,7 +476,7 @@ def start_container_proxy(
     )
     if not config.logs_mounted:
         setup_cmd = f"{setup_cmd} && chown -R agent:agent {quoted_log_dir}"
-    setup_result = container.exec(setup_cmd, timeout=5.0)
+    setup_result = _exec_container_proxy_setup(container, setup_cmd)
     if setup_result.exit_code != 0:
         raise RuntimeError(
             "Failed to prepare container proxy log dir "
@@ -428,7 +488,9 @@ def start_container_proxy(
         config_permissions_cmd = (
             f"chown -R agent:agent {quoted_runtime_dir} && {config_permissions_cmd}"
         )
-    config_permissions = container.exec(config_permissions_cmd, timeout=5.0)
+    config_permissions = _exec_container_proxy_setup(
+        container, config_permissions_cmd
+    )
     if config_permissions.exit_code != 0:
         raise RuntimeError(
             "Failed to secure container proxy config "
@@ -440,7 +502,7 @@ def start_container_proxy(
     stdout_log = f"{log_dir}/stdout.log"
     stderr_log = f"{log_dir}/stderr.log"
     cmd = (
-        f"python3 /opt/cage-proxy/container_proxy.py --port {requested_port} "
+        f"python3 {shlex.quote(CONTAINER_PROXY_SCRIPT_PATH)} --port {requested_port} "
         f"--config {quoted_config_path} --log-dir {quoted_log_dir} "
         f">{shlex.quote(stdout_log)} 2>{shlex.quote(stderr_log)}"
     )
@@ -450,12 +512,11 @@ def start_container_proxy(
         pid = container.exec_background(cmd, user="agent")
 
     # Health check: wait for proxy to become ready
-    max_retries = 30
-    for i in range(max_retries):
+    for _attempt in range(CONTAINER_PROXY_HEALTH_ATTEMPTS):
         time.sleep(0.2)
         check = container.exec(
             f"curl -s -o /dev/null -w '%{{http_code}}' http://localhost:{requested_port}/healthz",
-            timeout=3.0,
+            timeout=CONTAINER_PROXY_HEALTH_TIMEOUT,
         )
         if "200" in check.stdout:
             logger.info(
@@ -465,8 +526,20 @@ def start_container_proxy(
             )
             break
     else:
+        # Startup exceptions used to disappear with the short-lived container,
+        # leaving only "30 retries" even when Python had already written the
+        # exact import/config/permission failure to stderr.  Read only the
+        # bounded stderr tail (never the credential-bearing config file) before
+        # the caller tears the container down.
+        stderr_result = container.exec(
+            f"tail -n 20 {shlex.quote(stderr_log)} 2>/dev/null || true",
+            timeout=5.0,
+        )
+        stderr_tail = " ".join((stderr_result.stdout or "").split())[:1200]
+        detail = f"; proxy stderr: {stderr_tail}" if stderr_tail else ""
         raise RuntimeError(
-            f"Container proxy failed to start on port {requested_port} after {max_retries} retries"
+            f"Container proxy failed to start on port {requested_port} after "
+            f"{CONTAINER_PROXY_HEALTH_ATTEMPTS} retries{detail}"
         )
 
     return ContainerProxyInstance(
@@ -693,4 +766,3 @@ def start_proxy_instance(config: ProxyInstanceConfig) -> ProxyInstance:
     )
     instance.start()
     return instance
-

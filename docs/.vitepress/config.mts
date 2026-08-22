@@ -28,6 +28,7 @@ export default defineConfig({
         items: [
           { text: 'Running Experiments', link: '/running-experiments/' },
           { text: 'Models', link: '/models' },
+          { text: 'Key & Endpoint Rotation', link: '/model-rotation' },
           { text: 'Datasets', link: '/datasets' }
         ]
       },
@@ -54,6 +55,7 @@ export default defineConfig({
           { text: 'Operations', link: '/operations/' },
           { text: 'Resource GC (cage gc)', link: '/cage-gc' },
           { text: 'External Targets', link: '/serve-external-audience' },
+          { text: 'Serve API Reference', link: '/serve-api' },
           { text: 'Target Build Debugging', link: '/targets-check' }
         ]
       },

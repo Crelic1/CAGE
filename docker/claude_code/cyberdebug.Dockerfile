@@ -41,8 +41,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY cage/proxy/sidecar.py /opt/cage-proxy/container_proxy.py
-
 RUN useradd -m -s /bin/bash agent \
     && mkdir -p /home/agent/workspace \
     && chown -R agent:agent /home/agent
@@ -53,6 +51,12 @@ RUN useradd -m -s /bin/bash agent \
 # not the agent's home. Default `latest`; pin a version for a reproducible image.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# The cage proxy, copied last on purpose. It changes far more often than the
+# agent CLI does, and a COPY placed above the install step would invalidate
+# it — so editing the proxy would silently reinstall the CLI and, with an
+# unpinned version, land on a different build than the run before it.
+COPY cage/proxy/sidecar.py /opt/cage-proxy/container_proxy.py
 
 ENV HOME=/home/agent
 CMD ["sleep", "infinity"]

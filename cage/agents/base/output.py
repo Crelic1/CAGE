@@ -1,30 +1,61 @@
 """Shared output-parsing primitives for Claude-Code-shaped CLI streams.
 
-``claude`` and ``hermes`` emit the same NDJSON ``stream-json`` event shapes
-(``type == "result"`` carrying the final answer, ``type == "assistant"``
+``claude``, ``hermes`` and ``qwen`` emit the same NDJSON ``stream-json`` event
+shapes (``type == "result"`` carrying the final answer, ``type == "assistant"``
 messages carrying text blocks); their ``parse_output`` extraction loops were
 line-identical twins. This module owns that skeleton once.
 
-Deliberately NOT used by the other agents: kimi's CLI schemas churned across
-versions so its loop tolerates extra shapes (``role`` keys, string content,
-bare ``message`` events), qwen speaks single-object ``--output-format json``
-first, and codex has a dedicated event-stream parser. Forcing those onto one
-extractor would change what each agent accepts — they share only the
-:func:`failure_banner` guard.
+Deliberately NOT the whole story for the other agents: kimi's CLI schemas
+churned across versions so its loop tolerates extra shapes (``role`` keys,
+string content, bare ``message`` events), and codex has a dedicated
+event-stream parser. Forcing those onto one extractor would change what each
+agent accepts — they share only the :func:`failure_banner` guard. (qwen keeps
+a tolerant scan *after* the shared extractor for the same reason, not instead
+of it.)
 """
 
 from __future__ import annotations
 
 import json
 
+from cage.contracts.agent_output import (
+    AGENT_FAILURE_BANNER_PREFIX,
+    STDERR_ELISION_MARKER,
+)
 from cage.sandbox.exec import ExecResult
+
+#: How much of a dead agent's stderr the banner keeps, and how much of that
+#: budget goes to the opening. Both ends matter and for opposite reasons: a
+#: CLI that refuses to start says why in its *first* lines (kimi-cli's config
+#: validation error), while a CLI killed mid-run says why in its *last* ones.
+#: Keeping only the head — which this used to do — reduced every timeout kill
+#: to whatever startup banner the CLI happened to print, e.g. qwen-code's
+#: "running headless with --yolo" warning standing in as the agent's last
+#: words for a two-hour trial.
+_STDERR_BUDGET = 2000
+_STDERR_HEAD = 700
+
+
+def diagnostic_stderr(
+    stderr: str, *, budget: int = _STDERR_BUDGET, head: int = _STDERR_HEAD,
+) -> str:
+    """A dead agent's stderr trimmed to its two informative ends."""
+
+    text = str(stderr or "")
+    if len(text) <= budget:
+        return text
+    tail = budget - head
+    return f"{text[:head]}\n{STDERR_ELISION_MARKER}\n{text[-tail:]}"
 
 
 def failure_banner(result: ExecResult) -> str | None:
     """The shared "agent died with no output" banner, or None to keep parsing."""
 
     if result.exit_code != 0 and not result.stdout.strip():
-        return f"[Agent exited with code {result.exit_code}]\n{result.stderr[:1000]}"
+        return (
+            f"{AGENT_FAILURE_BANNER_PREFIX}{result.exit_code}]\n"
+            f"{diagnostic_stderr(result.stderr)}"
+        )
     return None
 
 

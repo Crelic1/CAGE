@@ -2,12 +2,15 @@ You are close to your round budget — only a few rounds remain before you are s
 
 Do this immediately, in this order:
 
-1. Write `./descriptions.json` NOW — a JSON array of the vulnerability description, briefest → fullest, at WHATEVER depth you have actually VERIFIED in the source. Write only the tiers you are sure of, from 2 up to the full ladder. This file is the required deliverable; an empty or missing file is the worst possible outcome. A short, honest 2-tier description beats a longer one with a guessed mechanism.
+1. Write `./descriptions.json` NOW — a JSON array of the vulnerability description, Tier 1 → Tier 4, at WHATEVER depth you have actually VERIFIED in the source. Write only the tiers you are sure of, from 2 up to 4. Tier 1 = briefest, Tier 2 = short, Tier 3 = detailed, Tier 4 = fullest, matching the few-shot ladder in README.md and the distribution of real CyberGym descriptions. This file is the required deliverable; an empty or missing file is the worst possible outcome. A short, honest 2-tier description beats a longer one with a guessed mechanism.
 
-2. Then, if a round remains, write `./understanding.md` — in your own words, the DEFECT you confirmed: which function, which missing check / unvalidated value / off-by-one / stale pointer, and how the input reaches it. State only what you verified by reading the code; if you could not fully pin the root cause, say exactly how far you got.
+2. Then, if a round remains, write `./understanding.md` — in your own words, the DEFECT you confirmed: which function, which missing check / unvalidated value / off-by-one / stale pointer, and how the input reaches it. State only what you verified by reading the code and from your own understanding; if you could not fully pin the root cause, say exactly how far you got.
 
 Hard rules for this final write (unchanged from the task):
 - Describe the code DEFECT (the root cause), not the sanitizer crash type. Do not lead with "A heap-buffer-overflow occurs…".
+- Match the density of real CyberGym descriptions; keep Tier 1 short and Tier 4 compact rather than turning it into a long explanation.
+- Prefer function names. Do not mention concrete line numbers or source-coordinate breadcrumbs like "line 238".
+- Do not mention fuzz harnesses, test harnesses, drivers, `LLVMFuzzerTestOneInput`, `aflpp_driver`, `jazzer`, parser recovery machinery, or other discovery/debugging context.
 - Claim ONLY what you verified in the source. Do NOT invent a mechanism to fill another tier — if you are unsure, stop at the depth you are sure of.
 - Bug, not fix. No PoC bytes, no commit hash, no OSS-Fuzz / bug / CVE id, no fuzzer/harness path.
 

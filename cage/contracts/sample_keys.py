@@ -35,6 +35,15 @@ SAMPLE_VARIANT_KEY = "variant"
 #: in :func:`cage.contracts.execution.resolve_max_rounds`.
 SAMPLE_MAX_ROUNDS_KEY = "max_rounds"
 
+#: Benchmark-declared early reminder window. The in-container proxy appends the
+#: message to forwarded model requests from ``at`` through ``until`` (inclusive)
+#: so a benchmark can reinforce a required startup/delivery ordering after the
+#: agent has had a few turns to inspect its immediate inputs. Empty/invalid
+#: values disable the reminder.
+SAMPLE_STARTUP_REMINDER_AT_KEY = "startup_reminder_at"
+SAMPLE_STARTUP_REMINDER_UNTIL_KEY = "startup_reminder_until"
+SAMPLE_STARTUP_REMINDER_MESSAGE_KEY = "startup_reminder_message"
+
 #: Benchmark-declared wrap-up window: how many rounds before the hard round cap
 #: the in-container proxy should start injecting the wrap-up reminder (a graceful
 #: pre-cap flush, so the agent finalizes its deliverable instead of being hard-

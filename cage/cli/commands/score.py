@@ -124,6 +124,264 @@ def _score_output_path_for_context(ctx: Any, score_name: str) -> Path | None:
     return ctx.trial_dir / "scores" / f"{score_name}.json"
 
 
+def _refresh_dashboard_score_metrics(benchmark_obj: Any, run_dir: Path) -> bool:
+    """Recompute ``dashboard.json``'s per-agent ``score_metrics`` in place.
+
+    The run card reads this file, not ``dashboard_view.json``. Rebuilding it
+    needs the trial scores as ``TrialResult``-shaped objects, which
+    ``ScoringContext`` can reconstruct from the artifacts on disk — so like the
+    rest of ``--dashboard-only`` this re-reads, it never re-scores.
+
+    Returns True when the file was rewritten. Any failure is swallowed: a stale
+    run card is worse than nothing, but not worth aborting a batch refresh over.
+    """
+    hook = getattr(benchmark_obj, "summarize_scores", None)
+    if not callable(hook):
+        return False
+    path = run_dir / "dashboard.json"
+    if not path.is_file():
+        return False
+    try:
+        payload = json_mod.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    agents = payload.get("agents")
+    if not isinstance(agents, dict) or not agents:
+        return False
+
+    from cage.scoring.lifecycle import _benchmark_summary
+
+    changed = False
+    for label, body in agents.items():
+        if not isinstance(body, dict):
+            continue
+        results = _trial_results_for_agent(run_dir, body)
+        if not results:
+            continue
+        owned = _benchmark_summary(results, benchmark_obj)
+        for source, target in (("metrics", "score_metrics"), ("pass_at_k", "pass_at_k")):
+            value = owned.get(source)
+            if value and body.get(target) != value:
+                body[target] = value
+                changed = True
+    if not changed:
+        return False
+    try:
+        path.write_text(json_mod.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _usage_label(usage: dict[str, Any]) -> str:
+    """One-line usage summary, in the terms the run overview shows."""
+    calls = usage.get("num_requests")
+    tokens = usage.get("input_tokens")
+    if not isinstance(calls, int) or not isinstance(tokens, int):
+        return "unrecorded"
+    return f"{calls} calls / {tokens / 1e6:.2f}M in"
+
+
+def _usage_is_current(run_dir: Path, trial_id: str, usage: dict[str, Any]) -> bool:
+    """Cheap staleness check for one trial's recorded call counts.
+
+    ``progress.json`` is ~500 bytes and holds the counters the in-container
+    proxy kept as it ran — the authority on how many calls a trial actually
+    made. ``dashboard.json``'s usage block is a *derivation* of the same
+    trial's ``proxy.jsonl``, taken once when the run ended. When the two
+    disagree the derivation is stale, and only then is it worth re-reading a
+    log that can be hundreds of megabytes.
+
+    Counts alone decide it: a reader that loses records always loses their
+    counts too, while token totals can differ for benign reasons (cache-token
+    accounting differs between the sidecar's tally and the offline parser).
+    No ``progress.json`` — older or externally-assembled runs — means no cheap
+    answer, so we re-derive rather than assume.
+    """
+    from cage.artifacts.run_storage import trial_progress_path
+    from cage.contracts.jsonio import load_json_file
+
+    progress = load_json_file(trial_progress_path(run_dir, trial_id))
+    if not isinstance(progress, dict) or not progress:
+        return False
+    recorded_total = progress.get("total_requests")
+    # ``success`` is the gross success count, which is what the offline parser
+    # counts as num_requests. ``successful_requests`` subtracts compact
+    # rewrites and would mismatch by design on agents that use them.
+    recorded_success = progress.get("success", progress.get("successful_requests"))
+    if not isinstance(recorded_total, int) or not isinstance(recorded_success, int):
+        return False
+    return (
+        usage.get("num_requests") == recorded_success
+        and usage.get("total_requests") == recorded_total
+    )
+
+
+def _refresh_dashboard_usage(run_dir: Path) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    """Re-derive each trial's ``usage`` block in ``dashboard.json`` in place.
+
+    The run overview reads these counts (the "N steps" cell, the token columns)
+    from the projection, not from the trial's own artifacts — so when the
+    parser that produced them was wrong, every finished run keeps quoting the
+    wrong number while the trial page, which re-reads ``proxy.jsonl`` on every
+    view, quotes the right one.
+
+    Needs no benchmark: usage is derived from the proxy log alone.
+
+    Returns one ``(trial_id, before, after)`` per rewritten trial.
+    """
+    from cage.artifacts.run_storage import trial_proxy_log_path
+    from cage.proxy.monitor import _parse_proxy_stats
+
+    path = run_dir / "dashboard.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json_mod.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    agents = payload.get("agents")
+    if not isinstance(agents, dict) or not agents:
+        return []
+
+    changes: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for body in agents.values():
+        if not isinstance(body, dict):
+            continue
+        for info in body.get("trials") or []:
+            if not isinstance(info, dict):
+                continue
+            trial_id = str(info.get("trial_id") or "")
+            if not trial_id:
+                continue
+            before = info.get("usage") if isinstance(info.get("usage"), dict) else {}
+            if _usage_is_current(run_dir, trial_id, before):
+                continue
+            proxy_log = trial_proxy_log_path(run_dir, trial_id)
+            if not proxy_log.is_file():
+                continue
+            stats = _parse_proxy_stats(proxy_log)
+            after: dict[str, Any] = {
+                "input_tokens": stats["input_tokens"],
+                "output_tokens": stats["output_tokens"],
+                "reasoning_tokens": stats["reasoning_tokens"],
+                "num_requests": stats["num_requests"],
+                "total_requests": stats["total_requests"],
+                "errors": stats["errors"],
+            }
+            if stats.get("malformed"):
+                after["malformed"] = stats["malformed"]
+            if after == before:
+                continue
+            info["usage"] = after
+            changes.append((trial_id, dict(before), after))
+
+    if not changes:
+        return []
+    try:
+        path.write_text(json_mod.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return []
+    return changes
+
+
+def _trial_results_for_agent(run_dir: Path, agent_body: dict[str, Any]) -> list[Any]:
+    """Rebuild score-carrying trial stand-ins for one agent from disk.
+
+    Only ``sample_id`` and ``scores`` are populated — the two fields
+    ``summarize_scores`` contracts on. Reconstructing full ``TrialResult``
+    objects would mean replaying the run.
+    """
+    import types
+
+    from cage.contracts.scoring import Score
+
+    results: list[Any] = []
+    for info in agent_body.get("trials") or []:
+        if not isinstance(info, dict):
+            continue
+        trial_id = str(info.get("trial_id") or "")
+        sample_id = str(info.get("sample_id") or "")
+        if not trial_id:
+            continue
+        scores: dict[str, Any] = {}
+        for score_path in sorted((run_dir / "trials" / trial_id / "scores").glob("*.json")):
+            try:
+                blob = json_mod.loads(score_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for name, body in (blob or {}).items():
+                if not isinstance(body, dict):
+                    continue
+                scores[name] = Score(
+                    value=body.get("value"),
+                    metadata=dict(body.get("metadata") or {}),
+                )
+        if scores:
+            results.append(types.SimpleNamespace(sample_id=sample_id, scores=scores))
+    return results
+
+
+def _rebuild_dashboard_views(
+    run_paths: list[Path],
+    benchmark_obj: Any,
+    load_error: str,
+) -> None:
+    """Regenerate a finished run's derived dashboard data, scoring nothing.
+
+    Everything the inspector shows for a settled run is a projection taken once
+    when the run ended: ``dashboard_view.json``, the run card's score metrics,
+    and each trial's usage counts. Change the code that derives any of them —
+    a benchmark's ``build_dashboard``, an aggregate, the proxy-log parser — and
+    old runs keep serving the old answer until the files are rewritten. This
+    rewrites all three from the artifacts already on disk: no agent rerun, no
+    scorer rerun, no live targets needed.
+    """
+    if benchmark_obj is None:
+        detail = f" Last project auto-detect error: {load_error}" if load_error else ""
+        click.echo(
+            "Error: --dashboard-only needs the benchmark that owns the "
+            "dashboard. Pass a benchmark id or a project.yml, or run it from a "
+            f"run dir whose project can be auto-detected.{detail}"
+        )
+        raise SystemExit(1)
+
+    from cage.experiment.engine.reporting import write_dashboard_view
+
+    written = 0
+    refreshed_cards = 0
+    refreshed_usage = 0
+    for rp in run_paths:
+        # Two separate caches feed two separate pages: dashboard_view.json backs
+        # the benchmark dashboard, dashboard.json's agent payload backs the run
+        # card in the run list. Refreshing one and not the other is how the two
+        # pages end up quoting different scores for the same run.
+        if _refresh_dashboard_score_metrics(benchmark_obj, rp):
+            refreshed_cards += 1
+        for trial_id, before, after in _refresh_dashboard_usage(rp):
+            refreshed_usage += 1
+            click.echo(
+                f"  - {display_path(rp)} {trial_id} usage: "
+                f"{_usage_label(before)} → {_usage_label(after)}"
+            )
+        path = write_dashboard_view(benchmark_obj, rp)
+        if path is None:
+            click.echo(f"  - {display_path(rp)}: no dashboard view produced")
+            continue
+        written += 1
+        click.echo(f"  - {display_path(path)}")
+    click.echo(
+        f"Rebuilt {written}/{len(run_paths)} dashboard views, refreshed "
+        f"{refreshed_cards} run-card metrics, {refreshed_usage} trial usage "
+        "blocks (nothing re-scored)"
+    )
+    # A run that never produced a scorable trial has no dashboard to rebuild —
+    # aborted runs and their archives are common, so skipping them is normal and
+    # must not read as failure. Only a clean sweep of nothing is an error.
+    if written == 0:
+        raise SystemExit(1)
+
+
 @click.command()
 @click.argument("target", metavar="BENCHMARK_OR_PROJECT_OR_RUN")
 @click.option(
@@ -137,6 +395,29 @@ def _score_output_path_for_context(ctx: Any, score_name: str) -> Path | None:
         "When TARGET is a benchmark id or project.yml, restrict re-scoring "
         "to a single run id under .cage_runs/<agent_label>/<run_id>/. "
         "Without this flag, every matching run dir is rescored."
+    ),
+)
+@click.option(
+    "--project",
+    "project_override",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Load the benchmark from this project.yml instead of auto-detecting it "
+        "from the run dir. Needed when a run's recorded project path has moved "
+        "or was a temp file, which makes auto-detect fail."
+    ),
+)
+@click.option(
+    "--dashboard-only",
+    "dashboard_only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Do not score anything. Rebuild each run's dashboard_view.json from "
+        "the score artifacts already on disk, then exit. Use this after the "
+        "benchmark's build_dashboard changes — it refreshes what the inspector "
+        "shows without rerunning agents or scorers."
     ),
 )
 @click.option(
@@ -158,6 +439,8 @@ def score(
     target: str,
     scorer_paths: tuple[str, ...],
     run_id_filter: str,
+    project_override: Path | None,
+    dashboard_only: bool,
     max_concurrent: int | None,
 ) -> None:
     """Score (or re-score) trial results from a completed run."""
@@ -207,6 +490,9 @@ def score(
         )
 
     benchmark_scorer: Scorer | None = None
+    # Kept alongside the scorer so --dashboard-only can call build_dashboard.
+    # The dashboard is the benchmark's, not the scorer's.
+    benchmark_obj: Any = None
     bench_label = ""
     run_paths: list[Path]
     if project_target is not None and cage_runs is not None:
@@ -226,11 +512,16 @@ def score(
             ) from exc
         if is_benchmark_mode:
             config.benchmark_dir = project_target.resolve().parent
-        benchmark_scorer = config.benchmark.scorer()
+        benchmark_obj = config.benchmark
+        # --dashboard-only never scores, so don't build a scorer for it. That
+        # is not just wasted work: a scorer can need a judge model and other
+        # config a pure re-render has no business requiring.
+        if not dashboard_only:
+            benchmark_scorer = config.benchmark.scorer()
         bench_label = (
             benchmark_label
             or config.benchmark.name
-            or benchmark_scorer.name
+            or (benchmark_scorer.name if benchmark_scorer is not None else "")
             or "benchmark"
         )
         if not cage_runs.is_dir():
@@ -245,7 +536,15 @@ def score(
         if not scorer_paths:
             from cage.config.experiment import resolve
 
-            for candidate, base_dir in _run_dir_project_candidates(target_path):
+            # An explicit --project wins outright: it exists precisely because
+            # the recorded candidates can be stale (a moved worktree, a temp
+            # effective-config file that has since been cleaned up).
+            candidates = (
+                [(project_override.resolve(), None)]
+                if project_override is not None
+                else _run_dir_project_candidates(target_path)
+            )
+            for candidate, base_dir in candidates:
                 try:
                     config = resolve(candidate, base_dir=base_dir)
                 except Exception as exc:  # noqa: BLE001
@@ -254,15 +553,21 @@ def score(
                         f"{candidate}{base_note}: {type(exc).__name__}: {exc}"
                     )
                     continue
-                benchmark_scorer = config.benchmark.scorer()
+                benchmark_obj = config.benchmark
+                if not dashboard_only:
+                    benchmark_scorer = config.benchmark.scorer()
                 bench_label = (
                     config.benchmark.name
-                    or benchmark_scorer.name
+                    or (benchmark_scorer.name if benchmark_scorer is not None else "")
                     or "benchmark"
                 )
                 run_dir_project = candidate
                 break
         run_paths = [target_path]
+
+    if dashboard_only:
+        _rebuild_dashboard_views(run_paths, benchmark_obj, run_dir_load_error)
+        return
 
     scorers: list[Scorer] = []
     if benchmark_scorer is not None:

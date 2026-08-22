@@ -16,7 +16,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
 
-from cage.cli.ui.run import RunContract, _inspector_browser_urls, build_run_contract
+from cage.cli.ui.run import (
+    RunContract,
+    _endpoint_slot_total,
+    _inspector_browser_urls,
+    build_run_contract,
+)
 from cage.contracts.coerce import int_or_zero
 from cage.contracts.duration import split_duration_hms
 from cage.contracts.logging import (
@@ -52,6 +57,37 @@ class _ActiveTrial:
     status: str = "running"
 
 
+def _live_slot_capacity(contract: RunContract | None) -> int | None:
+    """How many trials the run can hold in flight, or None if unbounded.
+
+    Per agent the binding cap is the smaller of its endpoint-slot total and its
+    ``max_concurrent``; the run's capacity is those summed, then clamped by
+    ``max_trials_global``. A single agent with no cap at all makes the whole run
+    unbounded — there is no honest denominator to show, so we show none.
+    """
+    if contract is None or not getattr(contract, "agents", None):
+        return None
+    per_agent: list[int] = []
+    for agent in contract.agents:
+        caps: list[int] = []
+        if getattr(agent, "endpoints", ()):
+            slots = _endpoint_slot_total(agent)
+            if slots is not None:
+                caps.append(slots)
+        try:
+            declared = int(agent.max_concurrent or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > 0:
+            caps.append(declared)
+        if not caps:
+            return None
+        per_agent.append(min(caps))
+    total = sum(per_agent)
+    ceiling = int(getattr(contract, "max_trials_global", 0) or 0)
+    return min(total, ceiling) if ceiling > 0 else total
+
+
 class RunProgressReporter:
     """Track run progress and print a small plain-text progress line."""
 
@@ -83,6 +119,16 @@ class RunProgressReporter:
             self.live_total = max(0, int(runnable_trials or 0))
         self.enabled = bool(enabled)
         self.contract = contract
+        # Denominator for ``running=N/cap``: how many trials this run can have
+        # in flight at once. Without it a saturated run and an idle one look the
+        # same — ``running=47`` tells you nothing about whether more capacity
+        # would help. ``None`` when any agent is unbounded, in which case the
+        # bare count is shown rather than a fictional ceiling.
+        self._slot_capacity = _live_slot_capacity(contract)
+        # Set by the conductor once the scheduler exists. A tune can grow or
+        # shrink the pool mid-run, so the denominator has to be asked for, not
+        # remembered.
+        self._capacity_source: Any | None = None
         self.stream = stream or sys.stderr
         self._color_enabled = should_color(self.stream)
         self.max_request_events = max(1, int(max_request_events or 1))
@@ -111,6 +157,20 @@ class RunProgressReporter:
         # during teardown must not redraw a progress line *after* the final
         # banner (it raced one in below the URLs before ``os._exit``).
         self._final_banner_printed = False
+
+    def bind_capacity_source(self, source: Any) -> None:
+        """Let the progress line read the run's CURRENT in-flight capacity."""
+        self._capacity_source = source
+
+    def _current_slot_capacity(self) -> int | None:
+        if self._capacity_source is not None:
+            try:
+                live = self._capacity_source()
+            except Exception:  # noqa: BLE001 - the progress line must never raise
+                live = None
+            if live:
+                return live
+        return self._slot_capacity
 
     @property
     def n_completed(self) -> int:
@@ -565,7 +625,11 @@ class RunProgressReporter:
             f"{done_text}",
             _progress_metric(
                 "running",
-                len(snapshot["active"]),
+                (
+                    f"{len(snapshot['active'])}/{capacity}"
+                    if (capacity := self._current_slot_capacity())
+                    else len(snapshot["active"])
+                ),
                 color="blue",
                 enabled=self._color_enabled,
             ),

@@ -274,7 +274,7 @@ Subclass `AgentType` (ABC in `cage/agents/base/definition.py`). Required members
 | `default_image: str` | Tag of the prebuilt image | `"cage/qwen-code:pentestenv"` |
 | `dockerfile: str` | Path under `docker/` used by `cage agent build` | `"docker/qwen_code/pentestenv.Dockerfile"` |
 | `install_command(version)` | Fallback install line if the image lookup misses | `"npm i -g …@<v>"` |
-| `build_launch_command(prompt, *, model, max_rounds, proxy_url)` | The per-trial shell command. Single-quote-escape the prompt; map positive `max_rounds` to the CLI's flag (negative = unset, `0` reserved). | `qwen --yolo --output-format json --max-session-turns N -p '<prompt>'` |
+| `build_launch_command(prompt, *, model, max_rounds, proxy_url, stdin_prompt)` | The per-trial shell command. Single-quote-escape the prompt; map positive `max_rounds` to the CLI's flag (negative = unset, `0` reserved). Leave the prompt out of argv when `stdin_prompt` is true — see below. | `qwen --yolo --output-format json --max-session-turns N -p '<prompt>'` |
 | `parse_output(result)` | Pull the final assistant string from `result.stdout`. Try the structured shape first, fall back to raw stdout. | see `qwen_code/agent.py` |
 | `@property protocol` | `"openai"` or `"anthropic"` — drives the proxy's translation gate | `"openai"` |
 
@@ -289,6 +289,33 @@ Optional hooks (defaults exist):
 
 Register the class with `@register_agent_type` (keys it by `name`). Forget the
 decorator and `cage agent list` won't show your agent.
+
+### Keep the prompt out of the command line
+
+An agent launched as `cli -p '<the whole prompt>'` carries that prompt in its own
+`/proc/<pid>/cmdline` for the entire trial. Agents routinely run
+`pkill -f <pattern>` to clean up something they started, and the pattern is
+usually a phrase the prompt also contains — a port, a service name, a target
+host. The sweep then matches the agent's own process and the agent kills its own
+session mid-trial.
+
+If the CLI can read its prompt from stdin, set `supports_stdin_prompt = True`.
+Cage then `docker cp`s the prompt to `/home/agent/.cage/prompt.txt`, calls
+`build_launch_command(..., stdin_prompt=True)`, and appends `< …/prompt.txt`
+after the env prefix and `session_args`. Your job is only to omit the prompt
+from argv in that case:
+
+```python
+prompt_flag = "" if stdin_prompt else f" -p '{escaped}'"
+```
+
+Verify against the real CLI before declaring support — getting it wrong starts
+the agent with no task at all, which looks like a model failure, not a config
+one. `cage`'s chain check runs the same delivery path as a trial, so a CLI that
+does not consume stdin fails there rather than silently mid-run.
+
+Agents whose CLI has no stdin path (`hermes chat` only takes `-q`) leave the
+attribute at `False` and keep the argv form.
 
 ### Where does the config live? (two patterns)
 
@@ -353,6 +380,13 @@ mc = ModelConfig(id="x", provider="vllm", model="X", base_url="...", api_key="K"
 a = _AGENT_TYPE_REGISTRY["qwen_code"]()
 print(a.build_launch_command("hello", model=mc, max_rounds=20, proxy_url="http://localhost:8877"))
 print(a.env_vars(proxy_url="http://localhost:8877", model=mc))
+```
+
+If you set `supports_stdin_prompt`, check the stdin form too — `hello` must be
+gone, and the rest of the invocation intact:
+
+```python
+print(a.build_launch_command("hello", model=mc, max_rounds=20, stdin_prompt=True))
 ```
 
 ## 3. Dockerfile — `docker/<name>/pentestenv.Dockerfile`

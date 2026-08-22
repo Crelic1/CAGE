@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from cage.contracts.execution import DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
 from cage.models import ModelConfig
 
 
@@ -30,7 +31,8 @@ class ProxyConfig:
 
     enabled: bool = True
     rewrite_system: str = ""  # template with {{ system_raw }}
-    request_timeout: float = 3600.0  # upstream request timeout in seconds
+    # upstream request timeout in seconds
+    request_timeout: float = DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
     upstream_http_proxy: str = ""  # HTTP proxy used by the in-container upstream proxy
 
 
@@ -100,6 +102,16 @@ class TargetConfig:
     #       (``external_port`` set), and attaches the agent only there.
     #       Internal services on the compose project's own networks stay
     #       unreachable regardless of how the adapter configured them.
+    #   "per_trial_bridge_sealed": same bridge, created with ``--internal`` and
+    #       ``com.docker.network.bridge.inhibit_ipv4`` so the host has NO
+    #       address on it. A normal bridge makes the docker host the gateway,
+    #       and an agent that dials it reaches every port the host has open
+    #       (sshd, the inspector, other runs' published target ports). Sealed,
+    #       the agent's netns simply has no route there. Needs Docker 26+, and
+    #       it fails the trial rather than falling back to a host-reachable
+    #       network. Seal the agent's BASE network too
+    #       (``runtime.agent_network_mode``) or the gateway is back on that one
+    #       — see scripts/agent_firewall.py --no-host-gateway.
     #   "trust_server": legacy behaviour — agent attaches to the network
     #       name returned by target_server as-is.
     agent_network_isolation: str = "per_trial_bridge"
@@ -158,6 +170,78 @@ class ExecutionConfig:
     on_failure: str = "continue"
     chunk_size: int | None = None
     agent_network_mode: str | None = "host"
+    # One switch for "the docker host must not be reachable from this run".
+    #
+    # On a stock bridge the host IS the gateway of every network cage and the
+    # benchmark create, and it listens on 0.0.0.0 — so a trial can dial its
+    # sshd, its inspector, and the published ports of every other run. Closing
+    # only the agent's own network is not enough either: an agent that takes a
+    # range machine uses THAT machine's stack, which sits on the range's compose
+    # networks where the host is the gateway again.
+    #
+    # With this on, ``cage run`` takes care of all three legs itself: it brings
+    # up the egress proxy (building its image on first use), points the agent
+    # containers at a network the host holds no address on, seals the per-trial
+    # agent↔target bridge, and tells the target server to build the range's own
+    # networks the same way. Containers are untouched — no NET_ADMIN, no proxy
+    # environment variables (those would break ``http://web`` alias resolution),
+    # no image changes — and egress stays ordinary all-protocol traffic.
+    #
+    # Needs Docker 26+. Does NOT cover a target that mounts docker.sock, runs
+    # privileged, or uses network_mode: host: those bypass networking entirely.
+    network_containment: bool = False
+    # Path to a mihomo/clash binary handed to the egress proxy so it can reach
+    # the model endpoints through ``proxy.upstream_http_proxy``. Empty ⇒ look on
+    # PATH; nothing found ⇒ the proxy egresses directly, which is fine when no
+    # upstream proxy is configured.
+    netproxy_mihomo: str = ""
+    # Servers the egress proxy's caching resolver forwards to, space separated
+    # ("223.5.5.5 1.1.1.1", or "10.0.0.53#5353"). Empty ⇒ whatever the docker
+    # host resolves with. This covers containers that query a resolver by
+    # address; the default docker path (127.0.0.11) is served by the daemon and
+    # never reaches the proxy, which is why the sidecar caches as well.
+    netproxy_dns_upstream: str = ""
+    # Hard memory ceiling for EACH agent container (Docker ``--memory``), as a
+    # docker size string: "16g", "512m", or raw bytes. ``""`` / ``"0"`` /
+    # ``"unlimited"`` removes the ceiling.
+    #
+    # This is a safety fuse, not a tuning knob. Without it one agent-authored
+    # script can consume the whole host: an unbounded ``bytearray`` grew to
+    # 70 GB and an ``np.zeros((65536, 65536))`` to 95 GB, and because neither
+    # trial was over its timeout the orchestrator never looked at them — the
+    # kernel OOM-killer did, after taking every other run on the box down with
+    # it. cgroup enforcement is the only mechanism that acts BEFORE a
+    # termination condition fires. 16g matches what the fuzzing fleet on the
+    # same hosts already caps each task at, and leaves ~90x headroom over an
+    # agent container's observed steady state (~170 MB).
+    #
+    # The cgroup kills the offending PROCESS, not the container. When that is a
+    # script the agent spawned (both observed runaways were), the agent simply
+    # sees exit 137 from its own Bash call and can correct course — the trial
+    # runs on. Only when the agent process itself is the one reaped does the
+    # trial end at 137, which ``classify_trial_termination`` already reports as
+    # ``oom_killed``. Either way a too-low ceiling is visible in the run rather
+    # than silently charged to the agent. This dataclass is the ONE source of
+    # this default; the loader references it rather than restating a literal.
+    agent_memory_limit: str = "16g"
+    # Hard CPU ceiling for EACH agent container (Docker ``--cpus``), in
+    # cores-worth of runtime: "8", "4.5". ``""`` / ``"0"`` / ``"unlimited"``
+    # removes the ceiling.
+    #
+    # Same class of fuse as ``agent_memory_limit``, and needed for the same
+    # reason: nothing else stops a runaway before a termination condition
+    # fires. A fuzzing agent that fans out with ``-jobs=$(nproc)`` sees the
+    # HOST's core count (a cgroup quota does not narrow sched_getaffinity) and
+    # spawns that many spinning processes — one such trial was measured at
+    # ~1970% CPU, starving the 60+ trials scheduled alongside it.
+    #
+    # 8 bounds any single trial to 1/8 of a 64-core host while still leaving
+    # real fuzzing parallelism. Note this caps a trial's PEAK, not the fleet's
+    # total: N concurrent trials can still oversubscribe the box, so the ceiling
+    # is a fairness guarantee between trials rather than a substitute for
+    # sizing ``max_concurrent`` to the host. This dataclass is the ONE source of
+    # this default; the loader references it rather than restating a literal.
+    agent_cpu_limit: str = "8"
     # Config space: "unlimited" (the default; no round cap) | -1 (use the
     # benchmark sample default) | 0 (no rounds) | N. Resolved by
     # resolve_max_rounds(); an unlimited budget needs another stop condition.
@@ -175,7 +259,11 @@ class ExecutionConfig:
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_cost: float | None = None
-    store_proxy: bool = False
+    # Keep proxy.jsonl (the trial's full LLM-call log — the inspector/trajectory
+    # views depend on it) after the trial ends. Default on. This dataclass is the
+    # ONE source of this default; the loader references it rather than restating a
+    # literal (see cage/config/experiment.py).
+    store_proxy: bool = True
     # Poll self-hosted (vllm/sglang) model endpoints until they answer before
     # starting — for remotely-launched servers with unknown boot time. The CLI
     # ``--wait-for-model`` flag overrides this. ``wait_timeout`` of 0 waits

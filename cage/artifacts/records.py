@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Mapping
 
 from cage.contracts.execution import normalize_max_rounds_config
+from cage.contracts.trial_phase import TrialPhase
 from cage.contracts.trial_status import (
-    COMPLETED_TRIAL_STATUSES,
-    FAILED_TRIAL_STATUSES,
-    INTERRUPTED_TRIAL_STATUSES,
+    TERMINAL_TRIAL_STATUSES,
+    TERMINAL_TRIAL_STATUSES_ON_READ,
 )
 from cage.experiment.model import (
     AgentModelSelection,
@@ -59,9 +59,9 @@ from cage.experiment.model import (
 )
 
 _TERMINAL_RUN_STATUSES = frozenset({"completed", "interrupted", "failed", "cancelled"})
-_TERMINAL_TRIAL_STATUSES = (
-    COMPLETED_TRIAL_STATUSES | FAILED_TRIAL_STATUSES | INTERRUPTED_TRIAL_STATUSES
-)
+#: What ``mark_trial_finished`` accepts. Strict on purpose: a scoring state
+#: reaching the runtime status field is a bug, and this is where it gets caught.
+_TERMINAL_TRIAL_STATUSES = TERMINAL_TRIAL_STATUSES
 
 
 @dataclass(frozen=True)
@@ -402,6 +402,22 @@ def _experiment_record_from_mapping(data: Mapping[str, object]) -> ExperimentRec
         interrupted_at=_optional_str(data.get("interrupted_at")),
     )
 
+def _phase_default_for_status(status: object) -> str:
+    """Best-effort phase for a record written before the phase axis existed.
+
+    Legacy records carry no ``phase`` key. Defaulting them all to ``planned``
+    would make every historical completed trial look like it never started, so
+    map terminal statuses onto the ``finished`` bookend and leave anything else
+    at ``planned`` — the honest answer for a record whose stage was never
+    recorded.
+    """
+
+    normalized = str(status or "").strip().lower()
+    if normalized in TERMINAL_TRIAL_STATUSES_ON_READ:
+        return TrialPhase.FINISHED.value
+    return TrialPhase.PLANNED.value
+
+
 def _trial_record_from_mapping(data: Mapping[str, object]) -> TrialRecord:
     """Reconstruct a ``TrialRecord`` from a JSON-ready mapping."""
 
@@ -421,6 +437,11 @@ def _trial_record_from_mapping(data: Mapping[str, object]) -> TrialRecord:
         scoring_id=_optional_str(data.get("scoring_id")),
         started_at=_optional_str(data.get("started_at")),
         completed_at=_optional_str(data.get("completed_at")),
+        # Records written before the phase axis existed carry neither key. A
+        # missing phase must not read as "planned" for a trial that already
+        # finished, so derive the bookend from the terminal status instead.
+        phase=str(data.get("phase") or _phase_default_for_status(data.get("status"))),
+        phase_updated_at=_optional_str(data.get("phase_updated_at")),
         termination=TrialTermination(
             reason=_optional_str(termination_data.get("reason")),
             signal=_optional_str(termination_data.get("signal")),

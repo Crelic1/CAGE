@@ -36,6 +36,9 @@
               class="px-3 py-1.5 rounded-lg bg-slate-700/40 text-slate-200 text-sm hover:bg-slate-700/60">
         Copy debug bundle
       </button>
+      {% with export_url = "/run/" ~ (run_dir | encode_path) ~ "/corpus.jsonl" %}
+        {% include "_corpus_export.html" %}
+      {% endwith %}
       <a href="{{ dashboard_url(run_dir) }}"
          class="px-3 py-1.5 rounded-lg bg-blue-500/15 text-blue-200 text-sm font-medium border border-blue-500/30 hover:bg-blue-500/25"
          title="Benchmark-defined visualization for this run">

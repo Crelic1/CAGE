@@ -52,7 +52,7 @@ def test_nested_source_fields_override_flat_challenge_fields(tmp_path):
             {
                 "adapter_kind": "challenge_json",
                 "benchmark_family": "agent_pentest_bench",
-                "task_profile": "post_exploitation",
+                "task_profile": "multi_target",
                 "marker_stages": [
                     {
                         "id": "report_user_shell",

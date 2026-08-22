@@ -28,6 +28,7 @@ PUBLIC_MODULES = {
     "cage.benchmarks",
     "cage.config",
     "cage.contracts",
+    "cage.corpus",
     "cage.models",
     "cage.scoring",
     "cage.target",

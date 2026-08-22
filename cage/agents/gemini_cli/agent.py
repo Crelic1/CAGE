@@ -67,9 +67,60 @@ def _gemini_settings(
     return settings
 
 
+def _stream_json_answer(stdout: str) -> tuple[str, bool]:
+    """Reproduce ``-o json``'s ``response`` from an ``-o stream-json`` stream.
+
+    Returns ``(answer, saw_json)``. gemini-cli's stream is NOT shaped like
+    claude-code's, so the shared extractor cannot read it:
+
+    - The answer arrives as ``{"type": "message", "role": "assistant",
+      "content": <str>, "delta": true}`` events — **fragments**, not whole
+      messages. Keeping the last one keeps the tail of a sentence.
+    - The very first ``message`` event has ``"role": "user"`` and carries the
+      prompt verbatim. A loop that ignores ``role`` renders the task
+      description back as the agent's own answer.
+    - ``{"type": "result"}`` never carries the text at all — success emits
+      only ``status`` and ``stats``.
+
+    So the CLI's own accounting is mirrored here (``packages/cli`` builds
+    ``responseText`` the same way): concatenate assistant fragments, and clear
+    the buffer at each ``tool_use`` so the answer is the prose *after* the
+    last tool call. Its ``preToolResponseText`` fallback matters most for the
+    trials that motivated the switch — an agent killed mid-tool-call has an
+    empty buffer, and the words before it are all it left.
+    """
+
+    saw_json = False
+    since_tool: list[str] = []
+    before_tool = ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        saw_json = True
+        etype = event.get("type")
+        if etype == "message" and event.get("role") == "assistant":
+            content = event.get("content")
+            if isinstance(content, str):
+                since_tool.append(content)
+        elif etype == "tool_use":
+            text = "".join(since_tool).strip()
+            if text:
+                before_tool = text
+            since_tool = []
+    return ("".join(since_tool).strip() or before_tool), saw_json
+
+
 @register_agent_type
 class GeminiCliAgent(AgentType):
     name = "gemini_cli"
+    supports_stdin_prompt = True
     state_paths = [".gemini"]
     default_image = "cage/gemini-cli:pentestenv"
     dockerfile = "docker/gemini_cli/pentestenv.Dockerfile"
@@ -86,32 +137,47 @@ class GeminiCliAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
         """Launch ``gemini`` in non-interactive single-prompt mode.
 
+        With ``stdin_prompt`` the ``-p`` flag is dropped entirely: a piped
+        (non-TTY) stdin is itself what puts gemini-cli in headless mode, and
+        the piped text becomes the prompt.
+
         ``-p`` forces headless (prompt-and-exit); ``--approval-mode=yolo``
-        auto-approves every tool call so the run is unattended; ``-o json``
-        emits a single ``{"response": ...}`` object on stdout. The per-trial
+        auto-approves every tool call so the run is unattended. The per-trial
         round budget rides in ``model.maxSessionTurns`` (written by
         ``env_vars``) because gemini-cli exposes no max-turns flag — the
         proxy's ``max_requests`` backstop is the hard cap regardless.
+
+        ``-o stream-json`` rather than the ``-o json`` this used to pass:
+        ``json`` builds one object in memory and prints it at process exit,
+        so a trial killed at its timeout records nothing at all. Measured on
+        gemini-cli 0.47.0 — killed 45s into a twelve-step task, ``json`` left
+        0 bytes on stdout; and polled while still running, ``stream-json``
+        already had 320 bytes on disk at t=4s. See :func:`_stream_json_answer`
+        for the event contract that buys.
         """
         escaped = prompt.replace("'", "'\\''")
+        prompt_flag = "" if stdin_prompt else f" -p '{escaped}'"
         cli_model = model.model_name_for_agent(self.name)
         return (
-            f"gemini -p '{escaped}'"
+            f"gemini{prompt_flag}"
             f" -m {cli_model}"
             f" --approval-mode=yolo"
-            f" -o json"
+            f" -o stream-json"
         )
 
     def parse_output(self, result: ExecResult) -> str:
-        """Extract the final answer from ``-o json`` stdout.
+        """Extract the agent's answer from ``-o stream-json`` stdout.
 
-        ``-o json`` produces one object with a top-level ``response`` string
-        (and a ``stats``/``error`` sibling). We read ``response`` first, then
-        fall back to known aliases, then to the ``stream-json`` NDJSON shape,
-        then to raw stdout.
+        The live format is the NDJSON stream :meth:`build_launch_command`
+        asks for; :func:`_stream_json_answer` owns its contract.
+
+        The single-object branch below stays for run dirs recorded under
+        ``-o json`` before the switch — ``cage score`` re-reads those — where
+        the answer sits in a top-level ``response``.
         """
         banner = failure_banner(result)
         if banner is not None:
@@ -120,6 +186,10 @@ class GeminiCliAgent(AgentType):
         stdout = result.stdout.strip()
         if not stdout:
             return ""
+
+        streamed, saw_json = _stream_json_answer(stdout)
+        if streamed:
+            return streamed
 
         try:
             obj = json.loads(stdout)
@@ -132,39 +202,10 @@ class GeminiCliAgent(AgentType):
                 if isinstance(value, str) and value.strip():
                     return value
 
-        # Fallback: stream-json NDJSON (one event per line; final answer is
-        # the last ``message`` / ``result`` event).
-        last_text = ""
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            etype = ev.get("type")
-            if etype in ("message", "assistant"):
-                msg = ev.get("message") or ev
-                content = msg.get("content", "") if isinstance(msg, dict) else ""
-                if isinstance(content, str) and content.strip():
-                    last_text = content
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                last_text = text
-            elif etype == "result":
-                value = ev.get("response") or ev.get("result") or ""
-                if isinstance(value, str) and value:
-                    last_text = value
-        if last_text:
-            return last_text
-
-        return stdout[:4000]
+        # Raw stdout is a readable last resort for ``-o text``, but an event
+        # stream nobody could read as prose is machine noise, and machine
+        # noise in the answer slot reads as an answer.
+        return "" if saw_json else stdout[:4000]
 
     def env_vars(
         self,

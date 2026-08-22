@@ -427,6 +427,164 @@ def test_attach_agent_to_target_falls_back_when_no_public_services():
     assert isolation is None  # cage didn't create its own
 
 
+def test_sealed_isolation_creates_bridge_without_a_host_address():
+    """The whole point of the sealed policy: no host IPv4 on the bridge."""
+    import subprocess as _subprocess
+    from types import SimpleNamespace
+
+    from cage.target import provisioning
+
+    seen: list[list[str]] = []
+
+    def _fake_run(argv, **_kwargs):
+        seen.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    original = provisioning.subprocess.run
+    provisioning.subprocess.run = _fake_run
+    try:
+        iso = provisioning.build_agent_isolation_network(
+            "t-1", _full_target_data(), "agent-1", sealed=True,
+        )
+    finally:
+        provisioning.subprocess.run = original
+    assert _subprocess.run is not _fake_run  # module-level patch was undone
+
+    assert iso is not None
+    create = next(a for a in seen if a[:3] == ["docker", "network", "create"])
+    assert "--internal" in create
+    assert "com.docker.network.bridge.inhibit_ipv4=true" in create
+
+    # And the default policy must NOT seal — that would silently cut off
+    # gateway-based grading for every existing benchmark.
+    seen.clear()
+    provisioning.subprocess.run = _fake_run
+    try:
+        provisioning.build_agent_isolation_network("t-2", _full_target_data(), "agent-1")
+    finally:
+        provisioning.subprocess.run = original
+    create = next(a for a in seen if a[:3] == ["docker", "network", "create"])
+    assert "--internal" not in create
+    assert not any("inhibit_ipv4" in part for part in create)
+
+
+def test_attach_agent_to_target_sealed_fails_closed_instead_of_falling_back():
+    """No public services → the unsealed policy falls back to the server
+    network, which the host sits on. Under the sealed policy that fallback
+    would quietly void the containment guarantee, so it must raise.
+    """
+    from types import SimpleNamespace
+
+    import pytest
+
+    from cage.target.provisioning import attach_agent_to_target
+
+    fake_container = SimpleNamespace(network_mode="bridge", sync_runtime_network=lambda _n: None)
+    with pytest.raises(RuntimeError, match="per_trial_bridge_sealed"):
+        attach_agent_to_target(
+            fake_container,
+            trial_id="t-1",
+            target_data=_full_target_data(with_external_port=False),
+            server_network="cage_net",
+            isolation_policy="per_trial_bridge_sealed",
+        )
+
+
+def test_attach_agent_to_target_sealed_rejects_host_networking():
+    """host networking shares the host's netns — nothing to seal."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from cage.target.provisioning import attach_agent_to_target
+
+    fake_container = SimpleNamespace(network_mode="host", sync_runtime_network=lambda _n: None)
+    with pytest.raises(RuntimeError, match="host networking"):
+        attach_agent_to_target(
+            fake_container,
+            trial_id="t-1",
+            target_data=_full_target_data(),
+            server_network="cage_net",
+            isolation_policy="per_trial_bridge_sealed",
+        )
+
+
+def test_host_off_network_opts_cover_ranges_that_declare_their_own_subnet():
+    """A range whose compose pins subnet+gateway (its topology is part of the
+    challenge) must still get the host off its networks — that is precisely the
+    subnet the agent is told to move laterally across.
+    """
+    from cage.target.server.network_alloc import (
+        HOST_OFF_BRIDGE_OPT,
+        _inject_host_off_network_opts,
+    )
+
+    config = {
+        "networks": {
+            "public_network": {
+                "driver": "bridge",
+                "ipam": {"config": [{"subnet": "172.80.1.0/24", "gateway": "172.80.1.1"}]},
+            },
+            "shared": {"external": True},
+            "bare": None,
+        }
+    }
+    changed = _inject_host_off_network_opts(config)
+
+    assert "public_network" in changed and "bare" in changed
+    assert config["networks"]["public_network"]["driver_opts"][HOST_OFF_BRIDGE_OPT] == "true"
+    # The declared gateway survives: containers need a default route to point at
+    # the egress proxy, which claims that address.
+    assert config["networks"]["public_network"]["ipam"]["config"][0]["gateway"] == "172.80.1.1"
+    # External networks belong to whoever created them.
+    assert "shared" not in changed
+    assert "driver_opts" not in config["networks"]["shared"]
+
+
+def test_host_off_networks_are_opt_in():
+    """The mode only works when the egress proxy runs on the machine, so it is
+    a deployment decision — never on by default.
+    """
+    import os
+
+    from cage.target.server.network_alloc import host_off_networks_enabled
+
+    previous = os.environ.pop("TARGET_SERVER_HOST_OFF_NETWORKS", None)
+    try:
+        assert host_off_networks_enabled() is False
+        os.environ["TARGET_SERVER_HOST_OFF_NETWORKS"] = "1"
+        assert host_off_networks_enabled() is True
+    finally:
+        os.environ.pop("TARGET_SERVER_HOST_OFF_NETWORKS", None)
+        if previous is not None:
+            os.environ["TARGET_SERVER_HOST_OFF_NETWORKS"] = previous
+
+
+def test_attach_egress_proxy_refuses_when_the_proxy_is_not_running():
+    """Fail loudly instead of leaving the range with a default route that
+    points at nobody — that failure is slow (ARP stalls), silent, and looks
+    like the range itself being broken.
+    """
+    from types import SimpleNamespace
+
+    import pytest
+
+    from cage.target.server import network_alloc
+
+    def _fake_run(argv, **_kwargs):
+        if argv[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such object")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    original = network_alloc.subprocess.run
+    network_alloc.subprocess.run = _fake_run
+    try:
+        with pytest.raises(RuntimeError, match="egress proxy"):
+            network_alloc.attach_egress_proxy("some-project")
+    finally:
+        network_alloc.subprocess.run = original
+
+
 def test_target_config_default_isolation_is_per_trial_bridge():
     """Defense-in-depth is on by default."""
     from cage.config.experiment import TargetConfig

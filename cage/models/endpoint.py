@@ -30,12 +30,20 @@ class ModelConfig:
     output_cost_per_1m: float | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     api_keys: list[str] = field(default_factory=list)
-    # The endpoint's real context window, in tokens, and the headroom an agent
-    # should reserve for its next response. Both are model capabilities, so they
-    # live here (declared per-model in config/models.yml) rather than as an
-    # ``extra`` magic key. ``None`` ⇒ undeclared: each agent falls back to its
-    # CLI's own default instead of Cage inventing a number. NOTE: the Claude
-    # Code CLI has no knob to accept a custom window, so it cannot honour these.
+    # The endpoint's context window, in tokens, and how much of it to hold back
+    # for the reply. Both are properties of the deployment rather than of the
+    # weights, so they are declared per-model in config/models.yml rather than
+    # smuggled through ``extra``.
+    #
+    # ``max_context_size`` is required: agents compact their conversation before
+    # it outgrows the window, every CLI takes that budget as an absolute token
+    # count, and the registry refuses to load an entry without one. Cage does
+    # not supply a default, because the failure from guessing high is silent —
+    # the agent simply never compacts.
+    #
+    # ``reserved_context_size`` stays optional. Most CLIs choose their own reply
+    # ceiling and subtract it themselves; it exists for the ones that want the
+    # reservation stated separately.
     max_context_size: int | None = None
     reserved_context_size: int | None = None
     # RL training integration. When ``rl_reward_sink`` is set, this model is in
@@ -114,6 +122,26 @@ class ModelConfig:
         if template_kwargs:
             body["chat_template_kwargs"] = template_kwargs
         return body
+
+    @property
+    def preserve_thinking(self) -> bool:
+        """Whether the model's reasoning stays in the conversation.
+
+        Reasoning arrives one of two ways, and only one of them survives a
+        naive translation: inline inside ``content`` (``<think>…</think>``,
+        Qwen-style) is indistinguishable from text and passes through, whereas
+        a dedicated ``reasoning_content`` field (GLM, DeepSeek) is dropped
+        unless something asks for it. With this on, the proxy lifts that field
+        into a real thinking block for the agent and replays it upstream on the
+        next turn, so both families behave the same.
+
+        Off by default — turning it on changes what the upstream sees on every
+        subsequent turn, so it stays a per-entry opt-in. Same key qwen-code
+        honours (``cage/agents/qwen_code/agent.py``).
+        """
+
+        extra = self.extra if isinstance(self.extra, dict) else {}
+        return bool(extra.get("preserve_thinking"))
 
     @property
     def is_local_endpoint(self) -> bool:

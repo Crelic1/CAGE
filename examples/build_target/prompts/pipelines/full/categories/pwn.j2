@@ -1,0 +1,95 @@
+This is a Pwn/binary-exploitation environment.
+
+## Determine the vulnerability-bearing runtime first
+
+- selected material priority: `{{ instance_data.pwn_material_priority.id }}`
+  ({{ instance_data.pwn_material_priority.label }})
+- Dockerfile present in declared deployment:
+  `{{ instance_data.pwn_material_priority.has_dockerfile }}`
+- provenance consequence: {{ instance_data.pwn_material_priority.authenticity }}
+
+Do not assume that every Pwn target needs a host-container glibc bundle. Trace
+the artifact that actually contains the vulnerability:
+
+- A dynamically linked glibc ELF may need an exact libc + loader pair.
+- A static, musl, or uClibc ELF; kernel/QEMU guest; browser/V8 build; firmware;
+  custom VM; or architecture emulator has a different runtime contract. Do not
+  force the local glibc catalog onto it or substitute the outer container's
+  runtime for the guest/vulnerability-bearing runtime.
+
+For a non-glibc target, set `selected_bundle` to JSON `null`, omit
+`selected_files`, and explain the actual runtime domain and evidence in
+`selection_basis`. This is not `runtime_bundle_unavailable`; the catalog is
+simply inapplicable.
+
+## glibc selection, only when the served target uses glibc
+
+Prefer, in order:
+
+1. an attachment-supplied matching libc + loader pair;
+2. an official pinned deployment/base image, cross-checked with P and W;
+3. an exact externally retrieved pair whose challenge identity, version/build
+   metadata, architecture, and hashes are corroborated;
+4. a local catalog pair supported by concrete Dockerfile, writeup, build-id,
+   symbol-version, allocator, or exploit-offset evidence.
+
+Never mix libc and loader from different sources. ELF `PT_INTERP`, architecture,
+imported symbol versions, and hardening are compatibility facts, but do not by
+themselves prove a glibc minor version. `ldd --version` inside the image reports
+the runtime just chosen and is not historical provenance.
+
+Local cache status: `{{ instance_data.pwn_runtime.status }}` at the read-only
+path `{{ instance_data.pwn_runtime.agent_path }}`.
+{% for bundle in instance_data.pwn_runtime.bundles %}- `{{ bundle.id }}`: Ubuntu {{ bundle.ubuntu_release }}, glibc {{ bundle.glibc_series }}, {{ bundle.architecture|default("amd64") }}{% if bundle.libc is defined %}; libc `{{ instance_data.pwn_runtime.agent_path }}/{{ bundle.libc.path }}` (sha256 `{{ bundle.libc.sha256 }}`), loader `{{ instance_data.pwn_runtime.agent_path }}/{{ bundle.loader.path }}` (sha256 `{{ bundle.loader.sha256 }}`){% endif %}
+{% endfor %}
+
+The cache is a convenience, not a ban on the internet. If no catalog pair is
+available, use an exact evidence-backed supplied, deployment-provided, or
+externally retrieved runtime when one can be verified. Never download an
+arbitrary “close enough” libc. If no defensible exact pair exists, use
+`selected_bundle: null` and record the remaining uncertainty; an official base
+image may still be sufficient to build.
+
+## `pwn_runtime` report schema
+
+Always add `pwn_runtime` to `build_report.json`:
+
+```json
+{
+  "pwn_runtime": {
+    "material_priority": "{{ instance_data.pwn_material_priority.id }}",
+    "selection_basis": "concise evidence-backed runtime-domain decision",
+    "evidence": [
+      {
+        "path": "materials/supplied-file",
+        "observation": "exact observed fact",
+        "supports": "the runtime decision"
+      }
+    ],
+    "selected_bundle": null,
+    "confidence": "confirmed|high|medium|low",
+    "authenticity_status": "concise provenance status"
+  }
+}
+```
+
+`evidence` is a JSON array. `selected_bundle` is one local catalog id,
+`supplied_with_challenge`, `external_verified`, or JSON `null`.
+
+When selecting a pair, copy both files into this workspace and add
+`selected_files.libc` and `selected_files.loader`, each with a path relative to
+`{{ workspace }}` and the actual copied-file SHA256. Never report a read-only
+`/opt/cage/pwn-runtimes/...` source path as an output path. For
+`external_verified`, evidence must identify the retrieval source and the
+independent version/hash corroboration. The scorer verifies workspace hashes;
+for a catalog bundle it also verifies the catalog hashes.
+
+Attachments-only input must keep `authenticity_status:
+unverified_until_exp` until current-instance exploit validation, even when a
+catalog choice is useful for construction.
+
+Preserve CPU architecture, executable permissions, interpreter/runtime pairing,
+working directory, compile flags, and binary hardening. Do not recompile a
+supplied binary unless the authentic build requires it. A network wrapper must
+reach the real program with authentic bidirectional behavior; an open socket
+alone is not proof.

@@ -80,10 +80,11 @@ def build_container_addrs(
     host-published port, each service's address as seen from INSIDE the isolated
     network (``inner_ip:internal_port``). An external agent that has attached to
     the docker network reaches the targets here. When entry services are declared
-    (web challenges), only those are listed — the internal parallel of
-    ``entry_urls``, which keeps scoring sidecars out. When none are declared
-    (multi-host post-exploit ranges), every service with an internal address is
-    listed so the whole topology is reachable.
+    — web via ``application_service_keys``, post-exploitation ranges via
+    ``entry_services`` — only those are listed, the internal parallel of
+    ``entry_urls``: it advertises exactly the entry points the agent prompt
+    names and keeps scoring sidecars / non-entry hosts out. Only a range that
+    declares no entries at all falls back to listing every internal address.
     """
     addrs: List[str] = []
     for svc in services:

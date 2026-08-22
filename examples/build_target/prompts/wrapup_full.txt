@@ -1,0 +1,154 @@
+You are in the delivery window: only twenty model rounds remain. After those
+rounds you cannot write or repair artifacts. Stop opening new investigation
+threads. Preserve the best evidence-backed environment and exploit already in
+hand, and make the workspace independently scoreable now. This reminder is
+self-contained; do not grep the transcript or the original prompt for a schema
+or routed value.
+
+Do this in order:
+
+1. Establish a complete best-effort root delivery before more technical work.
+   Ensure `docker-compose.yml`, `challenge.json`, `build_report.json`,
+   `solve/`, `solve_report.json`, and `education.json` exist and parse. It is
+   valid to record `build_report.status` as `blocked` and
+   `solve_report.status` as `unresolved` while work continues; update them only
+   when evidence changes. Copy every real deployment/exploit dependency into
+   the workspace instead of leaving a proved component only in `/tmp`.
+
+   Do not copy an event/framework metadata file over the scorer contract.
+   `challenge.json` must use this shape with one consistent real Compose
+   service name, the actual internal service port as a plain integer, the
+   evidence-backed protocol, and the production solver entry:
+
+   ```json
+   {
+     "compose_files": ["docker-compose.yml"],
+     "compose_target_services": ["challenge"],
+     "compose_dependency_services": [],
+     "target_ports": {"challenge": 31337},
+     "target_port_protocols": {"challenge": "tcp"},
+     "runtime_probes": [],
+     "flag_contract": {
+       "inject": "file",
+       "service": "challenge",
+       "path": "/flag.txt",
+       "format": "FAKE{...}"
+     },
+     "solve": {
+       "entry": "python3 solve.py",
+       "service": "challenge",
+       "image": "cage/build-target-solver:2026-08-v1"
+     }
+   }
+   ```
+
+   Replace example values only with evidence-backed task values. In root
+   Compose, keep every target/dependency service needed by the real topology,
+   remove host `ports:`, and put each exact output image tag appended below as
+   the service-level `image:` beside `build:`. The CAGE solver image above is
+   reserved for `challenge.json`: never build or tag it in Compose, and never
+   add the legacy `buildtarget/solver:latest` as a build service.
+
+2. In `build_report.json`, use only `status: "ready"` or `status: "blocked"`.
+   Copy the exact routed values appended below into `data_tier`,
+   `data_tier_source`, `build_profile`, `category_profile`,
+   `material_profile`, `pipeline_route`, and `build_source`. Also keep concrete
+   arrays/objects for `material_used`, `assumptions`,
+   `compatibility_changes`, and `blockers`.
+
+   `ready` means the environment/build contract is evidence-backed and ready
+   to be tested; it does not mean that the exploit or R5 has already passed.
+   If the static closure is complete enough for the host validator to attempt,
+   set the build status to `ready`, keep `solve_report.status` as `unresolved`,
+   and put exploit/validation unknowns only in the solve blockers. `ready` does
+   not claim a local build: `cage-check` is the only authority for build,
+   runtime, and exploit behavior. Never reproduce the complete target in the
+   agent container, never keep the build `blocked` merely because cage-check has
+   not run, and never run cage-check while the build report is `blocked`. Do not
+   locally compile the target, run its build scripts, install its dependencies,
+   or create a replacement runtime. When candidate Dockerfile/Compose/entrypoint
+   paths exist and the root contracts parse, checkpoint before optional
+   framework archaeology or runtime-topology research.
+
+   For a Pwn task, `build_report.json.pwn_runtime` is always required. It must
+   contain all six fields below, even when no host glibc bundle applies:
+
+   ```json
+   {
+     "material_priority": "copy the exact appended literal",
+     "selection_basis": "concise evidence-backed runtime-domain decision",
+     "evidence": [
+       {
+         "path": "workspace-relative or surfaced material path",
+         "observation": "exact observed fact",
+         "supports": "the runtime decision"
+       }
+     ],
+     "selected_bundle": null,
+     "confidence": "confirmed|high|medium|low",
+     "authenticity_status": "concise provenance status"
+   }
+   ```
+
+   `evidence` is an array. `selected_bundle` describes only the runtime of the
+   vulnerability-bearing served target. It is a local catalog id,
+   `supplied_with_challenge`, `external_verified`, or JSON `null`; a workspace
+   directory name such as `solve` or `build` is never a bundle id. Do not use a
+   solver image's libc, the outer container's libc, or a host-tooling copy to
+   fill this field. For a static, musl/uClibc, kernel/QEMU guest, browser/V8,
+   firmware, custom-VM, or architecture-emulator target, use JSON `null` and
+   omit `selected_files` unless the vulnerability-bearing target itself is a
+   dynamically linked glibc ELF. If `selected_bundle` is not null, add
+   `selected_files.libc` and `selected_files.loader` inside `pwn_runtime`; each
+   is an object with a workspace-relative `path` and the actual copied-file
+   `sha256`. Do not put `selected_files` at report top level.
+
+3. In `solve_report.json`, use only `status: "solved"` after an observed live
+   R5; otherwise use `status: "unresolved"`. Include the exact appended
+   `material_profile`, `pipeline_route`, and `exploit_source`, plus `entry`,
+   intended `primitive`, `success_signal`, fidelity changes, and `blockers`.
+   Each unresolved blocker records `code`, `stage`, `reason`, non-empty
+   `evidence`, and `next_action`. Do not discard a working build because the
+   exploit remains unresolved.
+
+4. Write `education.json` as one JSON object containing exactly these four
+   fields—no title, event, challenge, category, or other extra keys:
+
+   - `description`: two or three factual, player-facing, spoiler-light
+     sentences describing the target, visible interaction/materials, and
+     objective. Do not name the bug, primitive, ordered exploit path, offsets,
+     gadgets, hidden control-flow destination, a supplied solution, or promise
+     a shell. “Get the flag” alone is invalid.
+   - `tags`: 2–5 unique tags, primary first, selected only from `userland`,
+     `kernel`, `browser`, `qemu`, `vm`, `embedded`, `windows`, `blockchain`,
+     `stack`, `heap`, `format-string`, `integer`, `oob`, `uaf`, `race`,
+     `sandbox`, `ioctl`, `seccomp`, `jit`, `wasm`, `custom-allocator`,
+     `vm-escape`, `glibc`, `musl`, `v8`, `javascriptcore`, `spidermonkey`,
+     `amd64`, `i386`, `arm`, `aarch64`, `mips`, `riscv`, `heterogeneous`.
+     Tag what is attacked: use `qemu` only when QEMU/device emulation is the
+     target, not when it merely boots a kernel challenge.
+   - `difficulty`: an integer 1–5 based on required knowledge and solve
+     complexity.
+   - `learning_points`: 2–5 short concept labels, not ordered exploit steps.
+
+5. After delivery exists, finish at most one already-supported causal change.
+   Do not download new material, start a broad host/framework investigation,
+   replace a proved component, locally compile/install the target, or rebuild
+   from a new hypothesis. Use remaining validator-build or network-download wait
+   time to reopen and repair the delivery files instead of polling.
+
+6. If the workspace is ready and a check remains, run at most one final
+   `cage-check --json`. The client itself waits through temporary validator
+   contention. On R5, update both reports without changing the passed artifacts,
+   run `cage-check stop`, and finish. Without R5, keep the solve unresolved,
+   record the last proven and first unproven links and the concrete blocker,
+   stop a retained stack, and finish honestly.
+
+7. Before the final answer, stop every background relay, server, debugger,
+   solver, delayed probe, or other process you started by its retained exact
+   PID after verifying it is still that owned child. Also stop any retained
+   validator stack with `cage-check stop`. Do not leave an orphan that keeps the
+   agent/trial open after your final text.
+
+A complete best-effort workspace with honest reports is more useful than
+reaching the cap mid-investigation with required files missing.

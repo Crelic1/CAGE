@@ -229,6 +229,73 @@
       setTimeout(() => { button.textContent = old; }, 1000);
     });
   </script>
+  <script>
+  // Corpus export: ask, watch, then download.
+  //
+  // The export runs behind the request, so a click starts (or joins) a job and
+  // this polls it. Two behaviours matter and neither is cosmetic: the button
+  // disables itself while its own export is in flight, because repeat clicks
+  // are what turned one user action into several concurrent scans of the same
+  // gigabytes; and progress is shown, because a control that looks frozen for
+  // four minutes is what provokes those clicks in the first place.
+  document.addEventListener('click', async (event) => {
+    const link = event.target.closest('[data-corpus-export]');
+    if (!link) return;
+    event.preventDefault();
+    if (link.dataset.busy === '1') return;
+
+    const url = link.getAttribute('href');
+    const idle = link.dataset.corpusIdle || 'Export traj';
+    link.dataset.busy = '1';
+    link.classList.add('opacity-60', 'cursor-wait');
+
+    const finish = (text) => {
+      link.dataset.busy = '';
+      link.classList.remove('opacity-60', 'cursor-wait');
+      link.textContent = text;
+      if (text !== idle) setTimeout(() => { link.textContent = idle; }, 6000);
+    };
+
+    try {
+      while (true) {
+        const resp = await fetch(url + '?status=1', {headers: {'Accept': 'application/json'}});
+        const info = await resp.json().catch(() => ({}));
+        if (info.state === 'done') {
+          if (!info.rows) {
+            // Empty, and the reason matters: every trial refused by a
+            // contamination gate is a correct result, and downloading an empty
+            // file with no explanation is how that gets mistaken for a bug.
+            const why = Object.entries(info.refused_by_gate || {})
+              .map(([code, n]) => `${n} ${code}`).join(', ');
+            finish(why ? `Nothing to export — refused: ${why}` : 'Nothing to export');
+            return;
+          }
+          // Ready: hand it to the browser as an ordinary download, which gets a
+          // length and can resume if the transfer breaks.
+          window.location = url;
+          finish(idle);
+          return;
+        }
+        if (resp.status !== 202) {
+          finish('Export failed');
+          console.error('corpus export failed', info);
+          return;
+        }
+        const seen = info.trials_seen || 0;
+        const total = info.trials_total || 0;
+        const rows = info.rows || 0;
+        link.textContent = total
+          ? `Exporting ${seen}/${total} trials (${rows} rows)`
+          : `Exporting… (${rows} rows)`;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    } catch (err) {
+      console.error('corpus export', err);
+      finish('Export failed');
+    }
+  });
+  </script>
+
   {% block scripts %}{% endblock %}
 </body>
 </html>

@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cage.contracts.jsonio import iter_jsonl_entries
 from cage.proxy.conversations import reconstruct_forest
 from cage.proxy.usage import extract_entry_usage
 
@@ -235,18 +236,11 @@ def generate_traj(proxy_jsonl_path: Path, output_path: Path) -> None:
     if not proxy_jsonl_path or not proxy_jsonl_path.exists():
         return
 
-    entries: list[dict[str, Any]] = []
-    for line in proxy_jsonl_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("status") != "success":
-            continue
-        entries.append(entry)
+    entries: list[dict[str, Any]] = [
+        entry
+        for entry in iter_jsonl_entries(proxy_jsonl_path)
+        if entry.get("status") == "success"
+    ]
 
     if not entries:
         return

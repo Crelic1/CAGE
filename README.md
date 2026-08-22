@@ -118,29 +118,33 @@ themselves are documented in the
 
 ### 3. Prepare Targets
 
-CAGE ships two AgentPentestBench datasets as git submodules. The submodules
-include a small bundled subset for smoke tests. The full datasets can be fetched
-separately from Hugging Face.
+CAGE ships two AgentPentestBench datasets. A small bundled subset is published
+as ready-to-use release tarballs (§3.1) for smoke tests — no Git LFS required.
+The full datasets can be fetched separately from Hugging Face.
 
 | Benchmark | GitHub (subset) | Hugging Face (full set) |
 |---|---|---|
-| WebExploitBench | [WebExploitBench (comfyui, dataease, prestashop)](https://github.com/AgentCyberRange/WebExploitBench) | [datasets/WebExploitBench](https://huggingface.co/datasets/AgentCyberRange/WebExploitBench) |
-| PostExploitBench | [PostExploitBench (range-4, range-6)](https://github.com/AgentCyberRange/PostExploitBench) | [datasets/PostExploitBench](https://huggingface.co/datasets/AgentCyberRange/PostExploitBench) |
+| WebExploitBench | [WebExploitBench (comfyui, jetlinks, prestashop, siyucms, white-jotter)](https://github.com/AgentCyberRange/WebExploitBench) | [datasets/WebExploitBench](https://huggingface.co/datasets/AgentCyberRange/WebExploitBench) |
+| PostExploitBench | [PostExploitBench (range-3…range-7)](https://github.com/AgentCyberRange/PostExploitBench) | [datasets/PostExploitBench](https://huggingface.co/datasets/AgentCyberRange/PostExploitBench) |
 
 #### 3.1 Initialize Bundled Targets
 
-Make sure Git LFS is enabled before pulling the submodules. Otherwise, large
-target assets such as jars and archives may be checked out as LFS pointer files.
+The bundled public targets ship as **ready-to-use release tarballs** — every
+binary is already inside the archive, so no Git LFS is required. Download each
+and extract it into the datasets directory:
 
 ```bash
-git lfs install
-git submodule update --init --recursive \
-  examples/agent_pentest_bench/datasets/web_exploit_bench \
-  examples/agent_pentest_bench/datasets/post_exploit_bench
-# fetch the actual LFS binaries (jars/zips) — submodule update skips these:
-git -C examples/agent_pentest_bench/datasets/web_exploit_bench lfs pull
-git -C examples/agent_pentest_bench/datasets/post_exploit_bench lfs pull
+D=examples/agent_pentest_bench/datasets
+curl -L -o /tmp/web_exploit_bench.tar.gz \
+  https://github.com/AgentCyberRange/WebExploitBench/releases/download/v1/web_exploit_bench.tar.gz
+curl -L -o /tmp/post_exploit_bench.tar.gz \
+  https://github.com/AgentCyberRange/PostExploitBench/releases/download/v1/post_exploit_bench.tar.gz
+tar xzf /tmp/web_exploit_bench.tar.gz  -C "$D"
+tar xzf /tmp/post_exploit_bench.tar.gz -C "$D"
 ```
+
+This opens the public targets — web `comfyui`/`jetlinks`/`prestashop`/`siyucms`/`white-jotter`
+and post `range-3`…`range-7` — ready to build.
 
 #### 3.2 Optional: Fetch the full datasets
 
@@ -246,6 +250,21 @@ To continue a named run, pass the same --run-id with --resume:
 cage run web_exploit_bench --run-id web-smoke-001 --resume
 ```
 
+To adjust a run that is **still executing** — without stopping it — use
+`cage tune`. Today it changes per-endpoint concurrency: raise a box that was
+scaled up, bring a newly registered one online, or set one to `0` so it takes
+no new trials while the ones on it finish. The change applies to the next trial
+that starts; nothing in flight is disturbed. `--dry-run` previews it, `--clear`
+reverts to the concurrency the run launched with.
+
+```bash
+cage tune web_exploit_bench --run-id web-smoke-001 \
+  --model-source glm-box1:32 --model-source glm-box2:0
+```
+
+See [Key & Endpoint Rotation](docs/model-rotation.md) for the endpoint pool,
+capacities, and what `--tune` can and cannot change.
+
 To **re-score** a finished run without re-running the agent, use `cage score`.
 It reuses the evidence already saved from the run, and scores trials in parallel
 when you pass `--max-concurrent`:
@@ -257,6 +276,29 @@ cage score web_exploit_bench --run-id web-smoke-001 --max-concurrent 8
 By default it re-judges with the benchmark's judge model (`deepseek-v4-pro`). To
 judge with a different model, set `eval.benchmark.judge` to any model registered
 in `config/models.yml`.
+
+If the scores are fine and only the *presentation* changed — the benchmark's
+dashboard grew a column, or an aggregate was corrected — `--dashboard-only`
+rebuilds what the inspector shows from the artifacts already on disk, scoring
+nothing:
+
+```bash
+cage score web_exploit_bench --dashboard-only
+```
+
+To turn finished runs into **training data**, use `cage corpus`. One row per
+complete conversation, in ms-swift `messages + loss` shape, each traceable back
+to the trial it came from:
+
+```bash
+cage corpus runs                                 # what is available
+cage corpus export --run <run-id> --dry-run      # what a set of filters yields
+cage corpus export --run <run-id> --out sft.jsonl
+```
+
+Only the benchmark's contamination gates apply by default; everything else is an
+opt-in filter, and every drop is counted. See
+[Training Corpus](docs/training-corpus.md).
 
 ## How a run works
 
@@ -332,6 +374,7 @@ CAGE is benchmark-agnostic; these security benchmarks ship as example packages:
 | [AgentPentestBench](examples/agent_pentest_bench) | Web exploitation (WebExploitBench) and multi-host post-exploitation ranges (PostExploitBench). The release-facing example, with full datasets on Hugging Face. |
 | [CVEBench](examples/cvebench) | Whether an agent can exploit a known CVE in a live target. |
 | [NYU CTF](examples/nyuctfbench) | CTF-style capture-the-flag tasks. |
+| [Cybench](examples/cybench) | The 40 Cybench CTF tasks (HTB, SekaiCTF, GlacierCTF, HKCERT), 23 with a live service. |
 | [AutoPenBench](examples/autopenbench) | Automated penetration-testing tasks. |
 | [HackWorld](examples/hackworld) | Web CTF tasks. |
 | [StrongREJECT](examples/strongreject) | Safety / refusal behavior (no live target). |

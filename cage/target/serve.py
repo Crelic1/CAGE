@@ -57,6 +57,8 @@ def run_target_server(
     namespace: str = "default",
     adapters: Sequence[str] = (),
     external_token: str = "",
+    public_host: str = "",
+    max_public_instances: int | None = None,
     parent_pid: int = 0,
 ) -> None:
     """Run the target_server FastAPI app after applying process-local config.
@@ -66,6 +68,29 @@ def run_target_server(
     ungraceful cage exit can't leave the server orphaned. Standalone ``cage
     serve`` leaves it 0 and runs until explicitly stopped.
     """
+
+    # SECURITY: --public-host publishes target entry ports on the host so an
+    # off-host agent can reach them. The control API (/launches, /instances,
+    # /prompt, /submit, /launch, DELETE) also listens on that same host address,
+    # so any agent that can dial a published target can dial the API too. Without
+    # a token, a non-loopback caller is classified `internal` and gets full
+    # control: enumerate every instance, read any prompt (hint/topology leak),
+    # submit/close or launch anything. So enabling --public-host REQUIRES an
+    # --external-token to gate the API. The token never gates the targets
+    # themselves (a published target stays reachable without it); it only locks
+    # the control plane so an agent cannot pivot from its target to the API.
+    if public_host and not external_token:
+        print(
+            "Error: --public-host requires --external-token.\n"
+            "  Publishing target entries on the host also exposes the control API "
+            "there, so an off-host agent\n"
+            "  that can reach a target could otherwise drive the API "
+            "(list/launch/prompt/submit/delete every\n"
+            "  instance) with no auth. Set --external-token to gate the API, or "
+            "drop --public-host to keep\n"
+            "  targets network-only."
+        )
+        raise SystemExit(2)
 
     try:
         import uvicorn
@@ -78,6 +103,12 @@ def run_target_server(
         os.environ["TARGET_SERVER_NAMESPACE"] = namespace
     if external_token:
         os.environ["TARGET_SERVER_EXTERNAL_TOKEN"] = external_token
+    # External-access mode. ``auto`` = on with the advertised address derived
+    # per request; any other value pins that address. Unset = off (network-only).
+    if public_host:
+        os.environ["TARGET_SERVER_PUBLIC_HOST"] = public_host
+    if max_public_instances is not None:
+        os.environ["TARGET_SERVER_MAX_PUBLIC_INSTANCES"] = str(max(0, max_public_instances))
     if benchmark_root:
         root = Path(benchmark_root).expanduser().resolve()
         if not root.is_dir():
@@ -109,6 +140,11 @@ def run_target_server(
         print("external audience: ENABLED (bearer token required for non-loopback)")
     else:
         print("external audience: disabled (all callers treated as internal)")
+    if public_host:
+        advertised = "derived per request" if public_host == "auto" else public_host
+        print(f"external access: ENABLED (entries published on host as {advertised})")
+    else:
+        print("external access: disabled (targets stay on the isolated docker network)")
     if parent_pid > 1:
         print(f"parent watchdog: exit if cage pid {parent_pid} dies")
         threading.Thread(
@@ -150,6 +186,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--external-token", default="")
     parser.add_argument(
+        "--public-host",
+        nargs="?",
+        const="auto",
+        default="",
+        help=(
+            "Publish each challenge's declared entry service(s) on the host for "
+            "agents that are not co-located. Bare = derive the advertised "
+            "address per request; pass an address to pin it."
+        ),
+    )
+    parser.add_argument(
+        "--max-public-instances",
+        type=int,
+        default=None,
+        help="How many host-published instances may run at once (0 = unlimited).",
+    )
+    parser.add_argument(
         "--parent-pid",
         type=int,
         default=0,
@@ -173,6 +226,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         namespace=args.namespace,
         adapters=tuple(args.adapters),
         external_token=args.external_token,
+        public_host=args.public_host,
+        max_public_instances=args.max_public_instances,
         parent_pid=args.parent_pid,
     )
 

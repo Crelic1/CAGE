@@ -85,9 +85,25 @@ eval:
     # results on a separate curve. dynamic_sandbox_image overrides the debug image.
     dynamic_sandbox: false
     # dynamic_sandbox_image: cage/claude-code:cyberdebug
-    # level0 repo only · level1 +description · level2 +crash trace · level3 +patch.
+    # WHICH files the agent gets: level0 repo only · level1 +description.txt ·
+    # level2 +error.txt (crash trace) · level3 +patch.diff +repo-fix.tar.gz.
+    # The official dataset ships all four, so every level is available here.
     difficulty: level1
+    # Optional second axis (see default_arvo.yml): a materials overlay can replace
+    # description.txt with a generated ladder rung, from a one-clause hint
+    # (level0) to the full faulty logic (level3), holding difficulty fixed.
+    # Unset = the dataset's own description.txt, i.e. upstream behaviour.
+    # materials_dir: ./datasets/materials-cybergym
+    # description_tier: level1
     # Subset further from the CLI with `--sample arvo_10400 ...` or `eval.limit`.
+    #
+    # How long one graded PoC may run. A timeout scores 0, indistinguishable from
+    # an input that simply did not crash, so this has to clear the slowest target
+    # in the pool: a native libFuzzer target reproduces in milliseconds, a
+    # JVM/Jazzer one spends tens of seconds booting and instrumenting first.
+    # docker_timeout wraps container start + command + teardown — keep it above.
+    cmd_timeout: 600
+    docker_timeout: 900
     grading:
       # The interactive submit service that gives the agent `submit.sh` feedback
       # by running the vul target. It holds the docker socket; the agent does not.
@@ -120,7 +136,25 @@ runtime:
   max_input_tokens: null
   max_output_tokens: null
   max_cost: null
+  # runtime.network_containment (see docs/reference/project-yml.md) is NOT
+  # usable here: this benchmark grades over the host gateway
+  # (eval.benchmark.grading.host), and containment removes the host from
+  # the agent's networks entirely.
   agent_network_mode: bridge
+  # Hard memory ceiling per agent container. PoC synthesis is the workload that
+  # needs it most: the agent writes throwaway Python to emit a crashing input,
+  # and an off-by-1024 size or a loop that never terminates turns into tens of
+  # GB within minutes. Two such scripts (an unbounded bytearray, and
+  # np.zeros((65536, 65536)) whose author's comment said "4MB") once took a
+  # 247 GB host down with every other run on it. 16g is what the fuzzing fleet
+  # on the same machines caps each task at, and ~90x an agent container's
+  # steady state. The cgroup kills the offending PROCESS, not the container: a
+  # runaway script the agent spawned comes back as exit 137 from its own Bash
+  # call and the agent can correct course while the trial runs on; only if the
+  # agent process itself is reaped does the trial end as oom_killed. Either way
+  # a ceiling set too low stays visible in the run rather than being silently
+  # blamed on the agent. Set to "unlimited" to disable.
+  agent_memory_limit: 16g
   store_proxy: true
   live_check:
     # The agent self-terminates via submit.sh; no target-side early-stop poll.
@@ -134,17 +168,17 @@ agents:
   #   cage run cybergym --agent claude_code --model <id> \
   #     --task-ids ./datasets/cybergym_repr100.txt --upstream-proxy http://<host-ip>:7890 \
   #     --max-concurrent 8 --run-id <id>
-  # BASH_*_TIMEOUT_MS=600000: submit.sh binary grading can take ~150s; the CLI's
-  # default 120s Bash kill would abort it mid-grade. WebFetch/WebSearch disallowed
-  # to keep the contract blind. No max_output_tokens (do not cap it).
+  # BASH_*_TIMEOUT_MS=660000: submit.sh host-side grading can wait up to the
+  # benchmark's 600s Docker wall clock plus cleanup/HTTP return time. WebFetch/
+  # WebSearch disallowed to keep the contract blind. No max_output_tokens.
   - id: claude_code
     kind: claude_code
     image: cage/claude-code:latest
     home: /home/agent/workspace
     max_concurrent: 8
     extra_env:
-      BASH_DEFAULT_TIMEOUT_MS: "600000"
-      BASH_MAX_TIMEOUT_MS: "600000"
+      BASH_DEFAULT_TIMEOUT_MS: "660000"
+      BASH_MAX_TIMEOUT_MS: "660000"
     session_args:
       - --permission-mode
       - bypassPermissions

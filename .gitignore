@@ -86,6 +86,13 @@ examples/cybergym/datasets/image-cache
 examples/cybergym/datasets/payloads-arvo
 examples/cybergym/datasets/server-binary-arvo
 examples/cybergym/datasets/.dlcache
+# The extracted arvo_env_cache: one tree whose arvo/<id>/ carries both the vul|fix
+# binaries and the payload files, so it serves as binary_dir and data_dir at once.
+examples/cybergym/datasets/env-cache-arvo
+# Materials overlays (real error.txt + the description ladder) are harvested from
+# local run trees by external_arvo/scripts/build_materials_overlay.py — derived
+# data, rebuildable, never committed.
+examples/cybergym/datasets/materials-arvo/
 
 # Local ARVO task-id selection / working lists — regenerate via the extract/
 # classify scripts. The committed catalogs are the JSON indexes (arvo.json,
@@ -94,12 +101,12 @@ examples/cybergym/datasets/*.txt
 !examples/cybergym/datasets/cybergym_images.txt
 examples/cybergym/datasets/arvo_image_last200.json
 
-# external_arvo: ship only the classification/selection scripts + SCHEMA.md.
-# The generated data (environments.jsonl, *.tsv, features/selected_*) and the
-# internal analysis notes (README, GAP_REPORT, SELECTION_*) stay local.
-examples/cybergym/external_arvo/*
-!examples/cybergym/external_arvo/*.py
-!examples/cybergym/external_arvo/SCHEMA.md
+# external_arvo: source/docs are tracked; generated catalog, reports,
+# selections and snapshots stay local.
+examples/cybergym/external_arvo/catalog/
+examples/cybergym/external_arvo/reports/
+examples/cybergym/external_arvo/selections/
+examples/cybergym/external_arvo/snapshots/
 
 # Internal working/progress plans — never commit (may carry internal infra refs)
 docs/plans/
@@ -110,3 +117,13 @@ docs/plans/
 /artifacts/
 /asset/
 /reports/
+
+# Machine-local firewall allowlist extensions (private model endpoints etc.).
+# The committed scripts/agent_firewall_allowlist.txt stays generic.
+scripts/agent_firewall_allowlist.local.txt
+scripts/agent_firewall_ips.local.txt
+artifacts/traj_index.json
+
+# Per-session working notes and handoffs. These carry absolute host paths and
+# in-flight run state, so they stay local rather than travelling to the mirror.
+/.session/

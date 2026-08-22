@@ -27,7 +27,8 @@ if TYPE_CHECKING:
     from cage.sandbox.containers import Container
 
 
-DEFAULT_BENCHMARK_ROOT = Path(__file__).resolve().parent / "datasets"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_BENCHMARK_ROOT = _PACKAGE_DIR / "datasets"
 TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9]{16}(?![A-Za-z0-9_])")
 PRIVATE_CHALLENGE_FIELDS = {
     "flag",
@@ -45,7 +46,14 @@ def _resolve_benchmark_root(benchmark_root: str | os.PathLike[str] | None = None
         or os.getenv("EVOLVE_CTF_BENCHMARK_ROOT")
         or DEFAULT_BENCHMARK_ROOT
     )
-    root = Path(raw).expanduser().resolve()
+    root = Path(raw).expanduser()
+    # A relative ``benchmark_root`` in the project yml (e.g. ``./datasets``) is
+    # relative to this example package, not the process CWD. Resolving it against
+    # CWD breaks ``cage run autopenbench`` / ``cage benchmark check`` from the
+    # repo root (the documented invocation), so anchor relative paths here.
+    if not root.is_absolute():
+        root = _PACKAGE_DIR / root
+    root = root.resolve()
     index_path = root / "autopenbench.json"
     machines_root = root / "autopenbench" / "benchmark" / "machines"
     if not index_path.is_file():
@@ -123,8 +131,11 @@ class AutoPenBench(Benchmark):
         *,
         server_url: str | None = None,
     ) -> None:
+        # Keep a relative ``benchmark_root`` relative here; ``setup()`` anchors
+        # it to the package via ``_resolve_benchmark_root``. Pre-resolving would
+        # bake in the process CWD and break repo-root invocations.
         self.benchmark_root = (
-            Path(benchmark_root).expanduser().resolve() if benchmark_root else None
+            Path(benchmark_root).expanduser() if benchmark_root else None
         )
         self._index: dict[str, dict[str, Any]] = {}
         self.challenge_client: ChallengeClient | None = None

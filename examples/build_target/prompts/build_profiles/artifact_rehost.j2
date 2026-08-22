@@ -1,0 +1,6 @@
+The input primarily contains player-visible artifacts, possibly accompanied by a Writeup. Rehost only behavior that can be derived from those materials.
+
+- Inspect file type, architecture, interpreter/loader, dynamic libraries, permissions, and expected stdin/stdout or network interaction.
+- A thin transport wrapper is acceptable only when it exposes the supplied program without changing its logic.
+- Do not reimplement the challenge from the Writeup, hardcode expected output, or create a look-alike service.
+- If the server-side program, dependency, or flag mechanism cannot be recovered faithfully, set `build_report.json.status` to `blocked` and name the missing evidence.

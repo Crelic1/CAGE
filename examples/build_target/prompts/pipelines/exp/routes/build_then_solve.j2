@@ -1,0 +1,33 @@
+Material profile `{{ instance_data.route.material_profile }}`: build material
+(`B`) anchors a faithful environment, but there is no exploit and no writeup —
+nothing describes the intended path. Derive the exploit from the attachment
+alone. This is the hardest route; work the analysis in explicit stages and
+prove each before the next.
+
+## 1. Analysis — locate the vulnerability
+- Triage {% for p in instance_data.materials.attachments %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}{% if instance_data.materials.source %} and source {% for p in instance_data.materials.source %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}:
+  file type, architecture, loader, linked libraries, and protection state
+  (NX/PIE/canary/RELRO).
+- Map the input surface (menu/parser/protocol) and find the bug — overflow,
+  UAF, format string, off-by-one, type confusion. Record the exact
+  function/offset and the evidence (disassembly or decompiler output) that
+  establishes it.
+
+## 2. Primitive — turn the bug into control
+- Decide the primitive the bug yields (write-what-where, PC control, arbitrary
+  read) and build toward it: defeat each protection the target actually has and
+  resolve leaks at runtime against the rebuilt instance's real libc/loader.
+- Confirm the primitive via `cage-exploit` (control of PC / arbitrary read)
+  before attempting the finish.
+
+## 3. Flag — reach the success signal
+- Drive the primitive to the intended win: shell, win function, or a read of
+  the provisioned flag path. Capture the live-provisioned flag; never a
+  hardcoded one.
+
+## Honest unresolved
+- The environment is build-anchored, so failures are exploit-side. If the
+  attachment does not let you locate an exploitable bug, or the primitive cannot
+  be built from the supplied evidence, stop and emit `unresolved` naming the
+  last confirmed stage (analysis / primitive / flag) and the missing evidence.
+  Do not ship an exploit that only appears to work.

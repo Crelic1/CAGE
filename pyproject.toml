@@ -29,7 +29,7 @@ dev = [
 include = ["cage*"]
 
 [project.scripts]
-cage = "cage.cli:main"
+cage = "cage.cli:cli"
 
 [tool.ruff]
 line-length = 100

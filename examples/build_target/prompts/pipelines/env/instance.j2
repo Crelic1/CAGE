@@ -1,0 +1,109 @@
+{# Environment-generation entry. Composition contract:
+   mission -> surfaced materials (context policy) -> route strategy (the one
+   per-route variable part) -> category specifics -> service/flag/build-env
+   contracts -> validator workflow -> safety -> output contract.
+   `instance_data.route` carries the resolved RoutePipeline fields. #}
+# MISSION
+
+Reconstruct a faithful, bootable CAGE target for this challenge from the
+classified evidence below. You own only the workspace at `{{ workspace }}`; the
+independent host-side validator owns the Docker daemon and the final verdict.
+
+- challenge: `{{ instance_data.name }}` ({{ instance_data.category }})
+- material profile: `{{ instance_data.route.material_profile }}`
+- pipeline route: `{{ instance_data.route.pipeline_route }}` — {{ instance_data.route.summary }}
+- environment source: `{{ instance_data.route.build_source }}`
+- target maturity: environment `{{ instance_data.target_maturity.get("environment", "E3") if instance_data.target_maturity else "E3" }}`
+
+# INPUT MATERIALS
+
+Paths are relative to `{{ workspace }}`, classified by evidence role. Do not
+treat a writeup as deployment source, and never treat a historical flag as
+validation truth. For THIS route you are given exactly the roles that its
+build source needs:
+
+{% for role in instance_data.route.env_context_roles %}{% if instance_data.materials.get(role) %}## {{ role }}
+{% for path in instance_data.materials.get(role) %}- `{{ path }}`
+{% endfor %}{% endif %}{% endfor %}
+{% if instance_data.static_evidence.get("review_flags") %}
+Review flags on the supplied evidence: {% for f in instance_data.static_evidence.get("review_flags") %}`{{ f }}`{% if not loop.last %}, {% endif %}{% endfor %}. Resolve or record these; do not silently upgrade weak evidence.
+{% endif %}
+
+# ROUTE STRATEGY
+
+{% include "routes/" ~ instance_data.route.pipeline_route ~ ".j2" %}
+
+# CATEGORY-SPECIFIC REQUIREMENTS
+
+{% include "categories/" ~ instance_data.category_profile ~ ".j2" %}
+
+# DECLARED SERVICE CONTRACT
+
+{% if instance_data.service_contract %}{% for key, value in instance_data.service_contract.items() %}- `{{ key }}`: `{{ value }}`
+{% endfor %}{% else %}- No complete service contract was supplied. Derive only what the material supports and record uncertainty in `build_report.json`.
+{% endif %}
+
+# FLAG CONTRACT
+
+{% for key, value in instance_data.flag_contract.items() %}- `{{ key }}`: `{{ value }}`
+{% endfor %}
+- Never hardcode a historical writeup flag as proof of anything.
+- Prefer runtime injection through the declared environment variable or file contract.
+- A normal readiness probe must not print or otherwise disclose the flag.
+
+# BUILD ENVIRONMENT
+
+{% set network_mode = instance_data.build_environment.get("network", "unspecified") %}
+- network availability: `{{ network_mode }}`
+{% if instance_data.build_environment.get("cached_images") %}- locally available base images: {% for image in instance_data.build_environment.get("cached_images") %}`{{ image }}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
+{% if network_mode == "offline" %}- The build must not use `apt`, `apk`, `pip`, `npm`, `go get`, image pulls, or any other network fetch. Use only supplied material and declared cached images.
+{% elif network_mode == "restricted" %}- Do not assume public internet access. Reuse locked dependencies and configured proxy/cache paths; report an unavailable dependency instead of silently changing it.
+{% else %}- Do not assume a dependency can be fetched unless you verify the build environment permits it. Preserve lockfiles and pinned versions.
+{% endif %}
+
+# VALIDATOR WORKFLOW
+
+- The agent workspace does not own the Docker daemon. Use `cage-check` to ask the host-side validator to build and boot what you have written so far.
+- As soon as `docker-compose.yml`, `build_report.json`, and `challenge.json` exist in minimally valid form, run `cage-check`. Do not polish for many rounds before the first check.
+- Run `cage-check` after each meaningful Compose or Dockerfile change. A failed check returns a structured failure class plus concrete feedback; fix that exact issue before moving on.
+- `cage-check` is the independent validator: it resolves the private target address and executes the structured `runtime_probes` from `challenge.json` on the host. Agent-authored `service_output.txt` is never grading truth.
+- On a PASS, quote the returned host-side probe excerpt, run `cage-check stop`, and finish. Do not repeat a passing check or replace it with `nc -vz`.
+- If feedback has `retryable: false`, stop blind repair, preserve the structured blocker, and finish.
+
+# SAFETY AND AUTHENTICITY RULES
+
+- Preserve the original vulnerability, architecture, dependency semantics, entrypoint, and intended solve path. The environment must remain genuinely exploitable — a later exploit stage will prove it.
+- Make the smallest evidence-backed compatibility changes and list every one in `build_report.json`.
+- Do not use `privileged`, host networking/PID/IPC, Docker-socket mounts, host bind mounts, devices, host-admin capabilities (`cap_add: [SYS_ADMIN]`/`[ALL]`), unconfined `security_opt` (`apparmor:unconfined`/`seccomp:unconfined`), or a fixed `container_name`. If the authentic target truly cannot run without one, return `status: blocked` naming the blocker.
+- Do not turn a missing service into a mock, static page, echo server, or `sleep infinity` container to satisfy liveness.
+- If the supplied evidence cannot support a faithful environment, stop and emit a structured blocker. An honest blocker beats a fabricated target.
+
+# OUTPUT CONTRACT
+
+Always create `build_report.json`. It MUST preserve the routed task contract by
+copying these values **exactly** (the validator rejects any mismatch):
+
+- `data_tier`: `{{ instance_data.data_tier }}`
+- `data_tier_source`: `{{ instance_data.data_tier_source }}`
+- `build_profile`: `{{ instance_data.build_profile }}`
+- `category_profile`: `{{ instance_data.category_profile }}`
+
+Also include the routing provenance and evidence:
+
+- `status`: `ready` or `blocked`
+- `material_profile`: `{{ instance_data.route.material_profile }}`, `pipeline_route`: `{{ instance_data.route.pipeline_route }}`, `build_source`: `{{ instance_data.route.build_source }}`
+- `material_used`, `assumptions`, every `compatibility_changes` entry, and unresolved blockers.
+
+For `status: blocked`, `blockers` is a non-empty array of objects, each with `code`, `stage`, `reason`, non-empty `evidence`, `next_action`.
+
+For `status: ready` also produce:
+
+1. A root Compose file `docker-compose.yml` (may reference preserved nested Dockerfiles).
+2. `challenge.json` with `compose_files`, `compose_target_services`, `compose_dependency_services`, `target_ports` (integer values), `target_port_protocols`, and a source-backed `runtime_probes` contract.
+3. Dockerfile(s), entrypoint wrappers, config, and health checks the real service needs.
+{% if instance_data.image_names %}4. Assign every archival tag to a Compose service that has a `build:` section:
+{% for image in instance_data.image_names %}   - `{{ image }}`
+{% endfor %}{% endif %}
+
+Each `runtime_probes` entry asserts a source-backed, challenge-specific normal interaction (real banner/menu for TCP, real title/marker for HTTP), cites the exact supplied file in `evidence`, and includes at least one expectation string of four or more characters that literally appears in a cited file. The readiness probe must NOT exploit the target or retrieve the flag — that is the exploit stage's job. Do not choose or publish host ports; CAGE allocates an isolated network and reaches the service by container IP.

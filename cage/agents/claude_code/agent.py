@@ -7,6 +7,7 @@ State paths: .claude/ contains MEMORY.md, settings.json, session data.
 """
 
 from __future__ import annotations
+from cage.contracts.exceptions import AgentSetupError, ConfigError
 
 import getpass
 import json
@@ -64,6 +65,7 @@ def _container_mounts_target(container: Any, target_path: str) -> bool:
 @register_agent_type
 class ClaudeCodeAgent(AgentType):
     name = "claude_code"
+    supports_stdin_prompt = True
     state_paths = [".claude"]
     default_image = "cage/claude-code:pentestenv"
     dockerfile = "docker/claude_code/pentestenv.Dockerfile"
@@ -74,15 +76,29 @@ class ClaudeCodeAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
+        # ``-p``/``--print`` is a boolean flag; the prompt is a positional
+        # argument. Dropping the positional makes claude-code read the prompt
+        # from stdin, which is where the caller has put it.
         escaped = prompt.replace("'", "'\\''")
+        prompt_arg = "" if stdin_prompt else f"'{escaped}' "
         cli_model = model.model_name_for_agent(self.name)
         max_turns_flag = (
             f" --max-turns {int(max_rounds)}" if max_rounds >= 0 else ""
         )
+        # ``--verbose`` is not optional here: claude-code rejects
+        # ``-p`` + ``--output-format stream-json`` without it
+        # ("When using --print, --output-format=stream-json requires --verbose").
+        # It used to be left to the user's ``session_args``, so a project.yml
+        # that omitted it failed every trial with a message about a flag the
+        # user never chose to combine. A launch command has to be valid on its
+        # own. Passing it twice (when session_args also supplies it, as every
+        # example config currently does) is harmless — verified against
+        # claude-code 2.1.150.
         return (
-            f"claude -p '{escaped}' "
-            f"--output-format stream-json "
+            f"claude -p {prompt_arg}"
+            f"--output-format stream-json --verbose "
             f"--model {cli_model}"
             f"{max_turns_flag}"
         )
@@ -138,6 +154,29 @@ class ClaudeCodeAgent(AgentType):
         # Always: we're running benchmark containers, no telemetry allowed.
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         env["DISABLE_TELEMETRY"] = "1"
+
+        # Always: tell the CLI the endpoint's context window, in tokens.
+        #
+        # Left to itself, Claude Code assumes a window for the model it thinks
+        # it is talking to. Behind a proxy the upstream is usually a model it
+        # has never heard of, and its assumption has been both too small and
+        # far too large across versions — and the compaction threshold is a
+        # percentage *of that assumption*, so a wrong guess silently disables
+        # compaction rather than merely shifting it. Handing over the real
+        # window makes the percentage mean something no matter which version
+        # of the CLI is installed.
+        #
+        # The window is all we supply. How much of it to hold back for the
+        # reply is the CLI's own bookkeeping — it picks the reply ceiling, so
+        # it is the one that can subtract it. Reserving here as well would
+        # deduct the same tokens twice.
+        #
+        # This belongs above the protocol branches: an over-long conversation
+        # is refused by an Anthropic-compatible endpoint exactly as it is by an
+        # OpenAI-compatible one, and subscription mode talks to a real window
+        # too.
+        if model.max_context_size:
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(model.max_context_size)
 
         # Subscription auth: credentials seeded into ``~/.claude/`` by
         # ``setup_container`` carry the OAuth tokens. Skip ANTHROPIC_API_KEY
@@ -223,7 +262,7 @@ class ClaudeCodeAgent(AgentType):
         except Exception:
             user = "?"
         tried = "\n  ".join(str(c) for c in candidates)
-        raise ValueError(
+        raise ConfigError(
             f"config/models.yml::{model.id}: auth_source={model.auth_source!r} "
             f"has no .credentials.json on this host.\n"
             f"  Host:  {host}\n"
@@ -433,7 +472,7 @@ class ClaudeCodeAgent(AgentType):
             return src_dir / ".credentials.json", json_path
         if (src_dir / ".claude" / ".credentials.json").is_file():
             return src_dir / ".claude" / ".credentials.json", src_dir / ".claude.json"
-        raise RuntimeError(
+        raise AgentSetupError(
             f"auth_source={source!r}: no .credentials.json found at "
             f"{src_dir}/.credentials.json or {src_dir}/.claude/.credentials.json"
         )
@@ -480,7 +519,7 @@ class ClaudeCodeAgent(AgentType):
             try:
                 cred_path.chmod(mode | needed)
             except OSError as exc:
-                raise RuntimeError(
+                raise AgentSetupError(
                     f"auth_source credential file {cred_path} must be group "
                     "readable/writable for bind mounting into the agent "
                     f"container; chmod failed: {exc}"

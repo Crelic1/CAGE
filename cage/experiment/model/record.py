@@ -82,6 +82,16 @@ class TrialRecord:
     scoring_id: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    # Fine-grained position within ``status`` — see
+    # ``cage.contracts.trial_phase``. ``status`` says *which bucket* the trial
+    # is in (running / completed / failed / …); ``phase`` says *where inside it*.
+    # The pair is what lets a consumer tell "running the agent" from "still
+    # pulling the target image", and what stamps ``failed_phase`` on a crash.
+    phase: str = "planned"
+    # Wall-clock of the last phase transition. Together with the run-level
+    # heartbeat this is how the liveness probe distinguishes a healthy
+    # long-running phase from a stalled one, without guessing from file mtimes.
+    phase_updated_at: str | None = None
     termination: TrialTermination = field(default_factory=TrialTermination)
     artifacts: tuple[ArtifactRef, ...] = ()
     scoring: TrialScoringRecord = field(default_factory=TrialScoringRecord)

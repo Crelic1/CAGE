@@ -1,6 +1,6 @@
 """Graceful pre-cap wrap-up reminder (Layer-1).
 
-Two pure pieces make up the hook:
+Three pure pieces make up the hook:
   * ``resolve_wrapup`` — turns a ``wrapup_before`` OFFSET + message (runtime
     override or benchmark-sample default) into an ABSOLUTE ``(wrapup_at, msg)``
     against the resolved round cap. Disabled when there is no finite cap, no
@@ -8,6 +8,8 @@ Two pure pieces make up the hook:
   * ``_inject_wrapup_reminder`` — appends the reminder into the last ``user``
     turn of an Anthropic-shaped request body (so it rides a still-forwarded
     request, unlike the hard ``max_requests`` rejection).
+  * ``_wrapup_reminder_active`` — emits only at the successful-round boundary;
+    a failed upstream attempt leaves the count there so its retry is reminded.
 """
 
 from __future__ import annotations
@@ -15,8 +17,12 @@ from __future__ import annotations
 import pytest
 
 from cage.contracts.execution import resolve_wrapup
-from cage.proxy.sidecar import _inject_wrapup_reminder
-
+from cage.experiment.engine.trial_runner import _effective_trial_startup_reminder
+from cage.proxy.sidecar import (
+    _inject_wrapup_reminder,
+    _startup_reminder_active,
+    _wrapup_reminder_active,
+)
 
 # --------------------------------------------------------------------------- #
 # resolve_wrapup(cap, exec_before, exec_msg, sample_before, sample_msg)
@@ -90,3 +96,68 @@ def test_inject_noops_on_empty_message_or_no_messages():
     assert body["messages"][0]["content"] == "hi"
     assert _inject_wrapup_reminder({"messages": []}, "WRAP") is False
     assert _inject_wrapup_reminder({}, "WRAP") is False
+
+
+@pytest.mark.parametrize(
+    "round_count,expected",
+    [
+        (179, False),  # at - 1
+        (180, True),   # at
+        (181, False),  # at + 1
+    ],
+)
+def test_wrapup_reminder_fires_only_at_boundary(round_count, expected):
+    assert _wrapup_reminder_active(round_count, 180, "WRAP") is expected
+
+
+def test_wrapup_reminder_is_retried_after_upstream_failure():
+    # The first boundary request fails upstream, so the successful-round count
+    # remains 180. Its retry is reminded again; only a success advances to 181
+    # and disables subsequent injection.
+    successful_round_counts = [179, 180, 180, 181]
+    assert [
+        _wrapup_reminder_active(count, 180, "WRAP")
+        for count in successful_round_counts
+    ] == [False, True, True, False]
+
+
+@pytest.mark.parametrize(
+    "sample,expected",
+    [
+        (
+            {
+                "startup_reminder_at": 4,
+                "startup_reminder_until": 16,
+                "startup_reminder_message": "deliver",
+            },
+            (4, 16, "deliver"),
+        ),
+        ({}, (-1, -1, "")),
+        (
+            {
+                "startup_reminder_at": 0,
+                "startup_reminder_until": 16,
+                "startup_reminder_message": "deliver",
+            },
+            (-1, -1, ""),
+        ),
+        (
+            {
+                "startup_reminder_at": 8,
+                "startup_reminder_until": 4,
+                "startup_reminder_message": "deliver",
+            },
+            (-1, -1, ""),
+        ),
+    ],
+)
+def test_resolve_startup_reminder(sample, expected):
+    assert _effective_trial_startup_reminder(sample) == expected
+
+
+def test_startup_reminder_window_is_inclusive():
+    assert not _startup_reminder_active(3, 4, 16, "deliver")
+    assert _startup_reminder_active(4, 4, 16, "deliver")
+    assert _startup_reminder_active(16, 4, 16, "deliver")
+    assert not _startup_reminder_active(17, 4, 16, "deliver")
+    assert not _startup_reminder_active(8, 4, 16, "")

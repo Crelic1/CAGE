@@ -33,6 +33,25 @@ class SweepResult:
         )
 
 
+def _rm_network_detaching(network: str, *, docker_timeout: float) -> tuple[int, str]:
+    """Remove a network, detaching the egress proxy if that is what blocks it.
+
+    Under ``runtime.network_containment`` the proxy joins every range network so
+    it can be their gateway. It is not part of any compose project, so nothing
+    else takes it off — and docker refuses to delete a network that still has an
+    endpoint. Retrying on that specific error costs nothing in the normal case
+    and keeps a network from leaking per range launch.
+    """
+    rc, err = _docker_rm(["docker", "network", "rm", network], timeout=docker_timeout)
+    if rc == 0 or "active endpoints" not in (err or ""):
+        return rc, err
+    from cage.sandbox.netproxy import detach
+
+    if not detach(network):
+        return rc, err
+    return _docker_rm(["docker", "network", "rm", network], timeout=docker_timeout)
+
+
 def sweep_docker_resources(
     run_id: str,
     *,
@@ -71,10 +90,7 @@ def sweep_docker_resources(
             result.errors.append(f"container {container[:40]}: {err[:200]}")
 
     for network in _dedupe_ids(networks):
-        rc, err = _docker_rm(
-            ["docker", "network", "rm", network],
-            timeout=docker_timeout,
-        )
+        rc, err = _rm_network_detaching(network, docker_timeout=docker_timeout)
         if rc == 0:
             result.networks_removed += 1
         else:
@@ -177,9 +193,7 @@ def sweep_run(
         if component == "target":
             ids = _docker_ls(["docker", "network", "ls", "-q", *component_filter])
             for nid in ids:
-                rc, err = _docker_rm(
-                    ["docker", "network", "rm", nid], timeout=docker_timeout,
-                )
+                rc, err = _rm_network_detaching(nid, docker_timeout=docker_timeout)
                 if rc == 0:
                     result.networks_removed += 1
                 else:

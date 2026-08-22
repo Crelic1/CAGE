@@ -1,0 +1,82 @@
+This is a Pwn/binary-exploitation environment.
+
+## Material priority
+
+- selected queue class: `{{ instance_data.pwn_material_priority.id }}` (rank `{{ instance_data.pwn_material_priority.rank }}`)
+- evidence shape: {{ instance_data.pwn_material_priority.label }}
+- Dockerfile confirmed in declared deployment material: `{{ instance_data.pwn_material_priority.has_dockerfile }}`
+- authenticity consequence: {{ instance_data.pwn_material_priority.authenticity }}
+
+The batch priority is fixed as:
+
+1. Dockerfile/deployment + Writeup + attachments;
+2. Dockerfile/deployment + attachments;
+3. Writeup + attachments;
+4. source + attachments without runtime evidence (an additional fallback class);
+5. attachments only, far behind the other classes.
+
+Do not improve a lower-priority task's apparent confidence by inventing missing evidence.
+
+## glibc and loader selection
+
+Ubuntu LTS defaults used by the local bundle catalog are `16.04 → glibc 2.23`, `18.04 → 2.27`, `20.04 → 2.31`, `22.04 → 2.35`, and `24.04 → 2.39` for amd64. These are choices, not proof that a historical challenge used that runtime.
+
+- When an official Dockerfile pins an Ubuntu/base image, use that as primary runtime evidence and cross-check it against the Writeup.
+- Without a Dockerfile, derive the runtime choice from concrete Writeup clues: an explicit Ubuntu/glibc version, supplied libc name/build ID, mentioned allocator behavior, symbol availability, or exploit offsets. Cite the exact supplied path and paraphrase the clue.
+- Prefer an attachment-supplied matching `libc.so.6` + loader pair when both are present. Never mix libc from one bundle with the loader from another.
+- ELF `PT_INTERP`, architecture, imported symbol versions, and hardening are useful compatibility facts, but by themselves do not identify the historical glibc minor version.
+- Do **not** use `ldd --version` inside the image as evidence that your historical runtime inference is correct: it only reports the runtime you just chose and would be circular validation.
+- With attachments only and no Dockerfile or Writeup, you may select a bundle as an explicitly speculative construction aid, but must set authenticity to `unverified_until_exp`. Only a later current-instance EXP can resolve that uncertainty.
+
+Local runtime cache status: `{{ instance_data.pwn_runtime.status }}`. Runtime choices are exposed read-only at `{{ instance_data.pwn_runtime.agent_path }}`.
+
+{% for bundle in instance_data.pwn_runtime.bundles %}- `{{ bundle.id }}`: Ubuntu {{ bundle.ubuntu_release }}, glibc {{ bundle.glibc_series }}, {{ bundle.architecture|default("amd64") }}{% if bundle.libc is defined %}; libc `{{ instance_data.pwn_runtime.agent_path }}/{{ bundle.libc.path }}` (sha256 `{{ bundle.libc.sha256 }}`), loader `{{ instance_data.pwn_runtime.agent_path }}/{{ bundle.loader.path }}` (sha256 `{{ bundle.loader.sha256 }}`){% endif %}
+{% endfor %}
+
+If the cache is not `ready` and no exact pair is supplied with the challenge, record `runtime_bundle_unavailable` instead of downloading an arbitrary libc during the task.
+
+Add a `pwn_runtime` object to `build_report.json` containing `material_priority`, `selection_basis`, `evidence`, `selected_bundle`, `confidence`, and `authenticity_status`. This object is schema-checked before Docker is invoked:
+
+- `evidence` **must be a JSON array**, not a string. Prefer objects with `path`, `observation`, and `supports` fields so every inference is auditable.
+- `selected_bundle` is either one catalog bundle id, `supplied_with_challenge`, or JSON `null` when no defensible pair can be selected.
+- If a pair is selected, `selected_files.libc.path` and `selected_files.loader.path` must name the copies you placed **inside this workspace**. They must be relative to `{{ workspace }}` (for example `build/runtime/libc.so.6`), with no leading `/` and no `..`. Never report the read-only `/opt/cage/pwn-runtimes/...` source path as a selected output file.
+- Each selected file also needs its actual `sha256`. Copy only the selected matching libc/loader pair into the produced build context; do not mix bundles.
+
+Use this exact shape (replace the example values with evidence for this challenge):
+
+```json
+{
+  "pwn_runtime": {
+    "material_priority": "{{ instance_data.pwn_material_priority.id }}",
+    "selection_basis": "one concise evidence-backed explanation",
+    "evidence": [
+      {
+        "path": "deploy/Dockerfile",
+        "observation": "FROM ubuntu:20.04",
+        "supports": "Ubuntu 20.04 / glibc 2.31 bundle selection"
+      }
+    ],
+    "selected_bundle": "ubuntu-20.04-glibc-2.31-amd64",
+    "confidence": "confirmed",
+    "authenticity_status": "confirmed_by_deployment",
+    "selected_files": {
+      "libc": {
+        "path": "build/runtime/libc.so.6",
+        "sha256": "actual copied-file sha256"
+      },
+      "loader": {
+        "path": "build/runtime/ld-linux-x86-64.so.2",
+        "sha256": "actual copied-file sha256"
+      }
+    }
+  }
+}
+```
+
+The scorer checks file SHA256 against the selected local bundle, but deliberately does not compare the new container's self-reported glibc version.
+
+- Preserve CPU architecture, ELF interpreter, libc/loader pairing, executable permissions, working directory, compile flags, and binary hardening properties.
+- Do not recompile a supplied binary unless the task explicitly requires source rebuilding and the original toolchain is known.
+- For a network challenge, expose the real program over TCP with correct bidirectional stdin/stdout, per-connection process behavior, buffering, timeout, and signal handling.
+- Verify independently that the declared TCP port accepts a connection and reaches a real prompt/menu/input path; an open socket alone is insufficient.
+- Preserve the intended flag file/environment location and runtime user permissions without making the flag readable through normal readiness checks.

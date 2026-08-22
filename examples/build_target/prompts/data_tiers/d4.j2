@@ -1,0 +1,5 @@
+`D4` includes deployment material. Treat the official Dockerfile/Compose/scripts and their referenced closure as primary evidence.
+
+- Audit and reuse the supplied deployment; make only compatibility repairs that are individually recorded.
+- Pin the resulting local image tag and preserve the original runtime versions, service topology, permissions, and flag mechanism.
+- Clean build can establish R3. Do not promote to R4 from liveness or to R5 from the presence of deployment files.

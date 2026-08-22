@@ -38,9 +38,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = "http://localhost:8877/v1"
 _PROVIDER_NAME = "cage"
 _MODEL_ALIAS = "cage-model"
-# Fallback compaction_trigger_ratio when the user did not opt into a Cage-level
-# threshold. Matches kimi-cli's documented default; clamped to [0.5, 0.99].
-_KIMI_DEFAULT_RATIO = 0.85
 
 
 def _toml_string(value: Any) -> str:
@@ -60,7 +57,7 @@ def _provider_extra_options(extra: dict[str, Any]) -> dict[str, Any]:
 
 def _render_config_toml(
     *, base_url: str, api_key: str, model_name: str,
-    compaction_ratio: float = 0.85,
+    compaction_ratio: float | None = None,
     max_context_size: int | None = None,
     reserved_context_size: int | None = None,
     reasoning_key: str | None = None,
@@ -74,7 +71,9 @@ def _render_config_toml(
     pins the alias used by ``kimi -m`` to the per-trial model.
 
     ``compaction_ratio`` → ``[loop_control].compaction_trigger_ratio``.
-    kimi-cli clamps to [0.5, 0.99] (``src/kimi_cli/config.py``).
+    kimi-cli clamps to [0.5, 0.99] (``src/kimi_cli/config.py``). ``None`` omits
+    the key entirely so kimi-cli applies its own built-in default rather than
+    Cage pinning a number (same policy as the context sizes below).
     ``reserved_context_size`` → ``[loop_control].reserved_context_size``;
     kimi-cli enforces ≥1000. Auto-compaction fires when either
     ``context_tokens >= max_context_size * compaction_trigger_ratio``
@@ -87,7 +86,10 @@ def _render_config_toml(
     did not declare them; we then omit those keys so kimi-cli applies its own
     built-in defaults instead of Cage inventing a window.
     """
-    safe_ratio = max(0.5, min(0.99, float(compaction_ratio)))
+    safe_ratio = (
+        None if compaction_ratio is None
+        else max(0.5, min(0.99, float(compaction_ratio)))
+    )
     safe_max_ctx = (
         max(2000, int(max_context_size)) if max_context_size is not None else None
     )
@@ -132,19 +134,22 @@ def _render_config_toml(
     )
     sections.append("\n".join(model_lines))
 
-    loop_lines = [
-        '[loop_control]',
-        f'compaction_trigger_ratio = {safe_ratio:.4f}',
-    ]
+    loop_lines = ['[loop_control]']
+    if safe_ratio is not None:
+        loop_lines.append(f'compaction_trigger_ratio = {safe_ratio:.4f}')
     if safe_reserved is not None:
         loop_lines.append(f'reserved_context_size = {safe_reserved}')
-    sections.append("\n".join(loop_lines))
+    # Only emit the section if it carries at least one key; otherwise omit it so
+    # kimi-cli falls back to its own defaults for both knobs.
+    if len(loop_lines) > 1:
+        sections.append("\n".join(loop_lines))
     return "\n\n".join(sections) + "\n"
 
 
 @register_agent_type
 class KimiCodeAgent(AgentType):
     name = "kimi_code"
+    supports_stdin_prompt = True
     state_paths = [".kimi"]
     default_image = "cage/kimi-code:pentestenv"
     dockerfile = "docker/kimi_code/pentestenv.Dockerfile"
@@ -162,8 +167,12 @@ class KimiCodeAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
         """Launch ``kimi`` in non-interactive print mode.
+
+        With ``stdin_prompt`` the ``-p`` flag is dropped: ``--print`` reads
+        the prompt from stdin in the default ``--input-format text``.
 
         ``--print`` enables headless mode (implicitly enabling
         ``--afk`` to auto-approve tool calls and dismiss
@@ -176,6 +185,7 @@ class KimiCodeAgent(AgentType):
         per-trial model name from the user-facing CLI flag.
         """
         escaped = prompt.replace("'", "'\\''")
+        prompt_flag = "" if stdin_prompt else f" -p '{escaped}'"
         max_flag = (
             f" --max-steps-per-turn {int(max_rounds)}" if max_rounds and max_rounds > 0 else ""
         )
@@ -183,7 +193,7 @@ class KimiCodeAgent(AgentType):
             f"kimi --print --output-format stream-json"
             f"{max_flag}"
             f" -m {_MODEL_ALIAS}"
-            f" -p '{escaped}'"
+            f"{prompt_flag}"
         )
 
     def parse_output(self, result: ExecResult) -> str:
@@ -273,11 +283,7 @@ class KimiCodeAgent(AgentType):
                 base_url=base_url,
                 api_key=model.api_key,
                 model_name=model.model,
-                compaction_ratio=(
-                    _KIMI_DEFAULT_RATIO
-                    if context_compaction_threshold is None
-                    else context_compaction_threshold
-                ),
+                compaction_ratio=context_compaction_threshold,
                 max_context_size=model.max_context_size,
                 reserved_context_size=model.reserved_context_size,
                 **_provider_extra_options(extra),
@@ -288,7 +294,7 @@ class KimiCodeAgent(AgentType):
 
     def _patch_config(
         self, container: Any, *, home_dir: str, base_url: str,
-        api_key: str, model_name: str, compaction_ratio: float = 0.85,
+        api_key: str, model_name: str, compaction_ratio: float | None = None,
         max_context_size: int | None = None,
         reserved_context_size: int | None = None,
         reasoning_key: str | None = None,
@@ -339,11 +345,7 @@ class KimiCodeAgent(AgentType):
                 base_url=_DEFAULT_BASE_URL,
                 api_key=api_key,
                 model_name=model_name,
-                compaction_ratio=(
-                    _KIMI_DEFAULT_RATIO
-                    if context_compaction_threshold is None
-                    else context_compaction_threshold
-                ),
+                compaction_ratio=context_compaction_threshold,
                 max_context_size=(model.max_context_size if model is not None else None),
                 reserved_context_size=(
                     model.reserved_context_size if model is not None else None

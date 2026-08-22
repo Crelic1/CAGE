@@ -1,0 +1,87 @@
+{# Combined build⊕exploit route strategy for the R5 fusion pipeline.
+   Build half copied from env/routes/infer_both_from_writeup.j2, exploit half from
+   exp/routes/infer_both_from_writeup.j2, made self-contained so `{% include %}` resolves
+   under pipelines/full/ (its own routes/, categories/, _templates/). #}
+## Build the environment — route strategy
+
+Rebuild a faithful, bootable target using the strategy for this route.
+
+There is NO build material and NO exploit (`AW`): only a writeup. The writeup is
+the SOLE runtime anchor, and no exploit exists to corroborate any inference, so
+confidence is low by construction. Infer the runtime from the writeup alone,
+author a Dockerfile that realizes it, and mark it explicitly unverified.
+
+## Infer the runtime from the writeup alone
+
+{% if instance_data.materials.writeups %}Read the writeups ({% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}) and quote each concrete runtime clue:{% else %}Read the writeup and quote each concrete runtime clue:{% endif %}
+
+- an explicit Ubuntu/glibc version, a named libc / build-id, allocator behavior,
+  symbol availability, or stated offsets are the ONLY admissible runtime
+  evidence — quote the exact line.
+- loader + architecture from the supplied binary's ELF header (attachments) are
+  compatibility facts, NOT proof of the historical glibc minor version.
+- prose alone ("heap challenge", "ret2libc") does not pin a glibc series. Do not
+  manufacture a version the writeup never states.
+
+Select the catalog bundle (`instance_data.pwn_runtime`, cache
+`{{ instance_data.pwn_runtime.status }}`) matching the writeup's stated glibc, or
+the supplied libc/loader pair. Record it in the `pwn_runtime` object (schema in
+the category section) with `confidence: low` and
+`authenticity_status: unverified_until_exp`: with no exploit, nothing in this
+stage can confirm the runtime is faithful. Only a later current-instance exploit
+(a future enrichment to `AWP`) can resolve that uncertainty.
+
+## Realize it as a Dockerfile
+
+Author a Dockerfile installing the selected libc/loader pair and preserving
+interpreter, arch, permissions, and any hardening the writeup describes, served
+over the declared protocol. Make only the choices the writeup backs; record
+every unbacked assumption as such.
+
+## Prefer an honest blocker
+
+If the writeup gives no concrete runtime clue — no version, no libc, no offset —
+do not guess. Emit `status: blocked` with a `runtime_inference_unsupported`
+blocker quoting the writeup's silence; set `next_action` to supply a libc/loader
+pair or an exploit that would anchor the runtime.
+
+{% if instance_data.category_profile == "pwn" %}
+{% include "_templates/pwn_service.j2" %}
+{% endif %}
+
+## Prove it exploitable — route strategy
+
+With the target frozen, prove it faithfully exploitable: run the exploit
+under `solve/` from the player vantage against a fresh clean instance until
+it captures the harness-minted flag.
+
+Material profile `{{ instance_data.route.material_profile }}`: only the writeup
+(`W`). No runnable exploit, and the environment itself was *inferred from this
+same writeup*, not from build material. Neither side is anchored by an
+independent source, so a failing pair is genuinely ambiguous — the exploit may
+be wrong, or the inferred runtime may be unfaithful.
+
+## Synthesize from the writeup
+- Extract the intended chain from {% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}: vulnerability,
+  primitive, and success signal; record the writeup step behind each exploit
+  stage.
+- Recompute every address, offset, and gadget against the rebuilt target — the
+  writeup's numbers describe the historical runtime, not this one.
+
+## Co-evolve environment and exploit
+- The environment stage encoded runtime hypotheses (libc series, loader,
+  protections) from writeup clues. Your exploit is the test of those hypotheses.
+- When the R5 `cage-check` replay shows a runtime-shaped contradiction — a leaked libc
+  address inconsistent with the chosen glibc, a wrong loader, a protection the
+  writeup implies but the runtime lacks — feed it back and fix the ENVIRONMENT
+  files, then re-run. When the observation is a logic slip against a runtime the
+  writeup corroborates, fix the exploit instead.
+- Break ties about which side to move with the writeup's own concrete clues
+  (named Ubuntu/glibc, libc build-id, allocator notes), not by guessing.
+
+## Lower confidence, honest unresolved
+- Confidence is lower than a build-anchored route; do not overclaim a pass.
+- If the writeup underspecifies the runtime or a solve step so the pair cannot
+  be closed from the supplied evidence, stop and emit `unresolved` naming the
+  last confirmed milestone and the exact underspecified detail. Do not fabricate
+  the runtime, the primitive, or the flag.

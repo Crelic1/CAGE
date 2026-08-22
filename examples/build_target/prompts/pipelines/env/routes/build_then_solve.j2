@@ -1,0 +1,23 @@
+## Build then solve — reuse the deployment, exploit comes later (profile AB)
+
+The deployment (`B`) is present and primary. There is no exploit and no writeup:
+an exploit will be GENERATED later from the attachment against what you build, so
+the environment must faithfully preserve the bug and the intended solve surface.
+
+- Audit and reuse the deployment closure; smallest evidence-backed compatibility
+  repairs only, each recorded in `build_report.json`:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  Read every referenced local file (COPY/ADD sources, entrypoints, init
+  scripts, lockfiles) before editing.
+- Preserve every declared service, topology, pinned versions, users, and the
+  flag mechanism. Do not touch the vulnerable component — the later stage needs
+  the exact primitive to stay reachable.
+- With no writeup, derive the intended interaction for `runtime_probes` from the
+  deployment and the attachment only. Cite the exact supplied file for each
+  probe expectation; record inferred behavior as uncertainty, not fact.
+- The exploit generator will analyze the attachment against a fresh instance.
+  Keep the intended solve path intact and reachable: exposed service, correct
+  I/O contract, vulnerable dependency versions, protections, and entrypoint. Do
+  not patch, mock, or harden the target — that would make generation impossible.
+- If a required image or dependency is unavailable, report that exact blocker
+  rather than substituting silently.

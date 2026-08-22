@@ -1,0 +1,46 @@
+# EARLY DELIVERY GATE — THIS IS NOT A FINAL-WINDOW WARNING
+
+This reminder repeats only during early rounds because the required delivery
+has not been framework-confirmed. First inspect the workspace root. If all six
+items below already exist, parse them once and continue from the first unproven
+technical link; do not rewrite or stop merely because this reminder repeated.
+
+If any item is missing, act on the delivery gate **in this model turn**. Finish
+only a triggered guide read that is already pending. Before the six items exist,
+do not call WebSearch/WebFetch, download, compile, deeply extract/repack,
+re-derive or reverse the vulnerability, investigate an external framework, or
+run `cage-check`. Missing facts do not justify more research first: represent
+them honestly with working statuses and update the same files later.
+
+Create now:
+
+1. `docker-compose.yml` with the required service-level output `image:` beside
+   `build:` and no host `ports:`;
+2. scorer-shaped `challenge.json`, not an event/framework metadata file. Its
+   root fields are `compose_files`, `compose_target_services`,
+   `compose_dependency_services`, `target_ports` (plain integer values),
+   `target_port_protocols`, `runtime_probes`, `flag_contract`, and `solve`;
+3. `build_report.json` with `status: "blocked"`, the exact appended routed
+   literals, `material_used`, `assumptions`, `compatibility_changes`,
+   `blockers`, and the six-field `pwn_runtime` object. For a non-glibc target,
+   use `selected_bundle: null`; never substitute solver/host libc;
+4. `solve/` with a production entry. Mechanically copy the supplied driver when
+   one exists; it may remain unadapted at this checkpoint, but do not replace it
+   with an echo/static success stub;
+5. `solve_report.json` with `status: "unresolved"`, exact material/route/source
+   literals, entry, primitive, success signal, fidelity changes, and blockers;
+6. `education.json` with exactly `description`, `tags`, `difficulty`, and
+   `learning_points`. Use 2–5 allowed tags and put the attacked runtime/family
+   first.
+
+Write the small root contracts before copying a large closure. Then copy the
+real consumed deployment and complete exploit dependencies into final workspace
+paths. Once that static closure is complete enough for a host build attempt, set
+the build status to `ready` even though it has not run locally and the exploit
+remains `unresolved`. `cage-check` is the only authority for build, runtime, and
+exploit behavior; never reproduce the complete target in the agent container,
+and never run `cage-check` while build status is `blocked`. After the six items
+exist, do not locally compile the target, install its dependencies, create a
+replacement environment, or run its build scripts. If all candidate
+Dockerfile/Compose/entrypoint paths exist and the root contracts parse, mark it
+`ready` and checkpoint before optional framework or runtime-topology research.

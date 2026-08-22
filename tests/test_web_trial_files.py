@@ -406,4 +406,7 @@ def test_trial_page_renders_parsed_codex_final_output_instead_of_raw_stream(
     assert response.status_code == 200
     html = response.get_data(as_text=True)
     assert "ActiveMQ RCE is confirmed as root, and I retrieved flag3." in html
-    assert ">Final Output<" in html
+    # The stream ends in ``turn.failed`` and the reason is ``model_timeout``:
+    # the upstream died mid-turn, so this text is where the agent got to.
+    assert ">Last message before it was cut off" in html
+    assert ">Final Output<" not in html

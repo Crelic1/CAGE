@@ -36,6 +36,16 @@ from cage.contracts.execution import (
     run_lacks_termination_condition,
     sample_max_rounds,
 )
+from cage.contracts.jsonio import (
+    append_jsonl_record,
+    count_jsonl_lines,
+    dump_jsonl_record,
+    iter_jsonl_entries,
+    iter_jsonl_lines,
+    load_json_file,
+    read_jsonl_entries,
+    write_json_file,
+)
 from cage.contracts.runtime_state import (
     CHECK_SUPPORTED_KEY,
     RUNTIME_STATE_KEY,
@@ -56,6 +66,10 @@ from cage.contracts.sample_keys import (
 from cage.contracts.scoring import Score, extract_numeric_score_value
 from cage.contracts.trial_status import (
     COMPLETED_TRIAL_STATUSES,
+    COMPLETED_TRIAL_STATUSES_ON_READ,
+    LEGACY_SCORING_TRIAL_STATUSES,
+    TERMINAL_TRIAL_STATUSES,
+    TERMINAL_TRIAL_STATUSES_ON_READ,
     FAILED_TRIAL_STATUSES,
     INTERRUPTED_TRIAL_STATUSES,
     TrialCounts,
@@ -66,6 +80,10 @@ from cage.contracts.trial_status import (
 __all__ = [
     "CHECK_SUPPORTED_KEY",
     "COMPLETED_TRIAL_STATUSES",
+    "COMPLETED_TRIAL_STATUSES_ON_READ",
+    "LEGACY_SCORING_TRIAL_STATUSES",
+    "TERMINAL_TRIAL_STATUSES",
+    "TERMINAL_TRIAL_STATUSES_ON_READ",
     "FAILED_TRIAL_STATUSES",
     "INTERRUPTED_TRIAL_STATUSES",
     "CageError",
@@ -89,8 +107,16 @@ __all__ = [
     "TrialError",
     "TrialTimeout",
     "classify_trial_status",
+    "append_jsonl_record",
+    "count_jsonl_lines",
     "count_trials",
+    "dump_jsonl_record",
     "expand_env_refs",
+    "iter_jsonl_entries",
+    "iter_jsonl_lines",
+    "load_json_file",
+    "read_jsonl_entries",
+    "write_json_file",
     "classify_max_rounds",
     "max_rounds_config_label",
     "normalize_max_rounds_config",

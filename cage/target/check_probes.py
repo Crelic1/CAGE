@@ -302,7 +302,7 @@ def _ps_running_summary(ps: list[dict[str, Any]]) -> tuple[int, int, list[str]]:
     return running, len(ps), bad
 
 
-def _ingress_targets_for_pentest_remote(
+def _ingress_targets_for_single_target(
     target_data: dict[str, Any], sample: dict[str, Any],
 ) -> list[tuple[str, str, int]]:
     """Return ``[(service_name, agent_facing_host, port), ...]`` to probe.
@@ -410,7 +410,7 @@ def _required_post_exp_probe_names(sample: dict[str, Any]) -> list[str]:
     return []
 
 
-def _probe_post_exploitation(
+def _probe_multi_target(
     target_data: dict[str, Any],
     result: InstanceResult,
     sample: dict[str, Any],
@@ -486,7 +486,7 @@ def _probe_post_exploitation(
     result.passed = True
 
 
-def _probe_pentest_remote(
+def _probe_single_target(
     target_data: dict[str, Any],
     result: InstanceResult,
     sample: dict[str, Any],
@@ -504,7 +504,7 @@ def _probe_pentest_remote(
         return
 
     network_name = result.network_name
-    targets = _ingress_targets_for_pentest_remote(target_data, sample)
+    targets = _ingress_targets_for_single_target(target_data, sample)
     if not targets:
         result.error = "no agent-facing services declared (application_service_keys empty)"
         return
@@ -554,10 +554,10 @@ def _probe_instance(
     readiness_timeout: float,
 ) -> None:
     profile = str(sample.get("task_profile") or "")
-    if profile == "post_exploitation":
-        _probe_post_exploitation(target_data, result, sample, readiness_timeout)
-    elif profile == "pentest_remote":
-        _probe_pentest_remote(target_data, result, sample, readiness_timeout)
+    if profile == "multi_target":
+        _probe_multi_target(target_data, result, sample, readiness_timeout)
+    elif profile == "single_target":
+        _probe_single_target(target_data, result, sample, readiness_timeout)
     else:
         _probe_generic(target_data, result)
 

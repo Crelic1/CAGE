@@ -307,10 +307,12 @@ models:
   base:
     provider: openai
     model: base-model
+    max_context_size: 131072
     api_key: dummy
   override:
     provider: openai
     model: override-model
+    max_context_size: 131072
     api_key: dummy
 """,
         encoding="utf-8",
@@ -869,10 +871,12 @@ models:
   base:
     provider: openai
     model: base-model
+    max_context_size: 131072
     api_key: dummy
   blocked:
     provider: anthropic
     model: claude-opus
+    max_context_size: 131072
     auth_source: {tmp_path / "missing-claude-auth"}
 """,
         encoding="utf-8",
@@ -937,10 +941,12 @@ models:
   base:
     provider: openai
     model: base-model
+    max_context_size: 131072
     api_key: dummy
   blocked:
     provider: anthropic
     model: claude-opus
+    max_context_size: 131072
     auth_source: {tmp_path / "missing-claude-auth"}
 """,
         encoding="utf-8",
@@ -985,12 +991,17 @@ models:
             passed=True,
         )
 
+    # check_targets lazily does ``from cage.target.provisioning import
+    # discover_benchmark_root, spawn_embedded_target_server``, so the patch MUST
+    # target that module. Patching the conductor's copy misses, spawns a REAL
+    # embedded ``cage.target.serve`` subprocess, and (with _full_teardown mocked
+    # to a no-op below) leaks it forever.
     monkeypatch.setattr(
-        "cage.experiment.engine.conductor.discover_benchmark_root",
+        "cage.target.provisioning.discover_benchmark_root",
         lambda _benchmark: tmp_path,
     )
     monkeypatch.setattr(
-        "cage.experiment.engine.conductor.spawn_embedded_target_server",
+        "cage.target.provisioning.spawn_embedded_target_server",
         lambda **_kwargs: FakeEmbedded(),
     )
     monkeypatch.setattr(
@@ -1140,12 +1151,15 @@ def test_targets_check_tears_down_each_sample_before_next_launch(
         projects = ",".join(kwargs["project_names"])
         events.append(f"teardown:{projects}")
 
+    # Patch the module check_targets actually imports these from (provisioning),
+    # not the conductor's copy — otherwise a REAL embedded serve subprocess is
+    # spawned instead of the fake.
     monkeypatch.setattr(
-        "cage.experiment.engine.conductor.discover_benchmark_root",
+        "cage.target.provisioning.discover_benchmark_root",
         lambda _benchmark: tmp_path,
     )
     monkeypatch.setattr(
-        "cage.experiment.engine.conductor.spawn_embedded_target_server",
+        "cage.target.provisioning.spawn_embedded_target_server",
         lambda **_kwargs: FakeEmbedded(),
     )
     monkeypatch.setattr(
@@ -1363,7 +1377,7 @@ def test_post_targets_check_requires_declared_real_entry_service(monkeypatch) ->
         fake_probe_from_network,
     )
 
-    targets_check_module._probe_post_exploitation(
+    targets_check_module._probe_multi_target(
         target_data,
         result,
         sample,
@@ -1919,6 +1933,7 @@ models:
   base:
     provider: openai
     model: base-model
+    max_context_size: 131072
     api_key: dummy
 """,
         encoding="utf-8",

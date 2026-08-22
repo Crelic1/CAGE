@@ -89,6 +89,7 @@ class TestModelConfig:
             "  pooled:\n"
             "    provider: openai\n"
             "    model: foo\n"
+            "    max_context_size: 131072\n"
             "    api_keys:\n"
             "      - sk-a\n"
             "      - sk-b\n"
@@ -106,6 +107,7 @@ class TestModelConfig:
             "  pooled:\n"
             "    provider: openai\n"
             "    model: foo\n"
+            "    max_context_size: 131072\n"
             "    api_key: sk-explicit\n"
             "    api_keys:\n"
             "      - sk-a\n"
@@ -310,7 +312,13 @@ class TestAgentType:
         assert agent.name == "codex"
 
     def test_unknown_agent_type(self):
-        with pytest.raises(ValueError, match="Unknown agent type"):
+        # ``ConfigError``, not a bare ValueError: this is a user-fixable config
+        # mistake, and the CLI renders those as a message instead of a
+        # traceback. "kind" rather than "type" because ``kind:`` is the actual
+        # project.yml key the user has to edit.
+        from cage.contracts.exceptions import ConfigError
+
+        with pytest.raises(ConfigError, match="Unknown agent kind"):
             get_agent_type("nonexistent_agent")
 
     def test_agent_instance_stateful_via_shared_paths(self):
@@ -666,6 +674,7 @@ class TestLiveCheckConfig:
         models_yaml = tmp_path / "models.yaml"
         models_yaml.write_text(
             "models:\n  test-model:\n    provider: vllm\n    model: test\n"
+            "    max_context_size: 131072\n"
         )
         bench_py = tmp_path / "benchmark.py"
         bench_py.write_text(
@@ -718,6 +727,7 @@ class TestLiveCheckConfig:
         models_yaml = tmp_path / "models.yaml"
         models_yaml.write_text(
             "models:\n  test-model:\n    provider: vllm\n    model: test\n"
+            "    max_context_size: 131072\n"
         )
         bench_py = tmp_path / "benchmark.py"
         bench_py.write_text(

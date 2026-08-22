@@ -252,6 +252,10 @@
               class="px-3 py-2 rounded-lg bg-slate-700/40 text-slate-200 text-sm hover:bg-slate-700/60">
         Copy debug bundle
       </button>
+      {% with export_url = "/trial/" ~ (trial_dir | encode_path) ~ "/corpus.jsonl",
+              export_hint = "This trial's trajectory as a training-corpus JSONL — the same shape a whole-run export produces." %}
+        {% include "_corpus_export.html" %}
+      {% endwith %}
       {% for metric, data in trial.scores.items() %}
       {% set val = data.value if data is mapping else data %}
       <div class="px-3 py-2 rounded-lg text-center
@@ -332,6 +336,98 @@
     </div>
   </div>
 </div>
+
+{% if target_failure %}
+{# Prominent "why the target (靶机) failed" panel. The agent never ran because
+   the target never came up, so the target's OWN error — server-side init error
+   plus its container log tail — is the diagnostic that matters, not the agent
+   trajectory below. (issue #1) #}
+<div class="bg-red-500/[0.06] rounded-xl border border-red-500/40 mb-6">
+  <div class="px-6 py-4 border-b border-red-500/20 flex items-center gap-2">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m0 3.75h.008M10.34 3.94 1.9 18a1.5 1.5 0 0 0 1.3 2.25h17.6a1.5 1.5 0 0 0 1.3-2.25L13.66 3.94a1.5 1.5 0 0 0-2.6 0Z" />
+    </svg>
+    <h2 class="text-sm font-semibold text-red-200">Target failed to start — {{ target_failure.reason_label }}</h2>
+  </div>
+  <div class="px-6 py-4 space-y-4">
+    <p class="text-sm text-slate-400">
+      The benchmark target (靶机) never became ready, so the agent never ran. The cause below comes from the target itself.
+    </p>
+    {% if target_failure.server_error %}
+    <div>
+      <div class="text-xs font-semibold uppercase tracking-wider text-red-300/80 mb-1">Server-side error</div>
+      <pre class="whitespace-pre-wrap break-words rounded-lg bg-black/50 border border-red-500/20 px-4 py-3 text-xs text-red-100 max-h-72 overflow-y-auto font-mono">{{ target_failure.server_error }}</pre>
+    </div>
+    {% endif %}
+    {% for log in target_failure.logs %}
+    {% if log.tail or log.error %}
+    <div>
+      <div class="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wider text-red-300/80 mb-1">
+        <span>Target container log</span>
+        {% if log.service %}<span class="rounded border border-slate-600/60 bg-slate-800/60 px-1.5 py-0.5 normal-case text-slate-300">{{ log.service }}</span>{% endif %}
+        {% if log.status %}<span class="rounded border border-slate-600/60 bg-slate-800/60 px-1.5 py-0.5 normal-case text-slate-400">status: {{ log.status }}</span>{% endif %}
+        {% if log.exit_code is not none %}<span class="rounded border border-slate-600/60 bg-slate-800/60 px-1.5 py-0.5 normal-case text-slate-400">exit: {{ log.exit_code }}</span>{% endif %}
+      </div>
+      {% if log.error %}<div class="mb-1 text-xs text-red-200">{{ log.error }}</div>{% endif %}
+      {% if log.tail %}
+      <pre class="whitespace-pre-wrap break-words rounded-lg bg-black/50 border border-slate-700/50 px-4 py-3 text-xs text-slate-200 max-h-80 overflow-y-auto font-mono">{% if log.truncated %}… (showing tail)
+{% endif %}{{ log.tail }}</pre>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% endfor %}
+    {% if not target_failure.server_error and not target_failure.has_logs %}
+    <p class="text-sm text-slate-400">
+      No target error was captured on disk. Check
+      <code class="text-slate-300">target_logs/</code> and
+      <code class="text-slate-300">.cage_runs/**/target_server-&lt;run_id&gt;.log</code>
+      for the launch failure.
+    </p>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% if trial_error_report %}
+{# The trial raised. Type + phase + traceback, all of which previously lived
+   only in the run's hidden ``.cage.runlog`` — so the UI could say "Trial error"
+   and nothing more. The phase is the half that usually identifies the culprit:
+   "docker error" is ambiguous, "docker error while launching the target" is not. #}
+<div class="bg-red-500/[0.06] rounded-xl border border-red-500/40 mb-6">
+  <div class="px-6 py-4 border-b border-red-500/20 flex items-center gap-2">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m0 3.75h.008M10.34 3.94 1.9 18a1.5 1.5 0 0 0 1.3 2.25h17.6a1.5 1.5 0 0 0 1.3-2.25L13.66 3.94a1.5 1.5 0 0 0-2.6 0Z" />
+    </svg>
+    <h2 class="text-sm font-semibold text-red-200">
+      Trial raised {{ trial_error_report.error_type }}{% if trial_error_report.phase_label %} while: {{ trial_error_report.phase_label }}{% endif %}
+    </h2>
+  </div>
+  <div class="px-6 py-4 space-y-4">
+    <div class="flex flex-wrap items-center gap-2 text-xs">
+      <span class="rounded border border-red-500/30 bg-red-500/10 px-2 py-0.5 font-mono text-red-200">{{ trial_error_report.error_type }}</span>
+      {% if trial_error_report.failed_phase %}
+      <span class="rounded border border-slate-600/60 bg-slate-800/60 px-2 py-0.5 text-slate-300">
+        phase: <span class="font-mono">{{ trial_error_report.failed_phase }}</span>
+      </span>
+      {% endif %}
+    </div>
+    {% if trial_error_report.message %}
+    <div>
+      <div class="text-xs font-semibold uppercase tracking-wider text-red-300/80 mb-1">Message</div>
+      <pre class="whitespace-pre-wrap break-words rounded-lg bg-black/50 border border-red-500/20 px-4 py-3 text-xs text-red-100 max-h-48 overflow-y-auto font-mono">{{ trial_error_report.message }}</pre>
+    </div>
+    {% endif %}
+    {% if trial_error_report.traceback %}
+    <details class="group">
+      <summary class="cursor-pointer text-xs font-semibold uppercase tracking-wider text-red-300/80 hover:text-red-200">
+        Traceback <span class="font-normal normal-case text-slate-500">(click to expand)</span>
+      </summary>
+      <pre class="mt-2 whitespace-pre-wrap break-words rounded-lg bg-black/50 border border-slate-700/50 px-4 py-3 text-xs text-slate-200 max-h-96 overflow-y-auto font-mono">{{ trial_error_report.traceback }}</pre>
+    </details>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
 
 {% if live_check %}
 <div id="trial-evidence"></div>
@@ -475,11 +571,15 @@
   </div>
 </details>
 
-<!-- Final output -->
+<!-- Final output. A trial the orchestrator, the proxy or the user stopped has
+     no conclusion — what survives is the agent's last turn, typically a plan
+     for a tool call whose result it never saw. Saying so is the difference
+     between information and a claim the agent never made. -->
 <details class="bg-surface rounded-xl border border-slate-700/50 mb-6" open>
-  <summary class="px-6 py-4 text-sm font-semibold text-slate-300 hover:text-white">Final Output</summary>
+  {# Kept on one line: the label has to stay flush against its tags. #}
+  <summary class="px-6 py-4 text-sm font-semibold text-slate-300 hover:text-white">{% if output_was_cut_off %}Last message before it was cut off{% else %}Final Output{% endif %}{% if output_was_cut_off and termination.get('detail') %}<span class="ml-2 text-xs font-normal text-slate-500">{{ termination.detail }}</span>{% endif %}</summary>
   <div class="px-6 pb-5 pt-2">
-    <div class="text-sm text-slate-200 bg-bg rounded-lg p-4 max-h-96 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed">{{ trial.output or 'No final answer captured.' }}</div>
+    <div class="text-sm text-slate-200 bg-bg rounded-lg p-4 max-h-96 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed">{{ trial.output or ('No message captured before it was cut off.' if output_was_cut_off else 'No final answer captured.') }}</div>
   </div>
 </details>
 

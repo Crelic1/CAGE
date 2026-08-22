@@ -34,6 +34,7 @@ def _make_agent() -> SimpleNamespace:
     return SimpleNamespace(
         agent_type=SimpleNamespace(
             install_command=lambda v: "echo install",
+            supports_stdin_prompt=False,
             build_launch_command=lambda prompt, model=None, **kwargs: "echo run",
             parse_output=lambda r: r.stdout,
             env_vars=lambda proxy_url="", model=None, **kwargs: {},

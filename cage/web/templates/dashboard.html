@@ -213,13 +213,17 @@
           <tbody>
             {% for row in section.rows %}
             {% set row_status = dashboard_status_kind(row.get('status')) %}
+            {# A row carrying `_pinned` is a totals line, not an observation: it
+               must not be reordered by a column sort nor hidden by a filter, or
+               the number it totals stops matching the rows above it. #}
             <tr class="border-b border-l-2 border-slate-800/50
-                {% if row_status == 'failed' %}border-l-red-500/60 bg-red-500/[0.04] hover:bg-red-500/10
+                {% if row.get('_pinned') %}border-t-2 border-t-slate-600 bg-slate-800/40 font-medium
+                {% elif row_status == 'failed' %}border-l-red-500/60 bg-red-500/[0.04] hover:bg-red-500/10
                 {% elif row_status == 'stopped' %}border-l-amber-400/60 bg-amber-500/[0.04] hover:bg-amber-500/10
                 {% elif row_status == 'running' %}border-l-sky-400/60 bg-sky-500/[0.04] hover:bg-sky-500/10
                 {% elif row_status == 'completed' %}border-l-green-500/35 hover:bg-green-500/[0.05]
                 {% else %}border-l-transparent hover:bg-slate-800/30{% endif %}"
-                data-dashboard-row
+                {% if row.get('_pinned') %}data-dashboard-pinned="{{ row.get('_pinned') }}"{% else %}data-dashboard-row{% endif %}
                 data-dashboard-row-status="{{ row_status }}"
                 data-dashboard-row-tone="{{ row_status }}"
                 data-dashboard-original-index="{{ loop.index0 }}">
@@ -249,7 +253,12 @@
                       {% else %}border-slate-600 bg-slate-800 text-slate-300{% endif %}">
                   {{ status_label }}
                 </span>
-                {% if cell_text and cell_text != status_label %}
+                {# Case-insensitive: the badge title-cases the status, so a
+                   plain `!=` treats "failed" and "Failed" as different and
+                   prints the same word twice on every single row. Only show the
+                   raw value when it really says something else, e.g. an
+                   `agent_exit_nonzero` behind a "Failed" badge. #}
+                {% if cell_text and cell_text|lower != status_label|lower %}
                 <div class="mt-1 text-[11px] text-slate-500">{{ cell_text }}</div>
                 {% endif %}
                 {% else %}
@@ -322,6 +331,9 @@
     const failuresFirst = controls?.querySelector('[data-dashboard-failures-first]');
     const tbody = table.tBodies[0];
     const rows = Array.from(tbody?.querySelectorAll('[data-dashboard-row]') || []);
+    // Totals rows are excluded from sorting and filtering, then re-appended so
+    // they always sit at the bottom whatever the user does to the table.
+    const pinned = Array.from(tbody?.querySelectorAll('[data-dashboard-pinned]') || []);
     const state = { sortKey: '', sortDir: 'asc', failuresFirst: false };
 
     function apply() {
@@ -351,6 +363,7 @@
         row.classList.toggle('hidden', !(matchesText && matchesStatus));
         tbody.appendChild(row);
       });
+      pinned.forEach((row) => tbody.appendChild(row));
     }
 
     search?.addEventListener('input', apply);

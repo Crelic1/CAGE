@@ -13,6 +13,7 @@ from cage.scoring import Scorer
 
 if TYPE_CHECKING:
     from cage.artifacts.dashboard import Dashboard
+    from cage.corpus.records import TrainingAdmission, TrialCorpusView
     from cage.experiment.model import TrialResult
     from cage.sandbox.containers import Container
 
@@ -236,6 +237,22 @@ class Benchmark(ABC):
     ) -> None:
         """Prepare the isolated agent workspace before the agent starts."""
 
+    def configure_trial_container(
+        self,
+        container: Container,
+        sample: dict[str, Any],
+        *,
+        trial_id: str,
+        trial_dir: Path,
+    ) -> None:
+        """Mutate container mounts/env before the trial container starts.
+
+        Benchmarks that need a host-visible live workspace or host-side helper
+        services can override this hook to inject bind mounts / env vars before
+        ``docker run``. The default benchmark contract does not require any
+        pre-start customization.
+        """
+
     @abstractmethod
     def build_prompt(self, sample: dict[str, Any]) -> str:
         """Build the prompt passed to the agent CLI for a sample."""
@@ -287,6 +304,115 @@ class Benchmark(ABC):
         if not values:
             return 0.0
         return max(0.0, min(1.0, max(values)))
+
+    def summarize_scores(
+        self,
+        results: list["TrialResult"],
+    ) -> dict[str, Any] | None:
+        """How this benchmark rolls one agent's trials up into a run summary.
+
+        The same Layer-1/Layer-2 split as :meth:`reward` and
+        :meth:`build_dashboard`: the framework owns the *mechanism* — collecting
+        trial results, writing ``summary.json``, rendering the run card — while
+        *what the aggregate means* is benchmark domain knowledge and lives here.
+        Neither of the framework's generic answers is a universal truth. The
+        mean of per-trial score values weighs a 3-objective sample the same as a
+        16-objective one. Generic pass@k counts a sample solved only at score
+        ``>= 1.0``, which reads every partially-solved target as a total loss
+        and reports ``pass@2: 0.0`` for a run that in fact found half the
+        vulnerabilities.
+
+        Return any subset of::
+
+            {
+              # Rendered verbatim on the run card, most important first.
+              # ``label`` and ``value`` required, ``value`` a float in [0, 1]
+              # so the UI can colour it; ``detail`` is optional tooltip text.
+              "metrics": [{"label": "pass@3 (max)", "value": 0.117,
+                           "detail": "7 / 60 vulnerabilities solved"}],
+
+              # Replaces the framework's generic block in summary.json.
+              # Shape is the benchmark's own; ``k`` and ``n_samples`` are
+              # conventional. Consumed as data, not rendered.
+              "pass_at_k": {"<scorer>": {"k": 3, "n_samples": 20, ...}},
+            }
+
+        Whatever is omitted keeps the framework's generic value, so a benchmark
+        can correct one aggregate without inheriting responsibility for both.
+
+        Default: ``None`` — no opinion, generic answers stand. Overriding costs
+        every other benchmark nothing.
+        """
+
+        return None
+
+    def admit_for_training(self, trial: "TrialCorpusView") -> "TrainingAdmission":
+        """May this trial's trajectory be used to train on?
+
+        Same Layer-1/Layer-2 split as :meth:`summarize_scores`: the framework
+        owns walking runs, converting trajectories and writing rows, while *what
+        makes a trial unfit to learn from* is domain knowledge and lives here.
+        Only the domain knows that one variant handed the agent the answer, or
+        that a task belongs to the held-out evaluation set — and a consumer
+        downstream cannot be expected to know either, which is why these are
+        refusals rather than tags.
+
+        This is a **contamination** gate, not a taste one. "The agent failed",
+        "the reasoning is short", "there are already enough of this task" are
+        selection preferences: they belong to whoever assembles the training
+        mix, and the exporter passes them through as filters instead. Refusing
+        here is for data that would be wrong to learn from at all.
+
+        Return :meth:`TrainingAdmission.rejected` chained once per gate. Codes
+        are opaque to the framework — it matches them against ``--allow`` and
+        prints them in reports, never interprets one — so a benchmark can add a
+        gate without the framework learning its name.
+
+        Default: admitted, with ``passed`` recorded in provenance so the
+        exporter can filter on it. Overriding costs every other benchmark
+        nothing.
+        """
+
+        from cage.corpus.records import TrainingAdmission
+
+        return TrainingAdmission.ok(
+            passed=self.trial_passed(trial),
+            score=self.trial_score(trial),
+        )
+
+    def trial_passed(self, trial: "TrialCorpusView") -> bool | None:
+        """Did this trial count as a pass? ``None`` when the question does not apply.
+
+        Generic reading of the scoring contract: a scorer answering ``pass`` is
+        a pass, a scorer answering anything else is a fail. A benchmark that
+        grades on a scale answers neither — its scorers leave ``answer`` empty
+        and put the signal in ``value`` — and for those the honest answer is
+        ``None``. Returning ``False`` there would report a graded run as
+        uniformly failed, which is a different and wrong claim.
+        """
+
+        verdicts = [
+            str(payload.get("answer", "")).strip().lower()
+            for payload in trial.scores.values()
+            if isinstance(payload, dict)
+        ]
+        verdicts = [v for v in verdicts if v]
+        if not verdicts:
+            return None
+        return any(v == "pass" for v in verdicts)
+
+    def trial_score(self, trial: "TrialCorpusView") -> float | None:
+        """The trial's numeric score, or ``None`` when nothing numeric was recorded.
+
+        The signal a graded benchmark actually carries. Highest across scorers,
+        matching how the generic reward reads a trial.
+        """
+
+        values = [
+            extract_numeric_score_value(payload) for payload in trial.scores.values()
+        ]
+        numeric = [v for v in values if v is not None]
+        return max(numeric) if numeric else None
 
     def build_dashboard(self, run_dir: Path) -> Optional["Dashboard"]:
         """Build a benchmark-specific visualization for a finished run."""

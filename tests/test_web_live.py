@@ -1603,6 +1603,7 @@ models:
   dummy:
     provider: openai
     model: gpt-test
+    max_context_size: 131072
 """.strip(),
         encoding="utf-8",
     )
@@ -1702,6 +1703,7 @@ models:
   dummy:
     provider: openai
     model: gpt-test
+    max_context_size: 131072
 """.strip(),
         encoding="utf-8",
     )

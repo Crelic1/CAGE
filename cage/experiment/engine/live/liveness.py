@@ -40,6 +40,7 @@ from cage.experiment.engine.live.fs_signals import (
     safe_mtime_ns,
     scan_run_signals,
 )
+from cage.experiment.engine.live.run_heartbeat import run_process_is_alive
 
 _ACTIVE_TRIAL_RECORD_STATUSES = frozenset({
     "starting",
@@ -80,8 +81,12 @@ class RunLiveness:
 def is_run_running(run_dir: Path) -> RunLiveness:
     """Decide whether the run at ``run_dir`` is still ticking.
 
-    Mirrors ``cage.web.data._build_run_info``'s decision tree. Five
-    branches:
+    Mirrors ``cage.web.data._build_run_info``'s decision tree.
+
+    Branch 0, which outranks all the rest: ``runtime_status.json`` records the
+    orchestrator's pid, so on the same host liveness is a direct process check
+    rather than an inference. Everything below is the pre-heartbeat fallback,
+    kept for runs recorded before that file existed:
 
       1. ``dashboard.json`` carries a ``completed_at`` → dead.
       2. Some trial's ``progress.json`` ticked within the live window → alive.
@@ -94,6 +99,25 @@ def is_run_running(run_dir: Path) -> RunLiveness:
     """
     if not run_dir.exists():
         return RunLiveness(False, "run directory is missing — nothing on disk owns these resources, reclaiming")
+
+    # The orchestrator's own pid, when it recorded one, outranks every
+    # filesystem heuristic below: those infer life from recent writes, which a
+    # healthy-but-quiet run (image pull, long agent turn, rate-limit backoff)
+    # does not produce. Tri-state — ``None`` means this run predates the
+    # heartbeat and the heuristics remain the only available answer.
+    process_alive = run_process_is_alive(run_dir)
+    if process_alive is True:
+        return RunLiveness(
+            True,
+            "orchestrator process is alive (runtime_status.json pid) — authoritative, "
+            "not a filesystem freshness guess",
+        )
+    if process_alive is False:
+        return RunLiveness(
+            False,
+            "orchestrator process is gone (runtime_status.json pid no longer running) — "
+            "reclaiming (artifacts kept in .cage_runs/)",
+        )
 
     dashboard_path = run_dir / "dashboard.json"
     planned_path = run_dir / "planned_trials.json"

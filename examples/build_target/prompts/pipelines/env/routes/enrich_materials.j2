@@ -1,0 +1,8 @@
+This challenge has only an attachment (`A`) — no build material, no exploit,
+no writeup. It is **not production-eligible** for environment generation yet.
+
+- Do not fabricate a Dockerfile, service, or runtime from an attachment alone.
+- Emit `status: blocked` with a single `material_enrichment` blocker: state
+  exactly which anchors are missing (`build`, `exploit`, `writeup`), and set
+  `next_action` to the enrichment queue for the missing roles.
+- Cite the attachment paths you do have so the enrichment step knows the seed.

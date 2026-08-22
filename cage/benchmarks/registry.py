@@ -163,6 +163,18 @@ def load_benchmark_options(project_file: Path) -> list[BenchmarkOption]:
     return list(options_fn())
 
 
+def benchmark_is_artifact_task(
+    project_file: Path, raw: dict[str, Any] | None = None
+) -> bool:
+    """Return whether a benchmark produces its target during agent scoring."""
+
+    try:
+        benchmark = _build_benchmark_instance(project_file, raw)
+    except Exception:  # noqa: BLE001 - help output must remain best-effort
+        return False
+    return bool(benchmark is not None and getattr(benchmark, "artifact_task", False))
+
+
 #: Cap on samples consulted when resolving a deferred round budget for help text.
 #: Per-sample budgets are uniform (or a tiny per-profile set) within one project,
 #: so a small prefix settles the distinct set without iterating a large dataset.

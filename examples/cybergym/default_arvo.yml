@@ -15,7 +15,16 @@ project:
 proxy:
   enabled: true
   request_timeout: 3600
-  # upstream_http_proxy: http://172.17.0.1:7890
+  # FIREWALL (on by default — see runtime.agent_network_mode below). The agent
+  # container has no route to the internet, so the in-container sidecar's calls
+  # to the model API go through the allowlist proxy, reached by container name on
+  # the internal network. The model endpoint must therefore be allowlisted:
+  # public APIs (api.anthropic.com / api.openai.com / …) already are; a
+  # self-hosted endpoint on a bare IP needs
+  #   python3 ../../scripts/agent_firewall.py start --allow-ip <ip-or-cidr>
+  # (dstdomain never matches an address literal), or --parent-proxy <host:port>
+  # if this machine only reaches the outside through its own proxy.
+  upstream_http_proxy: http://cage-firewall-proxy:3128
 
 output:
   dashboard_prompt: false
@@ -52,13 +61,59 @@ eval:
     # To use IMAGE mode instead (per-task n132/arvo:<id>-<mode> images, full 3480
     # catalog), comment out binary_dir + task_ids above and uncomment these:
     # image_cache_dir: ./datasets/image-cache
-    # level0 repo only · level1 +description · level2 +crash trace · level3 +patch.
+    # WHICH files the agent gets: level0 repo only · level1 +description.txt ·
+    # level2 +error.txt (crash trace) · level3 +patch.diff +repo-fix.tar.gz.
+    # level3 is NOT AVAILABLE on this dataset — the external-ARVO payload tree
+    # ships no fixed source tree and no upstream patch, so requesting it fails
+    # fast with "not implemented" instead of silently staging a level2 workspace.
+    # Use default_cybergym.yml (official dataset) for level3.
     difficulty: level1
+    # Materials overlay: a second tree laid out like data_dir (<root>/arvo/<id>/)
+    # supplying the evidence the payload tree lacks — the REAL sanitizer output
+    # (error.txt, captured by running the ground-truth PoC against the exact
+    # vulnerable binary) and the generated description ladder. The payload tree's
+    # own description.txt/error.txt are synthesised placeholders (a sentence built
+    # from meta.json; a "# Reconstructed sanitizer trace" stub), so they are
+    # treated as MISSING and level1/level2 need this overlay. Build/refresh with:
+    #   python3 external_arvo/scripts/build_materials_overlay.py \
+    #     --run-dir '.cage_runs/<agent>/<gendesc-run>' --include-archived \
+    #     --out datasets/materials-arvo/<snapshot-id>
+    # (./datasets/materials-arvo/latest is a gitignored symlink to that snapshot.)
+    materials_dir: ./datasets/materials-arvo/latest
+    # HOW SPECIFIC the description is — orthogonal to difficulty, and the axis a
+    # hint-strength sweep varies: level0 one clause (~12 words) · level1 +the
+    # vulnerable function (~20) · level2 +the triggering condition (~32) · level3
+    # the full faulty logic and missing guard (~48). Tasks whose ladder lacks the
+    # requested rung are dropped from the run (logged), so a tier sweep stays on a
+    # comparable task set. Override per run: --description-tier level3.
+    description_tier: level1
     # White-box debug toggles exactly as in cybergym: `--dynamic-sandbox true`
     # (or --set eval.benchmark.dynamic_sandbox=true) stages the prebuilt target +
     # uses the debug image. Subset further with `--sample arvo_10012 ...`.
+    #
+    # How long one graded PoC may run. A timeout is NOT distinguishable from a
+    # clean exit downstream — it scores 0, exactly like an input that did not
+    # crash — so this must clear the slowest target in the pool, not the typical
+    # one. A native libFuzzer target reproduces in milliseconds; a JVM/Jazzer one
+    # spends tens of seconds booting and instrumenting before it reads the input,
+    # which is why upstream's 10s silently zeroes Java targets. docker_timeout
+    # wraps container start + the command + teardown, so keep it above cmd_timeout.
+    cmd_timeout: 600
+    docker_timeout: 900
     grading:
       enabled: true
+      # task_id 遮蔽（上游 cybergym.task.mask 的同款反查手段）：agent 在 submit.sh
+      # 里看到的是 12 位掩码而不是真实的 "arvo:344"，否则拿 id 一搜就能找到
+      # OSS-Fuzz issue 和官方 PoC。判分服务收到掩码后还原成真 id 再取镜像。
+      # 内置的 mask_map.json 只覆盖官方 CyberGym 那 1507 条，与 external ARVO
+      # 池零重叠 —— 所以这里必须指到 ARVO 自己的表，否则 3074 条全部明文暴露。
+      mask_map_path: ./mask_map_arvo.json
+      # Where the agent's submit.sh finds the grading service. Under the firewall
+      # (runtime.agent_network_mode above) the agent is not on the default bridge,
+      # so the host is NOT at 172.17.0.1 any more — it is at the internal
+      # network's pinned gateway. Drop this line if you set agent_network_mode
+      # back to `bridge`.
+      host: 172.30.0.1
     # IMAGE MODE ONLY (ignored while binary_dir is set above). Uncomment together
     # with image_cache_dir to grade the full 3480-task catalog against per-task
     # n132/arvo images with on-demand load + LRU eviction:
@@ -81,7 +136,50 @@ runtime:
   max_input_tokens: null
   max_output_tokens: null
   max_cost: null
-  agent_network_mode: bridge
+  # NETWORK-LEVEL LOOKUP BAN — ON BY DEFAULT. `--disallowedTools WebFetch,
+  # WebSearch` below only disarms the CLI's own web tools; `curl` in a Bash call
+  # would still reach the internet, and an agent that can read the OSS-Fuzz
+  # report is not reproducing the bug, it is copying the answer. So the agent
+  # runs on an INTERNAL docker network with no route out, whose only exit is an
+  # allowlist proxy — the same design as upstream CyberGym (cybergym.firewall).
+  # Bring it up once per machine (idempotent), before the first run:
+  #   python3 ../../scripts/agent_firewall.py start     # allowlist: apt, pip, LLM APIs
+  #   python3 ../../scripts/agent_firewall.py status    # prints exactly these values
+  # The agent's own shell gets NO proxy env, so it has no way out at all; only
+  # cage's sidecar is pointed at the proxy (see proxy.upstream_http_proxy).
+  # Host-side services stay reachable at the network's gateway — hence
+  # eval.benchmark.grading.host below, which must NOT stay at the default-bridge
+  # 172.17.0.1. To run without the firewall: set this back to `bridge`, drop
+  # proxy.upstream_http_proxy, and remove grading.host.
+  # runtime.network_containment (see docs/reference/project-yml.md) is NOT
+  # usable here: this benchmark grades over the host gateway
+  # (eval.benchmark.grading.host), and containment removes the host from
+  # the agent's networks entirely.
+  agent_network_mode: cage-internal
+  # Hard memory ceiling per agent container. PoC synthesis is the workload that
+  # needs it most: the agent writes throwaway Python to emit a crashing input,
+  # and an off-by-1024 size or a loop that never terminates turns into tens of
+  # GB within minutes. Two such scripts (an unbounded bytearray, and
+  # np.zeros((65536, 65536)) whose author's comment said "4MB") once took a
+  # 247 GB host down with every other run on it. 16g is what the fuzzing fleet
+  # on the same machines caps each task at, and ~90x an agent container's
+  # steady state. The cgroup kills the offending PROCESS, not the container: a
+  # runaway script the agent spawned comes back as exit 137 from its own Bash
+  # call and the agent can correct course while the trial runs on; only if the
+  # agent process itself is reaped does the trial end as oom_killed. Either way
+  # a ceiling set too low stays visible in the run rather than being silently
+  # blamed on the agent. Set to "unlimited" to disable.
+  agent_memory_limit: 16g
+  # Hard CPU ceiling per agent container, in cores-worth of runtime. Fuzzing is
+  # the workload that needs it: libFuzzer-style fan-out (`-jobs=$(nproc)`) reads
+  # the HOST's core count — a cgroup quota does not narrow sched_getaffinity —
+  # so one trial spawned 64 spinning processes and held ~1970% CPU, roughly 20
+  # cores, while 60+ sibling trials queued behind it. Docker's --cpus is a CFS
+  # quota, so the kernel keeps scheduling freely across cores; no core-pinning
+  # bookkeeping is involved. This caps a single trial's PEAK, not the fleet's
+  # total — N concurrent trials can still oversubscribe the host, so size
+  # max_concurrent to the machine as well. Set to "unlimited" to disable.
+  agent_cpu_limit: 8
   store_proxy: true
   live_check:
     enabled: false
@@ -97,11 +195,11 @@ agents:
           DISABLE_INTERLEAVED_THINKING: "1"
     image: cage/claude-code:pentestenv
     home: /home/agent/workspace
-    # submit.sh blocks on synchronous host-side grading (~150s). Claude Code's
-    # Bash tool would otherwise kill the curl at 120s; outwait the grading ceiling.
+    # submit.sh blocks on synchronous host-side grading. Keep Bash above the
+    # benchmark's 600s Docker wall clock so it does not kill curl first.
     extra_env:
-      BASH_DEFAULT_TIMEOUT_MS: "600000"
-      BASH_MAX_TIMEOUT_MS: "600000"
+      BASH_DEFAULT_TIMEOUT_MS: "660000"
+      BASH_MAX_TIMEOUT_MS: "660000"
     # Concurrency: how many trials this agent runs AT ONCE (not a total cap).
     # Override at the CLI with --max-concurrent N.
     max_concurrent: 3
@@ -109,9 +207,12 @@ agents:
       - --permission-mode
       - bypassPermissions
       - --verbose
-      # Align with the upstream CyberGym claude_code runner's "no web tools"
-      # setting (examples/agents/claude_code/run.py: disallowed_tools =
-      # "WebFetch,WebSearch"). The PoC must come from the agent's own analysis,
-      # not from looking the CVE up on the web.
+      # No web tools (upstream CyberGym's claude_code runner sets
+      # disallowed_tools = "WebFetch,WebSearch") and no delegation: the PoC must
+      # come from this agent's own analysis of the source, not from looking the
+      # CVE up on the web or from a sub-agent whose turns the round budget and
+      # the trajectory do not account for. Task is the current name of the
+      # sub-agent tool, Agent the legacy one — deny both so the setting does not
+      # depend on the CLI version in the image.
       - --disallowedTools
-      - WebFetch,WebSearch
+      - WebFetch,WebSearch,Task,Agent

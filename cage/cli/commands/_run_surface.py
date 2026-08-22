@@ -95,6 +95,7 @@ def echo_run_landing_help() -> None:
     click.echo("  --run-id ID             Set the run directory id.")
     click.echo("  --resume                Continue an existing run id.")
     click.echo("  --force                 Archive an existing run id and start fresh.")
+    click.echo("  --preflight-only        Check this project's real agent/model config, then exit.")
     click.echo("  --dry-run               Show the plan without launching containers or targets.")
     click.echo("  --allow-launch-build    Run benchmark build hook before target launch.")
     click.echo("  --timeout SECONDS       Override per-trial timeout.")
@@ -305,9 +306,15 @@ def echo_benchmark_run_surface(benchmark_id: str) -> None:
     click.echo(f"  cage benchmark check {spec.id} --sample <sample_id>")
     click.echo(f"  cage benchmark check {spec.id} --sample <sample_id> --show-prompt")
     click.echo()
-    click.echo("Step 2. Build or verify benchmark targets")
-    click.echo(f"  cage benchmark build {spec.id} --sample <sample_id>")
-    click.echo(f"  cage benchmark build {spec.id} --max-concurrent 4")
+    artifact_task = registry.benchmark_is_artifact_task(project_file, raw)
+    if artifact_task:
+        click.echo("Step 2. Confirm the artifact prompt and local prerequisites")
+        click.echo(f"  cage benchmark check {spec.id} --sample <sample_id> --show-prompt")
+        click.echo("  The target image is produced and built by the scorer during Step 3.")
+    else:
+        click.echo("Step 2. Build or verify benchmark targets")
+        click.echo(f"  cage benchmark build {spec.id} --sample <sample_id>")
+        click.echo(f"  cage benchmark build {spec.id} --max-concurrent 4")
     click.echo()
     click.echo("Step 3. Run one smoke trial")
     click.echo(

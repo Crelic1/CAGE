@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import os
+import subprocess
 import threading
 from typing import Any, Callable
+
+logger = logging.getLogger("cage.target.server.network_alloc")
 
 
 _PROJECT_LOCAL_SUBNET_LOCK = threading.Lock()
@@ -220,6 +224,178 @@ def _stamp_target_server_network_labels(config: dict[str, Any], docker_network: 
             continue
         _set_label_dict(net_cfg, "cage.target.network", docker_network)
         _set_label_dict(net_cfg, "cage.target.role", "runtime")
+
+
+HOST_OFF_BRIDGE_OPT = "com.docker.network.bridge.inhibit_ipv4"
+
+
+def host_min_mtu() -> int:
+    from cage.sandbox.netproxy import host_min_mtu as _mtu
+
+    return _mtu()
+
+
+def _inject_host_off_network_opts(config: dict[str, Any]) -> list[str]:
+    """Build the range's networks with the docker host NOT on them.
+
+    A stock compose bridge gives the host an address on every range subnet, and
+    the host listens on ``0.0.0.0`` — so any machine in the range can dial the
+    host's sshd. That is not hypothetical: an agent has taken a range host,
+    planted its own SSH key, and used the compose gateway to log into the
+    machine running the benchmark. Sealing only the agent's own network does
+    nothing about it, because the agent pivots and uses a *target's* network
+    stack.
+
+    ``inhibit_ipv4`` leaves the bridge address-less on the host side while
+    compose still declares a gateway, so containers keep their default route.
+    The address that route points at is claimed by the egress proxy container
+    (``scripts/agent_netproxy.py``), which must therefore be attached to these
+    networks — without it the route points at nobody and every outbound
+    connection stalls on ARP for seconds instead of failing fast.
+
+    Returns the names of the networks that were changed, so the caller can
+    attach the proxy to exactly those.
+    """
+    networks = config.get("networks") or {}
+    if not isinstance(networks, dict):
+        return []
+    changed: list[str] = []
+    for net_name, net_cfg in list(networks.items()):
+        if net_cfg is None:
+            net_cfg = {}
+            networks[net_name] = net_cfg
+        if not isinstance(net_cfg, dict):
+            continue
+        # External networks are somebody else's to configure; a driver option
+        # on them is ignored by compose anyway.
+        if net_cfg.get("external"):
+            continue
+        driver_opts = net_cfg.setdefault("driver_opts", {})
+        if not isinstance(driver_opts, dict):
+            continue
+        driver_opts[HOST_OFF_BRIDGE_OPT] = "true"
+        # Same MTU reasoning as the agent network: a target's egress leaves by
+        # the same path, and docker's default 1500 is silently too big when the
+        # host's way out is smaller. Only set when the compose file did not pin
+        # one — a range that specifies its own MTU is expressing topology.
+        driver_opts.setdefault("com.docker.network.driver.mtu", str(host_min_mtu()))
+        changed.append(str(net_name))
+    return changed
+
+
+def host_off_networks_enabled() -> bool:
+    """Whether ranges are launched with the host off their networks.
+
+    Off by default: the mode only works when the egress proxy is running on the
+    machine, so turning it on is a deployment decision, not a default.
+    """
+    return os.getenv("TARGET_SERVER_HOST_OFF_NETWORKS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def egress_proxy_container() -> str:
+    from cage.sandbox.netproxy import CONTAINER
+
+    return os.getenv("CAGE_NETPROXY_CONTAINER", CONTAINER).strip() or CONTAINER
+
+
+def attach_egress_proxy_to_network(network: str, *, container: str | None = None) -> bool:
+    """Attach the egress proxy to one network by name.
+
+    Used for networks cage creates directly (the target server's own shared
+    network), as opposed to the compose-created ones that
+    :func:`attach_egress_proxy` finds by project label.
+    """
+    from cage.sandbox.netproxy import attach
+
+    ok = attach(network, container=container or egress_proxy_container())
+    if not ok:
+        logger.error(
+            "egress proxy could not join %s — containers on it have a default "
+            "route to an address nobody answers for", network,
+        )
+    return ok
+
+
+def attach_egress_proxy(project_name: str, *, container: str | None = None) -> list[str]:
+    """Put the egress proxy on the networks compose just created for a project.
+
+    Must run after ``compose up`` (the networks do not exist before) and as
+    early as possible after it: the range's own services start immediately, and
+    until the proxy has claimed the gateway address their outbound connections
+    stall on ARP.
+
+    Raises when the proxy is missing rather than letting the range come up with
+    a default route pointing at nobody — that failure is slow, silent, and looks
+    like the range being broken.
+    """
+    container = container or egress_proxy_container()
+    probe = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30.0,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        raise RuntimeError(
+            f"TARGET_SERVER_HOST_OFF_NETWORKS is on but the egress proxy "
+            f"container {container!r} is not running — range networks would have "
+            f"a gateway address nobody answers for. Start it with: "
+            f"python3 scripts/agent_netproxy.py up"
+        )
+
+    listing = subprocess.run(
+        ["docker", "network", "ls", "--filter",
+         f"label=com.docker.compose.project={project_name}", "--format", "{{.Name}}"],
+        text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30.0,
+    )
+    networks = [n.strip() for n in (listing.stdout or "").splitlines() if n.strip()]
+    attached: list[str] = []
+    for network in networks:
+        result = subprocess.run(
+            ["docker", "network", "connect", network, container],
+            text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30.0,
+        )
+        if result.returncode == 0 or "already exists" in (result.stderr or ""):
+            attached.append(network)
+        else:
+            logger.warning(
+                "egress proxy could not join %s: %s", network, (result.stderr or "")[:200],
+            )
+    if networks and not attached:
+        raise RuntimeError(
+            f"egress proxy {container!r} could not join any network of project "
+            f"{project_name!r}; the range would have no way out and no gateway"
+        )
+    logger.info("egress proxy %s attached to %s", container, ", ".join(attached) or "(none)")
+    return attached
+
+
+def detach_egress_proxy(network: str, *, container: str | None = None) -> bool:
+    """Take the egress proxy off a network so the network can be removed.
+
+    The proxy is not part of the compose project, so ``compose down`` leaves it
+    attached and docker refuses to delete the network ("has active endpoints").
+    Teardown then burns its whole retry budget waiting for an endpoint that will
+    never leave on its own, and the network leaks — one per range launch.
+
+    Best-effort by design: a teardown must not fail because a detach did.
+    """
+    container = container or egress_proxy_container()
+    try:
+        result = subprocess.run(
+            ["docker", "network", "disconnect", "-f", network, container],
+            text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30.0,
+        )
+    except Exception as exc:  # docker missing, timeout — teardown continues
+        logger.debug("egress proxy detach from %s failed: %s", network, exc)
+        return False
+    if result.returncode == 0:
+        logger.info("egress proxy %s detached from %s", container, network)
+        return True
+    # "is not connected" / "No such container" are the normal cases when the
+    # mode is off or the proxy never joined.
+    logger.debug("egress proxy detach from %s: %s", network, (result.stderr or "").strip()[:160])
+    return False
 
 
 def _stamp_cage_run_id_labels(

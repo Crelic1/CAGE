@@ -23,10 +23,13 @@ from cage.artifacts.records import (
 )
 from cage.artifacts.resources import ResourceLedgerReader
 from cage.artifacts.run_storage import trial_record_ref as storage_trial_record_ref
+from cage.contracts.jsonio import append_jsonl_record, count_jsonl_lines
+from cage.contracts.trial_phase import TrialPhase
 from cage.contracts.trial_status import (
-    COMPLETED_TRIAL_STATUSES,
+    COMPLETED_TRIAL_STATUSES_ON_READ,
     FAILED_TRIAL_STATUSES,
     INTERRUPTED_TRIAL_STATUSES,
+    TERMINAL_TRIAL_STATUSES_ON_READ,
 )
 from cage.experiment.model import (
     ArtifactIndex,
@@ -47,6 +50,11 @@ from cage.experiment.model import (
     trial_event_to_json,
     trial_record_to_json,
 )
+
+#: A trial record in one of these statuses is done being written by the runtime.
+#: Phase marks arriving afterwards are ignored so a ``finally``-block teardown
+#: cannot resurrect a finished trial into an active phase.
+_TERMINAL_TRIAL_STATUSES: frozenset[str] = TERMINAL_TRIAL_STATUSES_ON_READ
 
 
 class ExperimentEventWriter:
@@ -83,7 +91,6 @@ class ExperimentEventWriter:
         log_path = Path(log_ref)
         if not log_path.is_absolute():
             log_path = self.run_dir / log_path
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         event = TrialEvent(
             schema_version="trial_event.v1",
             event_id=self._next_event_id(log_path),
@@ -99,8 +106,7 @@ class ExperimentEventWriter:
             resource_refs=resource_refs,
             error=error,
         )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(trial_event_to_json(event))
+        append_jsonl_record(log_path, trial_event_to_json(event))
         return event
 
     def _next_event_id(self, log_path: Path) -> str:
@@ -108,7 +114,7 @@ class ExperimentEventWriter:
 
         if not log_path.is_file():
             return "evt_000001"
-        count = sum(1 for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip())
+        count = count_jsonl_lines(log_path)
         return f"evt_{count + 1:06d}"
 
 class ExperimentArtifactWriter:
@@ -466,8 +472,56 @@ class ExperimentArtifactWriter:
             status_reason=status_reason,
             started_at=started_at,
             target_id=target_id if target_id is not None else record.target_id,
+            # The runtime marks each subsequent phase explicitly; entering
+            # "running" means it has cleared the gates and is starting the
+            # container, so seed the phase axis here rather than leaving a
+            # started trial reading as still ``planned``.
+            phase=TrialPhase.STARTING_CONTAINER.value,
+            phase_updated_at=started_at,
         )
         self._write_trial_record(trial_ref, updated)
+        return updated
+
+    def mark_trial_phase(
+        self,
+        trial_id: str,
+        *,
+        phase: str,
+        timestamp: str,
+        record_ref: str = "",
+    ) -> TrialRecord:
+        """Advance one trial's phase and persist it atomically.
+
+        This is the write that makes "what is this trial doing right now?"
+        answerable from durable state instead of inferred from file mtimes.
+        Each call rewrites ``record.json``, so the record's own mtime doubles as
+        a per-trial progress tick for the phases (target launch, snapshotting,
+        scoring) during which the LLM proxy is silent.
+
+        Terminal records are never re-opened: a late phase mark arriving after
+        ``mark_trial_finished`` (e.g. from a teardown path running in a
+        ``finally``) must not resurrect a finished trial into an active phase.
+
+        ``record_ref`` lets a caller that already knows the trial's record path
+        skip :meth:`_trial_record_ref`, whose linear scan over the run record
+        would otherwise make a per-trial phase timeline cost O(trials²) across a
+        run. ``TrialRuntimeSession`` resolves the ref once and passes it here.
+        """
+
+        trial_ref = record_ref or self._trial_record_ref(trial_id)
+        record = self._load_trial_record(trial_ref)
+        if str(record.status or "").strip().lower() in _TERMINAL_TRIAL_STATUSES:
+            return record
+        updated = replace(record, phase=phase, phase_updated_at=timestamp)
+        # Deliberately skips the artifact-index checksum refresh. That refresh
+        # reads, re-hashes and atomically rewrites the *run-level*
+        # ``artifact_index.json`` — an O(all artifacts) operation on a file every
+        # concurrent trial shares. Paying it twice per trial (start + finish) is
+        # fine; paying it once per phase transition would make it O(trials²) and
+        # turn concurrent phase marks into last-writer-wins races on a shared
+        # file. The checksum only has to be correct for the record's final
+        # content, and ``mark_trial_finished`` still refreshes it.
+        self._write_trial_record(trial_ref, updated, refresh_index=False)
         return updated
 
     def mark_trial_finished(
@@ -490,6 +544,8 @@ class ExperimentArtifactWriter:
             status_reason=status_reason,
             completed_at=completed_at,
             termination=termination or record.termination,
+            phase=TrialPhase.FINISHED.value,
+            phase_updated_at=completed_at,
         )
         self._write_trial_record(trial_ref, updated)
         self._refresh_run_trial_counts()
@@ -817,12 +873,25 @@ class ExperimentArtifactWriter:
         _atomic_write_text(path, experiment_record_to_json(record))
         self._refresh_artifact_index_entry(path)
 
-    def _write_trial_record(self, record_ref: str, record: TrialRecord) -> None:
-        """Persist one trial record and refresh its artifact-index checksum."""
+    def _write_trial_record(
+        self,
+        record_ref: str,
+        record: TrialRecord,
+        *,
+        refresh_index: bool = True,
+    ) -> None:
+        """Persist one trial record and refresh its artifact-index checksum.
+
+        ``refresh_index=False`` writes the record only. Callers use it for
+        high-frequency progress updates whose intermediate checksums nothing
+        reads — the refresh rewrites a run-level file shared by every trial, so
+        doing it on every update would not scale and would race.
+        """
 
         path = self.run_dir / record_ref
         _atomic_write_text(path, trial_record_to_json(record))
-        self._refresh_artifact_index_entry(path)
+        if refresh_index:
+            self._refresh_artifact_index_entry(path)
 
     def _trial_record_ref(self, trial_id: str) -> str:
         """Return the run-relative record ref for ``trial_id``."""
@@ -865,7 +934,7 @@ class ExperimentArtifactWriter:
             bucket = per_subject.setdefault(
                 trial.subject_id, {"terminal": 0, "active": 0, "planned": 0}
             )
-            if status in COMPLETED_TRIAL_STATUSES:
+            if status in COMPLETED_TRIAL_STATUSES_ON_READ:
                 completed += 1
                 bucket["terminal"] += 1
             elif status in FAILED_TRIAL_STATUSES:

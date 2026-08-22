@@ -6,7 +6,6 @@ handled by snapshot/restore at trial boundaries.
 
 Merged following capabilities:
 - PersistentShell support (open_persistent_shell)
-- agent_execute() with crash recovery and false-positive handling
 - Workspace helpers (symlink_dir_content, hardlink_dir_content, exists, mkdir)
 - Static IP support on connect_network (ipv4_address param)
 """
@@ -24,18 +23,40 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
+from cage.contracts.exceptions import ContainerError
+from cage.contracts.execution import CONTAINER_PROXY_SCRIPT_NAME
 from cage.sandbox.exec import ExecResult
 from cage.sandbox.shell import PersistentShell
 
 logger = logging.getLogger(__name__)
 
+# Shared Docker hosts can serialize container creation behind long-running image
+# save/build operations.  Allow ten minutes for ``docker run`` to return before
+# treating startup as failed; the trial runtime timeout is configured separately.
+DEFAULT_CONTAINER_START_TIMEOUT = 600.0
+
 # Global registry of active container names that need cleanup on process exit.
 # Container is a dataclass without __hash__, so we track by name (str).
 _ACTIVE_CONTAINER_NAMES: set[str] = set()
 _REGISTRY_LOCK = threading.Lock()
+
+# Config spellings that mean "no ceiling". Mirrors the vocabulary
+# ``contracts.execution`` uses for an unlimited round budget, so a user who
+# writes ``unlimited`` in one place is not surprised by the other. Shared by
+# the memory and CPU ceilings so both spell "off" the same way.
+_UNLIMITED_LIMIT_TOKENS = frozenset({"", "0", "unlimited", "none", "null", "off", "-1"})
+
+
+def memory_limit_is_unbounded(value: str | None) -> bool:
+    """Whether a configured memory ceiling means "do not cap"."""
+    return str(value or "").strip().lower() in _UNLIMITED_LIMIT_TOKENS
+
+
+def cpu_limit_is_unbounded(value: str | None) -> bool:
+    """Whether a configured CPU ceiling means "do not cap"."""
+    return str(value or "").strip().lower() in _UNLIMITED_LIMIT_TOKENS
 
 
 def _cleanup_all_containers() -> None:
@@ -55,21 +76,23 @@ def _cleanup_all_containers() -> None:
 
 atexit.register(_cleanup_all_containers)
 
-# ---------------------------------------------------------------------------
-# False-positive / connectivity error detection (from docker_env.py)
-# ---------------------------------------------------------------------------
-
-SHELL_WRAPPER_FALSE_POSITIVE_RETURNCODES = {126, 255}
-
-TARGET_CONNECTIVITY_ERROR_MARKERS = (
-    "connection refused",
-    "connection timed out",
-    "timed out",
-    "no route to host",
-    "network is unreachable",
-)
-
 READONLY_VOLUME_OPTIONS = {"ro", "readonly"}
+
+
+def _subprocess_text(value: str | bytes | None) -> str:
+    """Normalize subprocess output at the runtime boundary.
+
+    ``TimeoutExpired.stdout``/``stderr`` may be bytes even when the original
+    ``subprocess.run`` requested text mode.  Letting those bytes escape through
+    ``ExecResult`` makes ordinary string checks fail with a TypeError during
+    transient Docker daemon latency.
+    """
+
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _docker_bind_mount_spec(host_path: str, container_path_spec: str) -> str:
@@ -93,40 +116,6 @@ def _docker_bind_mount_spec(host_path: str, container_path_spec: str) -> str:
     if options & READONLY_VOLUME_OPTIONS:
         parts.append("readonly")
     return ",".join(parts)
-
-
-def is_shell_wrapper_false_positive(command: str, output: str, returncode: int) -> bool:
-    """Detect nc+head false-positives caused by sandbox shell wrappers."""
-    normalized_command = command.lower()
-    if "nc" not in normalized_command:
-        return False
-    if "| head" not in normalized_command and "head -c" not in normalized_command:
-        return False
-    if returncode not in SHELL_WRAPPER_FALSE_POSITIVE_RETURNCODES:
-        return False
-
-    normalized_output = output.lower()
-    if "operation not permitted" not in normalized_output:
-        return False
-
-    if "exec /usr/bin/bash" in normalized_output or "exec /usr/bin/sh" in normalized_output:
-        return True
-
-    return "failed to run command" in normalized_output and "bash" in normalized_output
-
-
-def sanitize_agent_false_positive_output(command: str, output: str) -> str:
-    """Return a sanitized message for false-positive outputs."""
-    del command, output
-    return "[SYSTEM] command hit a local shell-wrapper false positive; try another read method\n"
-
-
-def is_target_connectivity_error(output: str, returncode: int) -> bool:
-    """Detect whether a command failed due to target connectivity issues."""
-    if returncode == 0:
-        return False
-    normalized_output = output.lower()
-    return any(marker in normalized_output for marker in TARGET_CONNECTIVITY_ERROR_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +165,18 @@ class Container:
     cap_add: list[str] = field(default_factory=list)
     group_add: list[str] = field(default_factory=list)
     privileged: bool = False
-    start_timeout: float = 120.0
+    # Docker ``--memory`` size string ("16g", "512m", raw bytes). Empty or any
+    # of ``_UNLIMITED_LIMIT_TOKENS`` leaves the container uncapped, which is
+    # Docker's own default. ``--memory-swap`` is pinned to the same value so the
+    # ceiling cannot be escaped through swap on a host that has some.
+    memory_limit: str = ""
+    # Docker ``--cpus`` value — CPU-cores-worth of runtime ("8", "4.5"). Empty
+    # or any of ``_UNLIMITED_LIMIT_TOKENS`` leaves the container uncapped.
+    cpu_limit: str = ""
+    start_timeout: float = DEFAULT_CONTAINER_START_TIMEOUT
     labels: dict[str, str] = field(default_factory=dict)
     _started: bool = False
     _runtime_network_name: str | None = None
-
-    # Optional runtime coordinator for crash recovery (set externally)
-    runtime_coordinator: Any = None
 
     @property
     def is_running(self) -> bool:
@@ -193,14 +187,40 @@ class Container:
     # ------------------------------------------------------------------ #
 
     def start(self) -> None:
-        """Start the container: docker run -d ... sleep infinity."""
-        cmd = ["docker", "run", "-d", "--name", self.name]
+        """Start the container: docker run -d --init ... sleep infinity."""
+        cmd = ["docker", "run", "-d", "--init", "--name", self.name]
 
         for label_key, label_value in self.labels.items():
             cmd.extend(["--label", f"{label_key}={label_value}"])
 
         if self.network_mode:
             cmd.extend(["--network", self.network_mode])
+
+        # A cgroup ceiling is the only thing that can stop a runaway
+        # agent-authored script BEFORE some termination condition fires — the
+        # reaper (``kill_agent``) only runs once the orchestrator has decided to
+        # stop the trial, and a trial that ends ``completed`` never triggers it
+        # at all. Pinning ``--memory-swap`` to the same value keeps the ceiling
+        # meaningful on a host with swap (Docker otherwise allows 2x).
+        if not memory_limit_is_unbounded(self.memory_limit):
+            limit = self.memory_limit.strip()
+            cmd.extend(["--memory", limit, "--memory-swap", limit])
+
+        # The same fuse, for CPU. Uncapped, ONE trial can take the whole host:
+        # a fuzzing agent that fans out with ``-jobs=$(nproc)`` was observed
+        # holding 64 processes at ~1970% CPU — 20 cores — while 60+ sibling
+        # trials queued behind it. ``--cpus`` is a CFS quota, so the kernel
+        # keeps placing threads on whatever cores are free; unlike
+        # ``--cpuset-cpus`` it needs no core-range bookkeeping from the caller.
+        #
+        # Note this bounds a container's SHARE, not its process count: ``nproc``
+        # reads sched_getaffinity, which a quota does not narrow, so an agent
+        # that fans out by core count still spawns host-core-count processes.
+        # They now contend for the container's own slice instead of the host's,
+        # which is the property that matters — the context-switch cost stays
+        # charged to the trial that caused it.
+        if not cpu_limit_is_unbounded(self.cpu_limit):
+            cmd.extend(["--cpus", self.cpu_limit.strip()])
 
         # Docker injects HTTP(S)_PROXY/ALL_PROXY into every container from the
         # CLI's ~/.docker/config.json "proxies" block. For an agent container
@@ -236,13 +256,29 @@ class Container:
         for hostname, ip in self.extra_hosts.items():
             cmd.extend(["--add-host", f"{hostname}:{ip}"])
 
+        # ``sleep infinity`` keeps the container alive but never reaps: every
+        # process the agent orphans (a backgrounded bash, a curl whose shell
+        # exited, a compiler killed by timeout) reparents to it and stays a
+        # zombie for the whole trial. A long trial accumulated 1091 of them.
+        # ``--init`` puts tini at PID 1 instead, which reaps orphans and
+        # forwards signals, so ``docker stop`` also shuts down cleanly.
         cmd.extend([self.image, "sleep", "infinity"])
 
         result = self._run_local(cmd, timeout=self.start_timeout)
         if result.exit_code != 0:
-            raise RuntimeError(
-                f"docker run failed for {self.name}: {result.stderr[:500]},{result.stderr}"
-            )
+            # Typed, so the CLI renders it as a message and the trial classifier
+            # attributes it to the container rather than to nothing. The missing
+            # image is by far the most common cause and has a one-line fix, so
+            # say it rather than leaving a docker registry error to interpret.
+            detail = (result.stderr or "").strip()
+            if "Unable to find image" in detail or "manifest unknown" in detail:
+                detail = (
+                    f"image {self.image!r} is not available locally and could not "
+                    f"be pulled.\n  Build it with: cage agent build\n  {detail[:400]}"
+                )
+            else:
+                detail = f"docker run failed: {detail[:500]}"
+            raise ContainerError(self.name, detail)
         self._started = True
         # Register for atexit cleanup (in case stop() is never called)
         with _REGISTRY_LOCK:
@@ -305,59 +341,6 @@ class Container:
         )
 
         return self._run_local(cmd, timeout=timeout)
-
-    def agent_execute(
-        self,
-        command: str,
-        *,
-        cwd: str = "",
-        timeout: int | None = None,
-        runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Execute a command with crash recovery and false-positive handling.
-
-        Unlike exec() which returns an ExecResult, this returns a dict
-        with 'output' and 'returncode' keys (legacy interface from
-        DockerEnvironment.agent_execute).
-        """
-        self.sync_runtime_network(
-            str(runtime_context.get("network_name"))
-            if runtime_context and runtime_context.get("network_name")
-            else None
-        )
-
-        result = self._run_agent_command(command, cwd, timeout=timeout)
-
-        if timeout and result["returncode"] == 124:
-            return result
-
-        if is_shell_wrapper_false_positive(command, result["output"], result["returncode"]):
-            logger.warning(
-                "Sanitized local shell-wrapper false positive for command %r. Raw output: %r",
-                command,
-                result["output"],
-            )
-            return {
-                "output": sanitize_agent_false_positive_output(command, result["output"]),
-                "returncode": result["returncode"],
-            }
-
-        if (
-            runtime_context is not None
-            and self.runtime_coordinator is not None
-            and is_target_connectivity_error(result["output"], result["returncode"])
-        ):
-            recovery = self.runtime_coordinator.recover_and_refresh(
-                runtime_context,
-                reason=result["output"].strip() or "connectivity failure",
-            )
-            if recovery.recovered:
-                retried = self._run_agent_command(command, cwd, timeout=timeout)
-                if retried["returncode"] == 0:
-                    retried["output"] = f"[SYSTEM] target recovered; retried once\n{retried['output']}"
-                return retried
-
-        return result
 
     def copy_from(
         self,
@@ -561,7 +544,13 @@ class Container:
         """Send a signal to a process in the container."""
         self.exec(f"kill -s {signal} {pid} 2>/dev/null || true", timeout=5.0)
 
-    def kill_agent(self, *, user: str = "agent", spare_pattern: str = "sidecar.py") -> None:
+    def kill_agent(
+        self,
+        *,
+        user: str = "agent",
+        spare_pattern: str = CONTAINER_PROXY_SCRIPT_NAME,
+        escalate: bool = True,
+    ) -> bool:
         """Force-kill the agent process tree inside the container.
 
         The agent is launched via :meth:`exec_async` as the unprivileged
@@ -582,20 +571,92 @@ class Container:
         (each trial gets its own container, so this never touches another
         trial), and once the agent tree dies the exec pipe EOFs and the
         host-side drain returns promptly.
+
+        The reap is VERIFIED, not fire-and-forget. ``_run_local`` reports a
+        ``docker exec`` timeout as ``exit_code == -1`` instead of raising, so a
+        single unchecked call fails silently — and it fails precisely when it
+        matters most: an agent whose runaway child is thrashing the host is the
+        case where ``docker exec`` needs longer than the first budget just to
+        fork. We therefore re-probe for survivors, retry once with a much larger
+        budget, and (when ``escalate``) fall back to ``docker kill``, which the
+        daemon delivers to PID 1 without ever forking inside the starved
+        container.
+
+        Returns ``True`` once no agent process survives, ``False`` when that
+        could not be established.
         """
         if not self._started:
-            return
-        # POSIX sh loop: list the user's PIDs, skip the sidecar, SIGKILL the rest.
-        script = (
+            return True
+        # POSIX sh loop: list the user's PIDs, skip the sidecar, act on the rest.
+        loop = (
             f"for p in $(pgrep -u {shlex.quote(user)} 2>/dev/null); do "
             f"grep -qa {shlex.quote(spare_pattern)} \"/proc/$p/cmdline\" 2>/dev/null "
-            f"|| kill -KILL \"$p\" 2>/dev/null; "
+            f"|| %s; "
             f"done; true"
         )
+        reap_script = loop % 'kill -KILL "$p" 2>/dev/null'
+        probe_script = loop % 'echo "$p"'
+
+        survivors: list[str] | None = None
+        for timeout in (10.0, 60.0):
+            self._reap_agent_once(reap_script, timeout=timeout)
+            survivors = self._agent_survivors(probe_script, timeout=timeout)
+            if survivors == []:
+                return True
+
+        detail = "unknown (container unreachable)" if survivors is None \
+            else ",".join(survivors)
+        logger.warning(
+            "kill_agent: agent tree still alive in %s after two reap attempts "
+            "(survivors=%s)%s",
+            self.name,
+            detail,
+            "; escalating to `docker kill`" if escalate else "",
+        )
+        if not escalate:
+            return False
+        # Stops the whole container, so any post-trial snapshot will fail. That
+        # is the accepted trade against leaving a runaway agent burning host
+        # memory and model quota. ``_started`` stays True so ``stop()`` still
+        # runs ``docker rm -f`` and the container is not leaked.
+        result = self._run_local(["docker", "kill", self.name], timeout=30.0)
+        stderr = (result.stderr or "").strip()
+        if result.exit_code == 0:
+            logger.warning("kill_agent: escalated to `docker kill %s`", self.name)
+            return True
+        if "is not running" in stderr:
+            return True  # it died between the probe and the escalation
+        logger.error(
+            "kill_agent: `docker kill %s` failed (exit=%s): %s",
+            self.name,
+            result.exit_code,
+            stderr[:200],
+        )
+        return False
+
+    def _reap_agent_once(self, script: str, *, timeout: float) -> None:
+        """One best-effort SIGKILL sweep; never raises."""
         try:
-            self.exec(script, timeout=10.0)
+            self.exec(script, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - best-effort reaper; never raise
-            logger.warning("kill_agent failed for %s: %s", self.name, exc)
+            logger.warning("kill_agent reap failed for %s: %s", self.name, exc)
+
+    def _agent_survivors(self, script: str, *, timeout: float) -> list[str] | None:
+        """PIDs still alive after a sweep, or None when the probe itself failed.
+
+        None and ``[]`` mean different things: ``[]`` is a confirmed clean
+        container, None is "we could not find out" — which must NOT be read as
+        success, because a timed-out probe is the signature of the very
+        situation the reaper exists for.
+        """
+        try:
+            result = self.exec(script, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - probe is advisory; never raise
+            logger.debug("kill_agent survivor probe failed for %s: %s", self.name, exc)
+            return None
+        if result.exit_code != 0:
+            return None
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def exec_async(
         self,
@@ -685,49 +746,6 @@ class Container:
             self.name, timeout,
         )
 
-    def _run_agent_command(
-        self,
-        command: str,
-        cwd: str = "",
-        *,
-        timeout: int | None = None,
-    ) -> dict[str, Any]:
-        """Run a command inside the container with timeout wrapping.
-
-        Returns a dict with 'output' and 'returncode' (legacy agent_execute format).
-        """
-        inner_command = command
-        host_timeout = timeout
-        if timeout:
-            host_timeout = timeout + 3
-            safe_cmd = shlex.quote(command)
-            inner_command = f"timeout {timeout}s bash -c {safe_cmd}"
-
-        cmd = ["docker", "exec"]
-        if cwd:
-            cmd.extend(["-w", cwd])
-        cmd.extend([self.name, "bash", "-lc", inner_command])
-
-        try:
-            result = subprocess.run(
-                cmd,
-                text=True,
-                timeout=host_timeout,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-            if timeout and result.returncode == 124:
-                output = result.stdout
-                if output:
-                    output = f"{output} [SYSTEM] Docker command timed out"
-                return {"output": output, "returncode": result.returncode}
-            return {"output": result.stdout, "returncode": result.returncode}
-        except Exception as e:
-            logger.error("Unexpected error running docker command: %s", e)
-            return {"output": str(e), "returncode": -1}
-
     def _run_local(
         self,
         cmd: list[str],
@@ -743,12 +761,18 @@ class Container:
                 capture_output=True,
                 timeout=timeout,
             )
-            stdout = result.stdout
-            stderr = result.stderr
+            stdout = _subprocess_text(result.stdout)
+            stderr = _subprocess_text(result.stderr)
             exit_code = result.returncode
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = f"Timed out after {timeout}s"
+            stdout = _subprocess_text(exc.stdout)
+            partial_stderr = _subprocess_text(exc.stderr).strip()
+            timeout_message = f"Timed out after {timeout}s"
+            stderr = (
+                f"{partial_stderr}\n{timeout_message}"
+                if partial_stderr
+                else timeout_message
+            )
             exit_code = -1
         except Exception as exc:
             stdout = ""

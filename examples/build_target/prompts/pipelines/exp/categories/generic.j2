@@ -1,0 +1,14 @@
+No specialized Web/Pwn profile matched this target. Derive the interaction mode
+from evidence before exploiting.
+
+- Determine how the challenge is actually reached — TCP protocol, local program,
+  crypto oracle, RPC, or custom service — from the frozen environment and the
+  supplied materials, and interact over that exact channel.
+- Identify the intended primitive (the specific weakness the challenge turns on)
+  from the evidence, and build the exploit that exercises it against the live
+  instance. Do not swap in an unintended shortcut.
+- Resolve every instance-specific value (address, key, token, nonce, endpoint)
+  at runtime against the real target; do not reuse a historical constant.
+- Drive the primitive to the intended success signal and capture the
+  harness-provisioned flag from where the live service exposes it — never a
+  value copied from the supplied materials.

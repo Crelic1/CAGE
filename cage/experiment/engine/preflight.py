@@ -28,6 +28,7 @@ Three layers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -41,15 +42,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cage.contracts.exceptions import CageError
+from cage.experiment.engine.agent_chain import check_agent_model_chain
 from cage.contracts.sample_keys import SAMPLE_MAX_ROUNDS_KEY
-from cage.contracts.execution import resolve_max_rounds
+from cage.contracts.execution import CONTAINER_PROXY_SCRIPT_PATH, resolve_max_rounds
 from cage.contracts.style import should_color, style
+from cage.sandbox.containers import DEFAULT_CONTAINER_START_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
+# Preflight is an admission check, not a trial container.  Reusing the runtime's
+# ten-minute startup timeout makes one transient Docker stall look like a hung
+# launch.  Three bounded attempts tolerate daemon jitter while still failing in
+# a few minutes, before any trial is materialized.
+PREFLIGHT_CONTAINER_BOOT_ATTEMPTS = 3
+PREFLIGHT_CONTAINER_BOOT_TIMEOUT = min(DEFAULT_CONTAINER_START_TIMEOUT, 60.0)
+PREFLIGHT_CONTAINER_BOOT_RETRY_DELAY = 2.0
+PREFLIGHT_IMAGE_INSPECT_ATTEMPTS = 3
+PREFLIGHT_IMAGE_INSPECT_TIMEOUT = 30.0
+PREFLIGHT_IMAGE_INSPECT_RETRY_DELAY = 2.0
 
-class PreflightError(RuntimeError):
-    """Raised when a pre-flight check fails."""
+
+class PreflightError(CageError, RuntimeError):
+    """Raised when a pre-flight check fails.
+
+    A ``CageError`` because it is a user-fixable, fully-diagnosed condition —
+    the check already printed which image, endpoint or target is wrong and what
+    to run. The CLI renders those cleanly instead of burying them under a
+    traceback. Kept a ``RuntimeError`` too so existing ``except RuntimeError``
+    callers are unaffected.
+    """
 
 
 @dataclass
@@ -134,39 +156,24 @@ def run_preflight(
                 # corporate-proxy setup). The proxy chain check exercises the
                 # real call path end-to-end.
                 #
-                # Subscription/OAuth mode (``auth_source`` set, no explicit
-                # ``base_url``): the proxy chain CANNOT be validated by a raw
-                # curl. Anthropic only accepts OAuth-subscription tokens from
-                # the real Claude Code CLI (specific user-agent / device
-                # fingerprint); a bare curl with ``Authorization: Bearer ...``
-                # gets a fake ``rate_limit_error: Error`` envelope as an
-                # anti-abuse decoy. The real call path runs through the CLI
-                # inside the trial container, so leave validation to the live
-                # trial and emit a warning here instead of a misleading FAIL.
-                # Use ``cage agent debug --agent claude_code --model <id> --upstream-proxy <p>``
-                # to validate end-to-end before launching a run.
-                _sub_mode = (
-                    bool(getattr(pf_model, "auth_source", ""))
-                    and not pf_model.base_url
+                # Drive the *real* agent CLI, not a curl. A trial's call path is
+                # agent → proxy → model; checking curl → proxy → model verified
+                # a path nothing ever takes and left the agent's own config and
+                # CLI completely unexercised, so a model entry missing a field
+                # the CLI requires passed green here and then failed every trial.
+                #
+                # It also makes subscription/OAuth mode checkable. That case used
+                # to be skipped with a warning because Anthropic only accepts
+                # subscription tokens from the real Claude Code CLI — a bare curl
+                # gets a fake ``rate_limit_error`` anti-abuse decoy. Running the
+                # actual CLI is exactly what that mode needs.
+                _check_agent_chain(
+                    agent=agent,
+                    model=pf_model,
+                    network_mode=config.execution.agent_network_mode,
+                    result=result,
+                    upstream_http_proxy=config.proxy.upstream_http_proxy,
                 )
-                if _sub_mode:
-                    _warn(
-                        "Proxy → Model chain",
-                        result,
-                        "skipped (subscription/OAuth mode): Anthropic rejects raw "
-                        "API calls with subscription tokens; use `cage agent debug "
-                        f"--agent {agent.agent_type.name} --model {pf_model.id} "
-                        f"--upstream-proxy {config.proxy.upstream_http_proxy or '<host:port>'}` "
-                        "to validate end-to-end.",
-                    )
-                else:
-                    _check_proxy_chain(
-                        image=agent.effective_image,
-                        model=pf_model,
-                        network_mode=config.execution.agent_network_mode,
-                        result=result,
-                        upstream_http_proxy=config.proxy.upstream_http_proxy,
-                    )
             else:
                 _check_model_api(pf_model, result)
 
@@ -177,6 +184,7 @@ def run_preflight(
     # its stack tries to come up — looks like a "completed" run with 0 LLM calls.
     if getattr(getattr(config, "target", None), "enabled", False):
         _check_target_images(config, samples, result)
+        _check_sealed_agent_network(config, result)
 
     # ---- Layer 2: Framework-provided, user-enabled ----
     internet_cfg = pf_cfg.get("check_internet")
@@ -325,36 +333,170 @@ def _run_cmd(cmd: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
 
 def _check_image(image: str, result: PreflightResult):
     name = f"Docker image [{image}]"
-    rc, _, _ = _run_cmd(["docker", "image", "inspect", image])
-    if rc == 0:
-        _pass(name, result)
+    rc = -1
+    err = "unknown client error"
+    attempts_used = 0
+    for attempt in range(1, PREFLIGHT_IMAGE_INSPECT_ATTEMPTS + 1):
+        attempts_used = attempt
+        rc, _, err = _run_cmd(
+            ["docker", "image", "inspect", image],
+            timeout=PREFLIGHT_IMAGE_INSPECT_TIMEOUT,
+        )
+        if rc == 0:
+            suffix = (
+                f"attempt={attempt}/{PREFLIGHT_IMAGE_INSPECT_ATTEMPTS}"
+                if attempt > 1 else ""
+            )
+            _pass(name, result, suffix)
+            return
+        if re.search(r"(?:no such image|no such object)", err, re.IGNORECASE):
+            _fail(name, result, "Not found. Run: cage agent build")
+            return
+        if (
+            attempt >= PREFLIGHT_IMAGE_INSPECT_ATTEMPTS
+            or not _container_boot_failure_is_transient(rc, err)
+        ):
+            break
+        logger.warning(
+            "Transient Docker image-inspect failure on attempt %d/%d: %s",
+            attempt,
+            PREFLIGHT_IMAGE_INSPECT_ATTEMPTS,
+            err[:200],
+        )
+        time.sleep(PREFLIGHT_IMAGE_INSPECT_RETRY_DELAY)
+
+    attempts = (
+        f" after {attempts_used} attempts"
+        if attempts_used > 1 else ""
+    )
+    if rc == -1:
+        _fail(
+            name,
+            result,
+            "Docker inspect unavailable: "
+            f"{err[:200] or 'unknown client error'}{attempts}. Check Docker daemon health "
+            "before retrying; this does not prove the image is missing.",
+        )
     else:
-        _fail(name, result, "Not found. Run: cage agent build")
+        _fail(
+            name,
+            result,
+            f"Could not inspect image (docker exit {rc}): "
+            f"{err[:200] or 'no stderr'}{attempts}. "
+            "Check Docker daemon health before retrying.",
+        )
+
+
+def _container_boot_failure_is_transient(rc: int, error: str) -> bool:
+    text = error.lower()
+    if rc == -1 and "timeout" in text:
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "cannot connect to the docker daemon",
+            "context deadline exceeded",
+            "daemon is shutting down",
+            "i/o timeout",
+            "resource temporarily unavailable",
+            "connection reset by peer",
+        )
+    )
 
 
 def _check_container_boot(image: str, network_mode: str | None, result: PreflightResult):
     name = "Container boot"
     import uuid
-    cname = f"cage-preflight-{uuid.uuid4().hex[:8]}"
-    # Defensive: remove any leftover container with this name
-    _run_cmd(["docker", "rm", "-f", cname], timeout=5.0)
-    cmd = ["docker", "run", "-d", "--name", cname]
-    if network_mode:
-        cmd.extend(["--network", network_mode])
-    cmd.extend([image, "sleep", "10"])
+    failures: list[str] = []
+    for attempt in range(1, PREFLIGHT_CONTAINER_BOOT_ATTEMPTS + 1):
+        # Use a fresh name per attempt.  A timed-out create can reach the daemon
+        # after the client exits; reusing the name would turn that late request
+        # into a misleading deterministic name-conflict failure.
+        cname = f"cage-preflight-{uuid.uuid4().hex[:8]}"
+        _run_cmd(["docker", "rm", "-f", cname], timeout=5.0)
+        cmd = ["docker", "run", "-d", "--name", cname]
+        if network_mode:
+            cmd.extend(["--network", network_mode])
+        cmd.extend([image, "sleep", "10"])
 
-    rc, _, err = _run_cmd(cmd, timeout=120.0)
-    if rc != 0:
-        _fail(name, result, f"Failed to start: {err[:200]}")
+        rc, _, err = _run_cmd(cmd, timeout=PREFLIGHT_CONTAINER_BOOT_TIMEOUT)
+        if rc == 0:
+            rc2, _, _ = _run_cmd(
+                ["docker", "exec", cname, "id", "agent"], timeout=5.0
+            )
+            _run_cmd(["docker", "rm", "-f", cname], timeout=10.0)
+            if rc2 != 0:
+                _fail(name, result, "User 'agent' not found in image")
+            else:
+                suffix = (
+                    f", attempt={attempt}/{PREFLIGHT_CONTAINER_BOOT_ATTEMPTS}"
+                    if attempt > 1 else ""
+                )
+                _pass(name, result, f"network={network_mode}{suffix}")
+            return
+
+        # Make a bounded exact cleanup attempt.  The fresh name is retained in
+        # the diagnostic so a later health audit can reap a very-late create.
+        _run_cmd(["docker", "rm", "-f", cname], timeout=10.0)
+        failures.append(f"attempt {attempt} ({cname}): {err[:200]}")
+        if (
+            attempt >= PREFLIGHT_CONTAINER_BOOT_ATTEMPTS
+            or not _container_boot_failure_is_transient(rc, err)
+        ):
+            break
+        logger.warning(
+            "Transient Docker preflight boot failure on attempt %d/%d: %s",
+            attempt,
+            PREFLIGHT_CONTAINER_BOOT_ATTEMPTS,
+            err[:200],
+        )
+        time.sleep(PREFLIGHT_CONTAINER_BOOT_RETRY_DELAY)
+
+    _fail(name, result, "Failed to start preflight container; " + "; ".join(failures))
+
+
+# The probe lives in the sandbox layer next to the proxy it describes; kept
+# importable from here because preflight is where a wrong answer gets caught.
+from cage.sandbox.netproxy import host_holds_address_on  # noqa: E402
+
+
+def _check_sealed_agent_network(config: Any, result: PreflightResult):
+    """Under a sealed isolation policy, the agent's BASE network must be sealed too.
+
+    ``per_trial_bridge_sealed`` only governs the network cage builds for the
+    agent↔target leg. The container also keeps the network it was started on
+    (``runtime.agent_network_mode``), and a stock bridge puts the docker host on
+    that one — one ``curl 172.17.0.1:<port>`` and the seal is decoration. Catch
+    it here, before a whole run believes it was contained.
+    """
+    from cage.target.provisioning import SEALED_TRIAL_BRIDGE
+
+    if getattr(config.target, "agent_network_isolation", "") != SEALED_TRIAL_BRIDGE:
         return
 
-    rc2, _, _ = _run_cmd(["docker", "exec", cname, "id", "agent"], timeout=5.0)
-    if rc2 != 0:
-        _fail(name, result, "User 'agent' not found in image")
-    else:
-        _pass(name, result, f"network={network_mode}")
+    name = "Sealed agent network"
+    remedy = (
+        "create one with: python3 scripts/agent_netproxy.py up "
+        "(it builds the network with inhibit_ipv4 and puts the egress proxy on "
+        "the gateway address)"
+    )
+    network = config.execution.agent_network_mode or "bridge"
+    if network == "host":
+        _fail(name, result, f"runtime.agent_network_mode=host shares the host netns; {remedy}")
+        return
 
-    _run_cmd(["docker", "rm", "-f", cname], timeout=10.0)
+    host_on = host_holds_address_on(network)
+    if host_on is None:
+        _fail(name, result, f"cannot determine whether the host is on network {network!r}")
+    elif host_on:
+        _fail(
+            name, result,
+            f"the host holds an address on {network}'s bridge, so the agent can "
+            f"reach it (sshd, the inspector, other runs' published ports) and the "
+            f"sealed per-trial bridge buys nothing; {remedy}",
+        )
+    else:
+        _pass(name, result, f"host is not on {network}")
 
 
 def _check_model_api(model: Any, result: PreflightResult):
@@ -438,6 +580,161 @@ def _validate_proxy_response(body: str, *, curl_exit: int) -> tuple[bool, str]:
     return True, ""
 
 
+def _check_agent_chain(
+    *,
+    agent: Any,
+    model: Any,
+    network_mode: str | None,
+    result: PreflightResult,
+    upstream_http_proxy: str = "",
+):
+    """Verify agent → proxy → model end-to-end, skipping repeats via fingerprint.
+
+    Split by determinism, which is what makes the cache safe:
+
+    * **Whether this agent can drive this config** depends only on the image and
+      the generated config — both captured by the fingerprint — so once proven
+      it stays proven, and a repeat run pays nothing.
+    * **Whether the endpoint is up, authorized and in credit** depends on the
+      outside world and is *never* cached. ``_check_model_api`` covers it on
+      every run.
+
+    Caching the whole thing would silently skip the one check that catches an
+    expired key or an exhausted quota — the failure mode this preflight already
+    catches today.
+    """
+
+    name = "Agent → Proxy → Model chain"
+    fingerprint = _agent_chain_fingerprint(
+        agent=agent, model=model, network_mode=network_mode,
+        upstream_http_proxy=upstream_http_proxy,
+    )
+    if fingerprint and _chain_check_is_cached(fingerprint):
+        _pass(
+            name, result,
+            "cached — image and config unchanged since it last passed "
+            "(endpoint health is still checked separately)",
+        )
+        return
+
+    try:
+        outcome = check_agent_model_chain(
+            agent,
+            model=model,
+            image=getattr(agent, "effective_image", "") or "",
+            network_mode=network_mode,
+            upstream_http_proxy=upstream_http_proxy,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The agent-driven check itself broke — a bug on our side, not a verdict
+        # on the user's config. Blocking a run on that would be wrong, so fall
+        # back to the older curl-based check: it verifies less (it cannot see
+        # the agent's own config or CLI) but it is long-proven, and a partial
+        # gate beats an accidental one. This path is also the signal that the
+        # new check needs fixing for that agent.
+        logger.warning("agent chain check failed to run, falling back to curl: %s", exc)
+        _warn(name, result, f"agent-driven check unavailable ({str(exc)[:200]}); using curl")
+        _check_proxy_chain(
+            image=getattr(agent, "effective_image", "") or "",
+            model=model,
+            network_mode=network_mode,
+            result=result,
+            upstream_http_proxy=upstream_http_proxy,
+        )
+        return
+
+    if outcome.ok:
+        _pass(name, result, outcome.summary())
+        if fingerprint:
+            _remember_chain_check(fingerprint)
+    else:
+        _fail(name, result, outcome.summary())
+
+
+def _agent_chain_fingerprint(
+    *,
+    agent: Any,
+    model: Any,
+    network_mode: str | None,
+    upstream_http_proxy: str,
+) -> str:
+    """Identity of "this agent, this image, this config" — "" if it can't be taken.
+
+    Includes the image's **content id**, not its tag: a rebuilt ``:latest``
+    carries a new agent CLI, and a cache keyed on the tag would keep vouching
+    for a version that no longer exists. Resolving it is one ``docker image
+    inspect``; when that fails we return "" and the check simply always runs.
+    """
+
+    rc, out, _ = _run_cmd([
+        "docker", "image", "inspect", "--format", "{{.Id}}",
+        getattr(agent, "effective_image", "") or "",
+    ], timeout=15.0)
+    if rc != 0 or not out.strip():
+        return ""
+    parts = [
+        out.strip(),
+        str(getattr(agent.agent_type, "name", "")),
+        str(getattr(agent, "version", "")),
+        str(getattr(agent, "home", "")),
+        ",".join(sorted(getattr(agent, "plugins", []) or [])),
+        str(getattr(agent, "skill", "")),
+        str(getattr(agent, "context_compaction_threshold", "")),
+        str(network_mode or ""),
+        str(bool(upstream_http_proxy)),
+        # Model fields that shape the generated agent config / request.
+        str(getattr(model, "id", "")),
+        str(getattr(model, "model", "")),
+        str(getattr(model, "base_url", "")),
+        str(getattr(model, "protocol", "")),
+        str(getattr(model, "max_context_size", "")),
+        str(getattr(model, "reserved_context_size", "")),
+        str(getattr(model, "auth_source", "")),
+        json.dumps(getattr(model, "extra", {}) or {}, sort_keys=True),
+    ]
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
+
+
+def _chain_check_cache_path() -> Path:
+    return Path.home() / ".cache" / "cage" / "agent_chain_checks.json"
+
+
+def _chain_check_is_cached(fingerprint: str) -> bool:
+    """True when this exact agent+image+config already passed before."""
+
+    try:
+        data = json.loads(_chain_check_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and fingerprint in (data.get("passed") or {})
+
+
+def _remember_chain_check(fingerprint: str) -> None:
+    """Record a passing fingerprint. Best-effort — a lost write only costs time."""
+
+    path = _chain_check_cache_path()
+    try:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        passed = data.get("passed")
+        if not isinstance(passed, dict):
+            passed = {}
+        passed[fingerprint] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # Keep the file from growing without bound across months of image
+        # rebuilds; the oldest entries are the least likely to be re-used.
+        if len(passed) > 200:
+            passed = dict(sorted(passed.items(), key=lambda kv: kv[1])[-200:])
+        data["passed"] = passed
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.debug("chain-check cache not written: %s", exc)
+
+
 def _check_proxy_chain(
     image: str,
     model: Any,
@@ -464,16 +761,15 @@ def _check_proxy_chain(
     # timeout. Removed in ``finally`` regardless.
     cmd.extend([image, "sleep", "240"])
 
-    rc, _, err = _run_cmd(cmd, timeout=120.0)
+    rc, _, err = _run_cmd(cmd, timeout=DEFAULT_CONTAINER_START_TIMEOUT)
     if rc != 0:
         _fail(name, result, f"Container failed: {err[:200]}")
         return
 
     try:
-        # Copy proxy + write config
-        proxy_src = str(Path(__file__).parent / "proxy" / "sidecar.py")
-        _run_cmd(["docker", "cp", proxy_src, f"{cname}:/opt/cage-proxy/container_proxy.py"],
-                 timeout=30.0)
+        # Write config. The proxy binary is whatever the image baked into
+        # /opt/cage-proxy/container_proxy.py (the COPY in docker/*/Dockerfile);
+        # preflight starts that baked copy as-is.
 
         # Subscription/OAuth fallback: the agent launch path uses the same rule —
         # when ``auth_source`` is set and no explicit ``base_url``, the
@@ -512,7 +808,7 @@ def _check_proxy_chain(
 
         # Start proxy as agent
         _run_cmd(["docker", "exec", "-d", "-u", "agent", cname, "bash", "-c",
-                   f"python3 /opt/cage-proxy/container_proxy.py --port {proxy_port} "
+                   f"python3 {CONTAINER_PROXY_SCRIPT_PATH} --port {proxy_port} "
                    f"--config /tmp/pc.json --log-dir /tmp/pl "
                    f">/tmp/pl/stdout.log 2>/tmp/pl/stderr.log"])
         time.sleep(3)

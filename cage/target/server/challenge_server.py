@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 try:
@@ -54,7 +54,10 @@ from cage.target.server.health_probes import (  # noqa: F401
 from cage.target.server.cleanup import (  # noqa: F401
     _cleanup_instance_impl,
     cleanup_instance,
+    has_resources_for_cage_run_id,
+    purge_by_cage_run_id,
 )
+from cage.target.server import launch_ops
 from cage.target.server.launch import (  # noqa: F401
     _launch_challenge_impl,
     _reused_launch_response,
@@ -67,6 +70,7 @@ from cage.target.server.launch_workflow import (  # noqa: F401
     parse_internal_port,
     pydantic_to_dict,
 )
+from cage.contracts.challenge import range_objectives
 from cage.target.server.network_debug import build_network_debug  # noqa: F401
 from cage.target.server.network_admin import (  # noqa: F401
     _has_active_endpoints_error,
@@ -85,18 +89,31 @@ from cage.target.server.schemas import (  # noqa: F401
     ChallengeSummary,
     EntryUrl,
     InstanceSummary,
+    LaunchOpRequest,
+    LaunchOpStatus,
     LaunchResponse,
     PromptResponse,
+    RescoreOpStatus,
+    RescoreRequest,
     ServiceInfo,
     StopResponse,
     SubmitResponse,
+    epoch_to_rfc3339,
 )
+from cage.target.server import rescore, rescore_ops
 from cage.target.server.submit import (
     SubmissionError,
     render_task_prompt,
     score_submission,
 )
 from cage.target.server.network_debug import _build_entry_urls, build_container_addrs
+from cage.target.server.public_access import (
+    default_network_only,
+    instance_expired,
+    instance_is_public,
+    resolve_public_host,
+    ttl_remaining_s,
+)
 from cage.target.server.server_state import (  # noqa: F401
     BASE_DIR,
     BENCHMARK_ROOT,
@@ -132,7 +149,29 @@ from cage.target.server.server_state import (  # noqa: F401
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="target_server server")
+# The serve API's own contract version — deliberately NOT the Python package
+# version. ``info.version`` describes the HTTP contract a client codes against,
+# and tying it to the distribution would both mis-describe it and make the
+# committed schema (docs/openapi.json) depend on whether cage happens to be
+# pip-installed in whoever regenerates it. Bump on a breaking change to the
+# endpoints or their payloads; the repo versions its other contracts the same
+# way (see ``serve_log.SCHEMA_VERSION``).
+SERVE_API_VERSION = "1"
+
+app = FastAPI(
+    title="Cage target server",
+    version=SERVE_API_VERSION,
+    description=(
+        "Serve (PULL) mode: an external agent lists challenges, launches an "
+        "isolated target instance, attacks it, and submits its output for "
+        "scoring — with no Cage-managed agent runtime.\n\n"
+        "Endpoints are audience-gated: loopback callers are internal; "
+        "non-loopback callers need `Authorization: Bearer <token>` when the "
+        "server was started with `--external-token`.\n\n"
+        "See `docs/serve-external-audience.md` in the Cage repo for the "
+        "narrative contract, deployment model and worked examples."
+    ),
+)
 
 # Self-contained management console (single HTML file, no build step, no CDN).
 # Served at ``GET /`` so ``cage serve`` gives an operator a browsable target
@@ -240,6 +279,10 @@ async def monitor_instances():
                         # instance was originally launched with so bind-IPs survive
                         # the restart.
                         restart_audience = str(info.get("audience") or "internal").lower()
+                        # Preserve the instance's publish intent across the
+                        # restart: a published instance re-publishes, a
+                        # network-only one stays network-only.
+                        restart_network_only = not bool(info.get("public_intent"))
                         if instance_key != chal_id:
                             await asyncio.to_thread(cleanup_instance, chal_id, instance_key)
                             await asyncio.to_thread(
@@ -247,6 +290,7 @@ async def monitor_instances():
                                 chal_id=chal_id,
                                 force_recreate=False,
                                 audience=restart_audience,
+                                network_only=restart_network_only,
                             )
                         else:
                             await asyncio.to_thread(
@@ -254,6 +298,7 @@ async def monitor_instances():
                                 chal_id=chal_id,
                                 force_recreate=True,
                                 audience=restart_audience,
+                                network_only=restart_network_only,
                             )
                         logger.info(f"[Monitor] ✅ Instance {instance_key} successfully restarted.")
                     except Exception as e:
@@ -264,6 +309,48 @@ async def monitor_instances():
             break
         except Exception as e:
             logger.error(f"[Monitor] Unexpected error in monitor loop: {e}")
+            await asyncio.sleep(5)
+
+
+async def reap_expired_instances():
+    """Background task: tear down instances whose ``?ttl=`` lease has run out.
+
+    A lease is declared per launch, because how long a target is needed is a
+    property of the attempt, not of the server. Without a reaper the lease would
+    be decoration — and on an external-access server it is load-bearing: host
+    -published slots are capped, so one agent that launches and walks away would
+    otherwise block every other agent until the server restarts.
+
+    In-flight instances are skipped: an instance still launching has not started
+    its lease (``created_at`` is re-stamped when it goes ``running``), and one
+    already stopping is somebody else's job.
+    """
+    interval = max(1.0, float(_server_state.INSTANCE_REAP_INTERVAL_S))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            for instance_key in snapshot_running_instance_ids():
+                info = get_running_instance(instance_key)
+                if info is None or not instance_expired(info):
+                    continue
+                lifecycle_state = str(info.get("lifecycle_state", "") or "").strip().lower()
+                if lifecycle_state != "running":
+                    continue
+                chal_id = str(info.get("chal_id") or instance_key)
+                logger.info(
+                    "[Reaper] Instance %s (challenge %s) reached its %ss lease; removing.",
+                    instance_key, chal_id, info.get("ttl_s"),
+                )
+                update_running_instance(instance_key, lifecycle_state="stopping")
+                try:
+                    await asyncio.to_thread(cleanup_instance, chal_id, instance_key)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("[Reaper] Failed to remove %s: %s", instance_key, exc)
+        except asyncio.CancelledError:
+            logger.info("[Reaper] Task cancelled, stopping.")
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Reaper] Unexpected error: %s", exc)
             await asyncio.sleep(5)
 
 
@@ -361,6 +448,11 @@ async def startup_event():
     ensure_docker_network()
     asyncio.create_task(asyncio.to_thread(_startup_gc_namespace_scoped))
     asyncio.create_task(monitor_instances())
+    asyncio.create_task(reap_expired_instances())
+    # Reconcile durable launch operations against Docker after a restart: finish
+    # interrupted teardowns, re-drive interrupted launches, leave terminal ones.
+    # Runs in a thread — it may purge docker resources and re-enqueue work.
+    asyncio.create_task(asyncio.to_thread(launch_ops.get_orchestrator().reconcile_on_startup))
 
 
 @app.on_event("shutdown")
@@ -373,6 +465,7 @@ async def shutdown_event():
         with running_instances_lock:
             running_instances.clear()
 
+    launch_ops.get_orchestrator().shutdown()
     await asyncio.to_thread(_remove_own_docker_network)
 
 
@@ -428,24 +521,33 @@ def stop_challenge(
 @app.get("/launch/{chal_id}", response_model=LaunchResponse)
 def launch_challenge(
     chal_id: str,
+    request: Request = None,  # type: ignore[assignment]
     force_recreate: Annotated[bool, Query(description="If true, shutdown existing instance and create a fresh one.")] = False,
     parallel_mode: Annotated[Optional[str], Query(description="Parallelization strategy: network or alias.")] = None,
     target_scope: Annotated[Optional[str], Query(description="Target allocation scope: per_challenge or per_agent.")] = None,
     network_mode: Annotated[Optional[str], Query(description="Compose launch mode: compose_project_local or shared_external. Experiment default; challenge.json wins if it declares one.")] = None,
     exposure_mode: Annotated[Optional[str], Query(description="Service exposure: host_ports or internal. Experiment default; challenge.json wins if it declares one. Independent of network_only.")] = None,
     cage_run_id: Annotated[Optional[str], Query(description="Cage-side run id. Stamped as cage.run_id label on every container/network.")] = None,
-    network_only: Annotated[Optional[bool], Query(description="Keep user-facing targets on the docker network only (no host port), so a scanning agent can't reach them via localhost — reach them via the returned container_addr. Default: on. Pass network_only=false to opt one launch back into host-published entry_urls.")] = None,
+    network_only: Annotated[Optional[bool], Query(description="Keep this target on the docker network only (no host port) — reach it via the returned container_addr. Default: on for a normal server, OFF on a --public-host server (which publishes every launch's declared entry). Pass network_only=true to keep one launch off the host even on a --public-host server; network_only=false to host-publish one launch on a normal server.")] = None,
     prompt_level: Annotated[Optional[str], Query(description="Hint tier (l0/l1/l2) bound to THIS instance for GET /prompt. l0 = no hints; l1/l2 progressively reveal vuln location / topology. Default: the server's --prompt-level. Set per-launch so instances on one server can differ without restarting serve.")] = None,
+    ttl: Annotated[Optional[int], Query(description="Lease in seconds: reap this instance automatically once it expires. Declared per launch because how long a target is needed is a property of the attempt, not of the server. Omit to run until DELETEd. On an external-access server the lease is what stops an agent that walks away from holding a host-published slot forever.")] = None,
     audience: str = Depends(resolve_audience),
 ):
-    # Network-only by default: an agent reaches a target over the isolated docker
-    # network at its container_addr — never a host port — so a scanning agent can't
-    # reach a target (its own or another's) via localhost/host. Host access is
-    # forbidden entirely (target.use_external_access raises at config load), so this
-    # holds for cage-run and serve-only alike. An explicit ?network_only=false can
-    # still opt a single launch back into host-published entry_urls.
+    # Network-only by default so an agent reaches a target over the isolated
+    # docker network at its container_addr, never a host port. On a
+    # ``--public-host`` server the default flips to PUBLISH — for every launch,
+    # not just off-host callers: such a server is dedicated to serving off-host
+    # agents (cage run never sets --public-host, so its trials stay network-only
+    # regardless). Neither the caller's address nor the bearer token enters into
+    # it. An explicit ?network_only= always wins.
     if network_only is None:
-        network_only = True
+        network_only = default_network_only()
+
+    # The address to advertise in entry_urls. Derived from the address THIS caller
+    # just reached us at, unless the operator pinned one with --public-host.
+    public_host, public_host_source = resolve_public_host(
+        request.headers.get("host", "") if request is not None else ""
+    )
 
     # Hint tier is bound to the instance at LAUNCH (read back by GET /prompt), so
     # varying it per launch never needs a serve restart. ``--prompt-level`` is the
@@ -475,6 +577,9 @@ def launch_challenge(
             audience=audience,
             network_only=network_only,
             prompt_level=effective_prompt_level,
+            public_host=public_host,
+            public_host_source=public_host_source,
+            ttl_s=ttl,
         )
 
     lock = challenge_locks.get_lock(chal_id)
@@ -497,6 +602,9 @@ def launch_challenge(
                     audience=audience,
                     network_only=network_only,
                     prompt_level=effective_prompt_level,
+                    public_host=public_host,
+                    public_host_source=public_host_source,
+                    ttl_s=ttl,
                 )
 
         result = recovery_coordinator.run_serialized_recovery(
@@ -508,7 +616,13 @@ def launch_challenge(
             existing_instance = get_running_instance(chal_id)
             if existing_instance and is_instance_healthy(chal_id):
                 logger.info("Reusing recently recovered instance for %s", chal_id)
-                return _reused_launch_response(chal_id, existing_instance, audience=audience)
+                return _reused_launch_response(
+                    chal_id,
+                    existing_instance,
+                    audience=audience,
+                    public_host=public_host,
+                    public_host_source=public_host_source,
+                )
             with lock:
                 return _launch_challenge_impl(
                     chal_id=chal_id,
@@ -521,6 +635,9 @@ def launch_challenge(
                     audience=audience,
                     network_only=network_only,
                     prompt_level=effective_prompt_level,
+                    public_host=public_host,
+                    public_host_source=public_host_source,
+                    ttl_s=ttl,
                 )
         return result
 
@@ -536,7 +653,171 @@ def launch_challenge(
             audience=audience,
             network_only=network_only,
             prompt_level=effective_prompt_level,
+            public_host=public_host,
+            public_host_source=public_host_source,
+            ttl_s=ttl,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Asynchronous, idempotent launch operations (issue #4)
+# --------------------------------------------------------------------------- #
+# Wire the orchestrator to the real provisioning/health/cleanup functions. Done
+# here (not at launch_ops import) so the module stays free of a hard import cycle.
+launch_ops.configure(
+    provision=_launch_challenge_impl,
+    health=is_instance_healthy,
+    get_instance=get_running_instance,
+    load_challenges=load_all_challenges,
+    render_prompt=render_task_prompt,
+    cleanup_instance=cleanup_instance,
+    purge_by_run_id=purge_by_cage_run_id,
+    has_resources=has_resources_for_cage_run_id,
+)
+
+
+def _launch_op_params(req: LaunchOpRequest, request: Request, audience: str) -> dict:
+    """Freeze everything provisioning needs into the durable op record.
+
+    ``audience`` and the advertised ``public_host`` are captured HERE, from this
+    request, because the actual provisioning runs later on a worker thread with
+    no request in scope.
+    """
+    public_host, public_host_source = resolve_public_host(
+        request.headers.get("host", "") if request is not None else ""
+    )
+    network_only = req.network_only
+    if network_only is None:
+        network_only = default_network_only()
+    return {
+        "cage_run_id": req.cage_run_id,
+        "challenge_id": req.challenge_id,
+        "target_scope": req.target_scope,
+        "network_only": bool(network_only),
+        "prompt_level": _normalize_prompt_level(req.prompt_level, _resolve_prompt_level()),
+        "parallel_mode": req.parallel_mode,
+        "network_mode": req.network_mode,
+        "exposure_mode": req.exposure_mode,
+        "ttl": req.ttl,
+        "audience": audience,
+        "public_host": public_host,
+        "public_host_source": public_host_source,
+    }
+
+
+@app.post("/launches", response_model=LaunchOpStatus)
+def create_launch(
+    req: LaunchOpRequest,
+    response: Response,
+    request: Request = None,  # type: ignore[assignment]
+    audience: str = Depends(resolve_audience),
+):
+    """Accept a launch as a durable async operation — the orchestration-safe path.
+
+    Provisioning (minutes for a multi-host range) runs in the background; this
+    returns immediately. The operation id is ``cage_run_id``, so the call is
+    idempotent: a repeat with the same params returns the same operation and
+    never builds a second container set (``202`` while pending, ``200`` with the
+    terminal representation once ready/failed/closed); a repeat with different
+    params is ``409``. Poll ``status_url`` (honouring ``Retry-After``) until
+    ``ready`` — which guarantees a non-empty ``run_id``, a reachable target
+    address, and a non-empty ``task_prompt``. See ``GET /launches/{id}``.
+    """
+    if not str(req.cage_run_id or "").strip():
+        raise HTTPException(400, "cage_run_id is required (it is the launch operation's id)")
+    if not str(req.challenge_id or "").strip():
+        raise HTTPException(400, "challenge_id is required")
+    try:
+        load_all_challenges()  # surface a bad registry early
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"challenge registry unavailable: {exc}")
+
+    orch = launch_ops.get_orchestrator()
+    params = _launch_op_params(req, request, audience)
+    try:
+        op, created = orch.submit(req.cage_run_id, params)
+    except launch_ops.LaunchOpError as exc:
+        raise HTTPException(exc.http_status, {"error": exc.code, "message": exc.message})
+
+    # 202 while the op is still doing work (new or a pending duplicate); 200 once
+    # a duplicate POST finds an already-terminal operation.
+    response.status_code = 202 if (created or op.is_pending()) else 200
+    view = launch_ops.status_view(op)
+    response.headers["Location"] = view["status_url"]
+    if "retry_after" in view:
+        response.headers["Retry-After"] = str(view["retry_after"])
+    return view
+
+
+@app.get("/launches/{launch_id}", response_model=LaunchOpStatus)
+def get_launch(launch_id: str, _audience: str = Depends(resolve_audience)):
+    """The one authoritative representation of a launch operation.
+
+    ``status`` walks ``queued → starting → ready | failed`` (and ``… → closing →
+    closed`` on cancel). While pending, ``200`` carries ``status`` +
+    ``retry_after``; a terminal *operation* failure is still ``200`` with
+    ``status=failed`` (the query itself succeeded). Only auth/'"unknown id"'
+    are non-200 (401/404). A ``ready`` body carries the full ``result``.
+    """
+    op = launch_ops.get_orchestrator().store.get(launch_id)
+    if op is None:
+        raise HTTPException(404, f"no launch operation with id {launch_id!r}")
+    return launch_ops.status_view(op)
+
+
+@app.delete("/launches/{launch_id}", response_model=LaunchOpStatus)
+def cancel_launch(launch_id: str, response: Response,
+                  _audience: str = Depends(resolve_audience)):
+    """Idempotently cancel + tear down a launch operation.
+
+    Works in ``queued``, ``starting``, and ``ready`` — crucially even before an
+    internal ``run_id`` exists (the case the ``run_id``-keyed ``DELETE /launch``
+    cannot handle): teardown also purges any docker resources tagged with this
+    ``cage_run_id``. Reaches ``closed`` only once containers/networks are
+    confirmed gone.
+
+    When cleanup cannot finish in the request — a provisioning worker is still
+    in flight, or a first teardown left resources behind — this returns ``202``
+    with ``status=closing``; poll the status URL (honouring ``Retry-After``)
+    until ``200`` with ``status=closed``. Repeating it is idempotent throughout.
+    """
+    op = launch_ops.get_orchestrator().cancel(launch_id)
+    if op is None:
+        raise HTTPException(404, f"no launch operation with id {launch_id!r}")
+    response.status_code = 202 if op.status == launch_ops.CLOSING else 200
+    view = launch_ops.status_view(op)
+    if "retry_after" in view:
+        response.headers["Retry-After"] = str(view["retry_after"])
+    return view
+
+
+def _challenge_objectives(source_fields: dict) -> tuple[int, str]:
+    """How many objectives a challenge is scored out of, and what one is called.
+
+    A result's progress is ``achieved / objectives``, but the unit depends on the
+    task's shape: a single-target app declares one objective per vulnerability, a
+    multi-host range one per *host* it is possible to own. This must agree with
+    what the scorer divides by, or a caller sees a denominator that never
+    matches the score it later reads.
+
+    A range's marker stages are not the count. Several stages can belong to one
+    host (a user shell and then root), and a stage whose kind proves no
+    ownership — a file read on a host with no execution path at all — is not an
+    objective a run can ever complete. Counting stages would therefore advertise
+    a denominator larger than the reachable one.
+
+    Returns ``(0, "")`` when the challenge declares no objectives.
+    """
+    vulnerabilities = source_fields.get("vulnerabilities")
+    if isinstance(vulnerabilities, list) and vulnerabilities:
+        return len(vulnerabilities), "vulnerability"
+
+    stages = source_fields.get("marker_stages")
+    if isinstance(stages, list) and stages:
+        declared, _ = range_objectives(stages)
+        if declared:
+            return len(declared), "host"
+    return 0, ""
 
 
 @app.get("/challenges", response_model=list[ChallengeSummary])
@@ -549,8 +830,16 @@ def list_challenges(
 
     Strictly excludes flag, verify scripts, ``agent_input``, and any
     ``source_fields`` content. ``entry_service_count`` is the number of
-    user-facing entry services declared via ``application_service_keys``
-    (1 for web challenges, 2 for post-exploitation with web+jump host, etc.).
+    user-facing entry services (web challenges declare them as
+    ``application_service_keys``, post-exploitation ranges as ``entry_services``):
+    1 for a single-entry web challenge, 2+ for a multi-entry range.
+
+    ``objective_count`` is what a result is scored out of, available here BEFORE
+    anything is launched, with ``objective_kind`` naming the unit
+    (``vulnerability`` / ``marker``). It is the same number the scorer later
+    reports as ``objective_total``. Note that it is NOT ``entry_service_count``:
+    a range can publish more entry services than it has objectives.
+
     Authentication is the same as ``/launch``: loopback OR bearer token.
     """
     try:
@@ -570,9 +859,18 @@ def list_challenges(
         if category_filter and cat != category_filter:
             continue
         source_fields = meta.get("source_fields", {}) or {}
-        entry_keys = source_fields.get("application_service_keys") or []
+        # Web challenges declare their user-facing entries as
+        # ``application_service_keys``; post-exploitation ranges declare them as
+        # ``entry_services``. Fall back the same way ``submit._challenge_task``
+        # does so ``entry_service_count`` reflects post ranges (2+), not 0.
+        entry_keys = (
+            source_fields.get("application_service_keys")
+            or source_fields.get("entry_services")
+            or []
+        )
         if isinstance(entry_keys, str):
             entry_keys = [entry_keys]
+        objective_count, objective_kind = _challenge_objectives(source_fields)
         results.append(ChallengeSummary(
             id=str(chal_id),
             name=str(meta.get("name") or chal_id),
@@ -581,6 +879,8 @@ def list_challenges(
             description=str(meta.get("description") or meta.get("task") or ""),
             task_profile=str(meta.get("task_profile") or ""),
             entry_service_count=len([k for k in entry_keys if k]),
+            objective_count=objective_count,
+            objective_kind=objective_kind,
         ))
     results.sort(key=lambda item: (item.benchmark, item.id))
     return results
@@ -592,6 +892,8 @@ def _project_instance(
     audience: str,
     challenges: dict,
     probe_health: bool,
+    public_host: str = "",
+    public_host_source: str = "",
 ) -> InstanceSummary:
     """Project a running-instance registry dict into a public-safe summary.
 
@@ -604,17 +906,25 @@ def _project_instance(
     chal_id = str(info.get("chal_id") or "")
     run_id = str(info.get("run_id") or "")
     meta = challenges.get(chal_id, {}) or {}
+    # The registry keeps epoch seconds (arithmetic wants a number); the wire
+    # carries RFC 3339 (readers want a timestamp). Compute uptime from the raw
+    # value, then format for output — never the other way round.
     created_at = info.get("created_at")
     uptime = (time.time() - created_at) if isinstance(created_at, (int, float)) else None
 
     services = info.get("services") or []
     entry_keys = set(info.get("entry_service_keys") or [])
     entry_urls: list[EntryUrl] = []
-    if audience == "external":
+    entry_url_source = ""
+    if instance_is_public(info):
+        advertise_host = public_host
+        entry_url_source = public_host_source
+        if not advertise_host:
+            advertise_host, entry_url_source = resolve_public_host("")
         entry_urls = _build_entry_urls(
             services=services,
             entry_service_keys=entry_keys,
-            host_ip=HOST_IP,
+            host_ip=advertise_host,
         )
 
     healthy: Optional[bool] = None
@@ -634,19 +944,24 @@ def _project_instance(
         cage_run_id=str(info.get("cage_run_id") or ""),
         lifecycle_state=str(info.get("lifecycle_state") or ""),
         healthy=healthy,
-        created_at=created_at if isinstance(created_at, (int, float)) else None,
+        created_at=epoch_to_rfc3339(created_at),
         uptime_s=round(uptime, 1) if uptime is not None else None,
         network_name=info.get("network_name"),
         network_subnet=info.get("network_subnet"),
         network_gateway=info.get("network_gateway"),
         service_count=len(services),
         entry_urls=entry_urls,
+        entry_url_source=entry_url_source if entry_urls else "",
+        public=instance_is_public(info),
+        ttl_s=info.get("ttl_s"),
+        ttl_remaining_s=ttl_remaining_s(info),
         container_addr=build_container_addrs(services, entry_keys),
     )
 
 
 @app.get("/instances", response_model=list[InstanceSummary])
 def list_instances(
+    request: Request = None,  # type: ignore[assignment]
     probe: Annotated[bool, Query(description="Run a live per-instance docker health check (slower). Default: report only the cached lifecycle_state.")] = False,
     audience: str = Depends(resolve_audience),
 ):
@@ -662,6 +977,9 @@ def list_instances(
     except Exception:
         challenges = {}
 
+    public_host, public_host_source = resolve_public_host(
+        request.headers.get("host", "") if request is not None else ""
+    )
     summaries: list[InstanceSummary] = []
     for key in snapshot_running_instance_ids():
         info = get_running_instance(key)
@@ -669,11 +987,54 @@ def list_instances(
             continue
         summaries.append(
             _project_instance(
-                info, audience=audience, challenges=challenges, probe_health=probe
+                info,
+                audience=audience,
+                challenges=challenges,
+                probe_health=probe,
+                public_host=public_host,
+                public_host_source=public_host_source,
             )
         )
     summaries.sort(key=lambda s: (s.chal_id, s.run_id))
     return summaries
+
+
+async def _read_upload_capped(upload: UploadFile, content_length: str = "") -> bytes:
+    """Read an uploaded archive, refusing anything over the size cap.
+
+    The body is read into memory to be unpacked, so "however big the caller
+    sent" is a memory lever any caller can pull. A declared ``Content-Length``
+    over the cap is rejected before a byte is read; a lying or absent one is
+    caught while streaming.
+    """
+    limit = int(_server_state.MAX_SUBMIT_UPLOAD_BYTES)
+    if limit <= 0:
+        return await upload.read()
+
+    def _too_large(size_hint: str) -> HTTPException:
+        return HTTPException(
+            status_code=413,
+            detail=(
+                f"agent_output exceeds the {limit} byte upload limit ({size_hint}). "
+                "Submit only the final_answer/ reports, not the whole workspace."
+            ),
+        )
+
+    declared = str(content_length or "").strip()
+    if declared.isdigit() and int(declared) > limit:
+        raise _too_large(f"Content-Length {declared}")
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise _too_large(f"body exceeded it after {total} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _safe_extract_upload(raw: bytes, dest: Path) -> None:
@@ -766,7 +1127,7 @@ async def submit_challenge(
     request: Request,
     agent_output: Annotated[
         Optional[UploadFile],
-        File(description="tar.gz/zip of the agent output dir (its final_answer/ holds per-vuln reports). Omit for marker-only post-exploitation challenges."),
+        File(description="tar.gz/zip of the agent output dir (its final_answer/ holds per-vuln reports). Omit for marker-only post-exploitation challenges. Bodies over the server's upload limit (1 GiB default) are rejected with 413."),
     ] = None,
     close: Annotated[bool, Query(description="Tear the instance down (DELETE) after scoring. Default: keep it up (e.g. for inspection). One submission per instance either way.")] = False,
     label: Annotated[str, Query(description="Optional human-friendly name for this submission's record, for easy lookup (prefixes the .cage_serve dir). Not an identity — may be empty or repeat.")] = "",
@@ -815,7 +1176,13 @@ async def submit_challenge(
     workdir = Path(tempfile.mkdtemp(prefix="cage_submit_"))
     try:
         if agent_output is not None:
-            _safe_extract_upload(await agent_output.read(), workdir)
+            _safe_extract_upload(
+                await _read_upload_capped(
+                    agent_output,
+                    request.headers.get("content-length", "") if request is not None else "",
+                ),
+                workdir,
+            )
         try:
             result = score_submission(
                 run_id=run_id,
@@ -855,9 +1222,106 @@ async def submit_challenge(
     )
 
 
+def _serve_roots() -> list[Path]:
+    """The ``.cage_serve`` trees this server's submissions live in."""
+    try:
+        challenges = load_all_challenges()
+    except Exception:  # noqa: BLE001 — lookup must survive a bad registry
+        challenges = {}
+    return rescore.discover_serve_roots(challenges, BENCHMARK_ROOT)
+
+
+def _resolve_rescore_judge(models: list[str]) -> Optional[dict]:
+    """Judge config for a re-judge: the caller's models, else the server's."""
+    named = [m.strip() for m in (models or []) if str(m).strip()]
+    if named:
+        return {"models": named}
+    return _resolve_submit_judge()
+
+
+def _locate_submission_or_404(run_id: str):
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        raise HTTPException(400, "run_id is required")
+    found = rescore.locate_submission(run_id, _serve_roots())
+    if found is None:
+        raise HTTPException(404, f"no scored submission for run_id={run_id!r}")
+    return found
+
+
+@app.post("/rescores", response_model=RescoreOpStatus, status_code=202)
+def create_rescore(
+    req: RescoreRequest,
+    response: Response,
+    _audience: str = Depends(resolve_audience),
+):
+    """Re-judge an already-scored submission, offline, as a background operation.
+
+    Scoring a submission has two halves. The verifier half ran against the live
+    target and is frozen on disk; the ``LLM_judge`` half is a model call, and a
+    model call can fail for reasons that say nothing about the agent — an
+    expired key, a rate limit, a model swapped out. This re-runs the judge half
+    over the frozen inputs and appends the result as a new scoring pass.
+
+    No instance needs to be alive: the findings and the verifier evidence were
+    persisted at submit time precisely so this could happen later.
+
+    The agent-facing "one submission per instance" rule is untouched — this
+    changes no findings, only how they were judged. Every pass is retained, and
+    the response reports ``grader_drift`` when the verifier scripts themselves
+    have changed since grading, because no re-judge can account for that.
+    """
+    # No findings-based gate. Re-scoring runs the benchmark's whole ``score()``,
+    # not just the judge, and a scorer that consumes no agent findings still has
+    # something to recompute: a marker-based post-exploitation range scores
+    # purely from the frozen evidence, so re-running it picks up any later fix to
+    # that scoring logic. Refusing those submissions blocked exactly the case
+    # offline re-scoring is most useful for. Whether a submission has anything to
+    # judge is the scorer's call, not this endpoint's.
+    sub_dir, record = _locate_submission_or_404(req.run_id)
+    judge = _resolve_rescore_judge(req.judge_models)
+    if not judge:
+        raise HTTPException(
+            400,
+            "no judge model configured: name one in judge_models, or start the "
+            "server with a judge (cage benchmark serve --judge-model)",
+        )
+
+    op, _started = rescore_ops.get_orchestrator().submit(
+        record.target_launch.launch_id,
+        lambda: rescore.rescore_submission(sub_dir, judge=judge),
+    )
+    body = rescore_ops.status_view(op)
+    response.status_code = 202 if op.is_pending() else 200
+    return body
+
+
+@app.get("/rescores/{run_id}", response_model=RescoreOpStatus)
+def get_rescore(run_id: str, _audience: str = Depends(resolve_audience)):
+    """Authoritative status of a re-judge.
+
+    With no operation in flight, this answers from the submission record itself
+    — the durable truth about which pass is canonical — so a serve restart, or a
+    query long after the work finished, still gets a real answer instead of
+    "unknown operation". Such a result is flagged ``from_record``.
+    """
+    op = rescore_ops.get_orchestrator().get(str(run_id))
+    if op is not None:
+        return rescore_ops.status_view(op)
+    sub_dir, record = _locate_submission_or_404(run_id)
+    return {
+        "run_id": record.target_launch.launch_id,
+        "status": rescore_ops.DONE,
+        "status_url": f"/rescores/{record.target_launch.launch_id}",
+        "attempts": 0,
+        "result": rescore.record_result_view(sub_dir, record),
+    }
+
+
 @app.get("/prompt/{run_id}", response_model=PromptResponse)
 def prompt_challenge(
     run_id: str,
+    request: Request = None,  # type: ignore[assignment]
     audience: str = Depends(resolve_audience),
 ):
     """The agent-facing task briefing for a launched instance.
@@ -884,8 +1348,23 @@ def prompt_challenge(
 
     # Hint tier bound to THIS instance at launch; fall back to the server default.
     level = _normalize_prompt_level(instance.get("prompt_level"), _resolve_prompt_level())
+    # A briefing must name an address the reader can actually dial. The
+    # challenge writes its targets as docker-internal addresses (``prestashop:80``,
+    # or a post-exploitation range's live inner IPs) — correct for an agent on the
+    # instance network, useless for a remote one. When this instance publishes its
+    # entries on the host and the caller is external, rewrite those authorities to
+    # the published ones so /prompt and /launch agree on where the target is.
+    # A published instance is reached by every agent at its host-published
+    # address, so rewrite the briefing's target authorities for ANY caller —
+    # the operator polling /prompt from the serve host sees the same public
+    # address the remote agent will dial.
+    public_host = ""
+    if instance_is_public(instance):
+        public_host, _ = resolve_public_host(
+            request.headers.get("host", "") if request is not None else ""
+        )
     task_prompt, task_prompt_template = render_task_prompt(
-        run_id, instance, challenge, prompt_level=level
+        run_id, instance, challenge, prompt_level=level, public_host=public_host
     )
     return PromptResponse(
         run_id=run_id,

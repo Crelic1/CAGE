@@ -19,9 +19,11 @@ from typing import Any, Callable
 from cage.target.server.network_alloc import (
     _allocate_project_local_subnet,
     _inject_compose_project_local_ipam,
+    _inject_host_off_network_opts,
     _remap_conflicting_local_networks,
     _stamp_cage_run_id_labels,
     _stamp_target_server_network_labels,
+    host_off_networks_enabled,
 )
 from cage.target.compose_files import (
     _absolutize_compose_paths,
@@ -138,6 +140,7 @@ def materialize_compose_runtime(
     audience: str = "internal",
     entry_service_keys: set[str] | None = None,
     network_only: bool = False,
+    publish_scope: str = "declared",
     challenge_id: str | None = None,
 ) -> ComposeRuntimePlan:
     # ``audience='external'`` + a non-empty ``entry_service_keys`` is the
@@ -145,6 +148,18 @@ def materialize_compose_runtime(
     # every other published service (e.g. scoring sidecars like
     # ``evaluator``) is bound to 127.0.0.1 so external clients carrying
     # the bearer token cannot reach the scoring channel.
+    #
+    # ``publish_scope`` picks WHICH services get a host port at all:
+    #   ``declared``   — the challenge's own ``exposure_mode`` decides, and
+    #                    ``network_only`` can suppress it. The default.
+    #   ``entry_only`` — external-access mode: publish exactly the declared
+    #                    entry services and nothing else. A range that declares
+    #                    ``exposure_mode: internal`` means "do not spill this
+    #                    whole multi-host topology onto the host", not "the
+    #                    entry point is unreachable", so entry publishing is
+    #                    intentionally not gated on it — but every non-entry
+    #                    service (inner pivot hosts, scoring sidecars) still
+    #                    gets no host port whatsoever.
     if spec.mode != "compose":
         raise ValueError(f"Cannot materialize non-compose launch spec: {spec.mode}")
 
@@ -317,7 +332,20 @@ def materialize_compose_runtime(
                 protocol = parse_port_protocol(original_ports[0]) or "tcp"
 
         _entry_keys = entry_service_keys or set()
-        if network_only and resolved_exposure_mode == "host_ports":
+        if publish_scope == "entry_only":
+            # A challenge that declares no entries at all has no "entry only"
+            # subset to publish; fall back to every target service so the
+            # remote agent is not handed an empty instance.
+            is_entry = service_name in _entry_keys if _entry_keys else True
+            if is_entry and internal_port is not None:
+                external_port = existing_external_ports.get(service_name) or find_free_port_fn()
+                port_suffix = f"/{protocol}" if protocol != "tcp" else ""
+                service_config["ports"] = [f"0.0.0.0:{external_port}:{internal_port}{port_suffix}"]
+                external_ports[service_name] = external_port
+                public_service_names.append(service_name)
+            else:
+                service_config.pop("ports", None)
+        elif network_only and resolved_exposure_mode == "host_ports":
             # network_only: NOTHING is host-published — every service (the
             # user-facing entry target AND scoring sidecars like ``evaluator``)
             # is reachable only over the isolated docker network at its internal
@@ -388,6 +416,18 @@ def materialize_compose_runtime(
     elif not use_compose_project_local_networks:
         config.setdefault("networks", {})
         config["networks"][docker_network] = {"external": True}
+
+    # Applied in every network mode, and after the ipam/remap passes so it also
+    # covers networks that declared their own subnet+gateway (a range whose
+    # topology is part of the challenge) — those return early from the ipam
+    # pass, and skipping them would leave the host on exactly the subnets the
+    # agent is told to move laterally across.
+    if host_off_networks_enabled():
+        sealed = _inject_host_off_network_opts(config)
+        if sealed:
+            logger.info(
+                "range networks built with the host off them: %s", ", ".join(sealed),
+            )
 
     _stamp_target_server_network_labels(config, docker_network)
     if cage_run_id:

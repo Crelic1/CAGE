@@ -6,7 +6,7 @@ runs a tiny base runner over **prebuilt** vul/fix artifacts laid out as::
 
     <binary_dir>/arvo/<id>/<mode>/
         arvo            # the image's /bin/arvo entrypoint script (verbatim)
-        out/<fuzzer>    # the ONE task fuzz target (not all of the image's /out)
+        out/<fuzzer>    # the task entrypoint plus required /out runtime tree
         libs/           # the fuzzer's shared-lib closure minus base-system libs
 
 Upstream publishes this layout (``cybergym-server-data.7z``) only for the **1507
@@ -23,8 +23,10 @@ plain archive and pull the three things we need straight out of the layers, with
 no docker daemon involved at all:
 
   * **arvo**: the merged-filesystem ``/bin/arvo`` (top layer wins, whiteouts honoured);
-  * **out/<fuzzer>**: the single fuzz target the ``arvo`` script invokes
-    (``/out/<name> /tmp/poc``), not the dozens of siblings in the image ``/out``;
+  * **out/**: the task entrypoint the ``arvo`` script invokes (``/out/<name>
+    /tmp/poc``), plus the direct runtime data/sidecars that wrapper scripts
+    reference (for example ``jazzer_driver``, ``.pkg`` loaders, jars/classes),
+    plus any in-image ``/out/lib/...`` dependencies resolved via ``$ORIGIN``;
   * **libs/**: the fuzzer's transitive ``DT_NEEDED`` closure (parsed statically
     from the ELF — no ``ldd``, no execution) restricted to libraries whose
     basename is NOT in :data:`BASE_SYSTEM_LIBS`. The base runner ships those at a
@@ -79,7 +81,9 @@ ARVO_PATHS = ("bin/arvo", "usr/bin/arvo")
 # Directories an ldd-style search would consult for a SONAME, in resolution order.
 LIB_DIRS = (
     "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "usr/local/lib",
+    "lib/i386-linux-gnu", "usr/lib/i386-linux-gnu",
     "usr/lib", "lib", "lib64", "usr/lib64", "usr/local/lib64",
+    "lib32", "usr/lib32",
 )
 
 # Libraries the base runner (oss-fuzz-base-runner, Ubuntu 16.04/glibc) provides at
@@ -91,12 +95,13 @@ LIB_DIRS = (
 BASE_SYSTEM_LIBS = frozenset({
     "ld-linux-x86-64.so.2", "ld-linux.so.2", "linux-vdso.so.1", "linux-gate.so.1",
     "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
-    "libresolv.so.2", "libnsl.so.1", "libcrypt.so.1", "libgcc_s.so.1",
+    "libresolv.so.2", "libnsl.so.1", "libgcc_s.so.1",
     "libstdc++.so.6", "libz.so.1", "libbz2.so.1.0", "liblzma.so.5",
     "libcom_err.so.2", "libkeyutils.so.1",
 })
 
 _OUT_TOKEN = re.compile(r"/out/([A-Za-z0-9_.\-]+)")
+_SCRIPT_TOKEN = re.compile(r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]+)(?![A-Za-z0-9_.\-])")
 
 
 def _is_fuzz_aux(base: str) -> bool:
@@ -131,15 +136,16 @@ def _iter_layer_members(outer: tarfile.TarFile, blob: str):
     """Yield (TarInfo, layer_tar) for a rootfs layer blob.
 
     Layer blobs may be gzip-compressed (docker-save / OCI ``...tar.gzip``) or a
-    plain tar (some ``crane`` tarball outputs). Auto-detect via the gzip magic so
-    either source works.
+    plain tar (some ``crane`` tarball outputs). Read them as a streaming tar so
+    large ARVO images do not need a full in-memory decompression of the whole
+    layer blob before we can inspect the few files we actually keep.
     """
-    raw = outer.extractfile(blob).read()
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    layer = tarfile.open(fileobj=io.BytesIO(raw))
-    for m in layer.getmembers():
-        yield m, layer
+    layer_stream = outer.extractfile(blob)
+    if layer_stream is None:
+        return
+    with tarfile.open(fileobj=layer_stream, mode="r|*") as layer:
+        for m in layer:
+            yield m, layer
 
 
 def _is_lib(path: str) -> bool:
@@ -147,7 +153,7 @@ def _is_lib(path: str) -> bool:
     if ".so" not in base:
         return False
     head, _, _ = path.rpartition("/")
-    return head in LIB_DIRS or head == "out"  # /out honours rpath $ORIGIN
+    return head in LIB_DIRS or head == "out" or head.startswith("out/")
 
 
 def _collect_merged(
@@ -187,138 +193,221 @@ def _collect_merged(
     return arvo, files, links
 
 
-def _extract_out(outer: tarfile.TarFile, fuzzer: str) -> dict[str, bytes]:
-    """Merged ``/out`` contents to ship: the task fuzz target PLUS its non-ELF
-    data files (``magic.mgc``, dictionaries, seed files, …).
-
-    The image ``/out`` holds the target fuzzer, often dozens of *sibling* fuzz
-    targets (ELF), and sometimes data files the target needs at runtime. Upstream
-    keeps the target + the data files but not the siblings (verified vs
-    server-data, e.g. arvo:1065 -> ``magic_fuzzer`` + ``magic.mgc``). Rule:
-    target fuzzer + every direct ``/out`` file whose first 4 bytes are NOT the ELF
-    magic, excluding ``.wh.`` whiteout markers. Merged top->bottom; sibling ELF
-    binaries are only peeked (4 bytes), never fully read.
-    """
-    out: dict[str, bytes] = {}
-    seen: set[str] = set()
-    whited: set[str] = set()
-    got_target = False
-    for blob in reversed(_layer_blobs(outer)):
+def _collect_out(outer: tarfile.TarFile) -> tuple[dict[str, bytes], dict[str, str]]:
+    """Merged ``/out`` regular files + symlinks (any depth, whiteouts honoured)."""
+    files: dict[str, bytes] = {}
+    links: dict[str, str] = {}
+    for blob in _layer_blobs(outer):
         for m, layer in _iter_layer_members(outer, blob):
             name = _norm(m.name)
-            if not name.startswith("out/") or name.count("/") != 1:
+            if not name.startswith("out/"):
                 continue
-            base = name.split("/", 1)[1]
+            base = name.rsplit("/", 1)[-1]
             if base.startswith(".wh."):
-                whited.add(base[len(".wh."):])
+                victim = name[: -len(base)] + base[len(".wh."):]
+                files.pop(victim, None)
+                links.pop(victim, None)
                 continue
-            if base in seen or base in whited:
-                continue
-            seen.add(base)
-            if not m.isfile():
-                continue
-            f = layer.extractfile(m)
-            head = f.read(4)
-            if base == fuzzer:
-                out[base] = head + f.read()
-                got_target = True
-            elif head != b"\x7fELF" and not _is_fuzz_aux(base):  # runtime data file
-                out[base] = head + f.read()
-            # else: sibling fuzz-target ELF, or fuzzing aux -> skip (rest unread)
-    return out if got_target else {}
+            if m.isfile():
+                files[name] = layer.extractfile(m).read()
+                links.pop(name, None)
+            elif m.issym() or m.islnk():
+                links[name] = m.linkname
+                files.pop(name, None)
+    return files, links
 
 
 # --------------------------------------------------------------------------- #
-# Minimal static ELF DT_NEEDED reader (ELF64 LE) — no execution, no ldd
+# Minimal static ELF DT_NEEDED reader (ELF32/ELF64 LE) — no execution, no ldd
 # --------------------------------------------------------------------------- #
 
 def _elf_needed(data: bytes) -> list[str]:
-    """Return the DT_NEEDED sonames of an ELF64 little-endian object."""
-    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
-        return []  # not ELF64-LE; arvo targets are x86_64
-    e_shoff = struct.unpack_from("<Q", data, 0x28)[0]
-    e_shentsize = struct.unpack_from("<H", data, 0x3A)[0]
-    e_shnum = struct.unpack_from("<H", data, 0x3C)[0]
-    if not e_shoff or not e_shnum:
+    """Return the DT_NEEDED sonames of an ELF32/ELF64 little-endian object."""
+    if len(data) < 52 or data[:4] != b"\x7fELF" or data[5] != 1:
         return []
-    dyn_off = dyn_size = strtab_idx = None
+    elf_class = data[4]
+    if elf_class == 2:  # ELF64
+        if len(data) < 64:
+            return []
+        e_shoff = struct.unpack_from("<Q", data, 0x28)[0]
+        e_shentsize = struct.unpack_from("<H", data, 0x3A)[0]
+        e_shnum = struct.unpack_from("<H", data, 0x3C)[0]
+        sh_offset_off, sh_size_off, sh_link_off = 0x18, 0x20, 0x28
+        dyn_unpack = "<qQ"
+        dyn_entry_size = 16
+    elif elf_class == 1:  # ELF32
+        e_shoff = struct.unpack_from("<I", data, 0x20)[0]
+        e_shentsize = struct.unpack_from("<H", data, 0x2E)[0]
+        e_shnum = struct.unpack_from("<H", data, 0x30)[0]
+        sh_offset_off, sh_size_off, sh_link_off = 0x10, 0x14, 0x18
+        dyn_unpack = "<iI"
+        dyn_entry_size = 8
+    else:
+        return []
+    if not e_shoff or not e_shnum or not e_shentsize:
+        return []
+    if e_shoff + e_shnum * e_shentsize > len(data):
+        return []
+    dyn_off = dyn_region_size = strtab_idx = None
     sections = []
     for i in range(e_shnum):
         base = e_shoff + i * e_shentsize
         sh_type, = struct.unpack_from("<I", data, base + 4)
-        sh_offset = struct.unpack_from("<Q", data, base + 0x18)[0]
-        sh_size = struct.unpack_from("<Q", data, base + 0x20)[0]
-        sh_link = struct.unpack_from("<I", data, base + 0x28)[0]
+        sh_offset = struct.unpack_from("<I" if elf_class == 1 else "<Q", data, base + sh_offset_off)[0]
+        sh_size = struct.unpack_from("<I" if elf_class == 1 else "<Q", data, base + sh_size_off)[0]
+        sh_link = struct.unpack_from("<I", data, base + sh_link_off)[0]
         sections.append((sh_type, sh_offset, sh_size, sh_link))
         if sh_type == 6:  # SHT_DYNAMIC
-            dyn_off, dyn_size, strtab_idx = sh_offset, sh_size, sh_link
+            dyn_off, dyn_region_size, strtab_idx = sh_offset, sh_size, sh_link
     if dyn_off is None or strtab_idx is None or strtab_idx >= len(sections):
         return []
+    if dyn_region_size is None or dyn_off + dyn_region_size > len(data):
+        return []
     str_off, str_size = sections[strtab_idx][1], sections[strtab_idx][2]
+    if str_off + str_size > len(data):
+        return []
     strtab = data[str_off: str_off + str_size]
     needed: list[str] = []
-    for off in range(dyn_off, dyn_off + dyn_size, 16):
-        d_tag, d_val = struct.unpack_from("<qQ", data, off)
+    for off in range(dyn_off, dyn_off + dyn_region_size, dyn_entry_size):
+        d_tag, d_val = struct.unpack_from(dyn_unpack, data, off)
         if d_tag == 0:  # DT_NULL
             break
         if d_tag == 1:  # DT_NEEDED
             end = strtab.find(b"\x00", d_val)
-            needed.append(strtab[d_val:end].decode("utf-8", "replace"))
+            if 0 <= d_val < len(strtab):
+                if end < 0:
+                    end = len(strtab)
+                needed.append(strtab[d_val:end].decode("utf-8", "replace"))
     return needed
 
 
 # SONAME search order: rpath ``$ORIGIN`` (the fuzzer's dir, /out) first, then the
 # standard library directories — what the dynamic loader would consult.
-SEARCH_DIRS = ("out",) + LIB_DIRS
+SEARCH_DIRS = ("out", "out/lib", "out/lib64", "out/bin") + LIB_DIRS
 
 
-def _resolve_path(path: str, files: dict[str, bytes], links: dict[str, str], depth: int = 0) -> bytes | None:
-    """Resolve an image path to file bytes, following symlinks within the image."""
+def _resolve_path_with_name(
+    path: str,
+    files: dict[str, bytes],
+    links: dict[str, str],
+    depth: int = 0,
+) -> tuple[str | None, bytes | None]:
+    """Resolve an image path to (final_path, file_bytes), following symlinks."""
     if depth > 40:
-        return None
+        return None, None
     if path in files:
-        return files[path]
+        return path, files[path]
     if path in links:
         tgt = links[path]
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
         nxt = posixpath.normpath(tgt).lstrip("/") if tgt.startswith("/") \
             else posixpath.normpath(posixpath.join(parent, tgt))
-        return _resolve_path(nxt, files, links, depth + 1)
-    return None
+        return _resolve_path_with_name(nxt, files, links, depth + 1)
+    return None, None
 
 
-def _resolve_soname(soname: str, files: dict[str, bytes], links: dict[str, str]) -> bytes | None:
+def _resolve_path(path: str, files: dict[str, bytes], links: dict[str, str], depth: int = 0) -> bytes | None:
+    """Resolve an image path to file bytes, following symlinks within the image."""
+    return _resolve_path_with_name(path, files, links, depth)[1]
+
+
+def _resolve_soname(soname: str, files: dict[str, bytes], links: dict[str, str]) -> tuple[str | None, bytes | None]:
     for d in SEARCH_DIRS:
-        data = _resolve_path(f"{d}/{soname}", files, links)
+        path, data = _resolve_path_with_name(f"{d}/{soname}", files, links)
         if data is not None:
-            return data
-    return None
+            return path, data
+    return None, None
+
+
+def _script_sidecars(target: bytes, direct_paths: list[str]) -> set[str]:
+    """Direct /out siblings that a wrapper script references by basename."""
+    if target[:4] == b"\x7fELF":
+        return set()
+    text = target.decode("utf-8", "replace")
+    refs: set[str] = set()
+    for path in direct_paths:
+        base = path.split("/", 1)[1]
+        if _is_fuzz_aux(base):
+            continue
+        if _SCRIPT_TOKEN.search(base) and re.search(
+            rf"(?<![A-Za-z0-9_.\-]){re.escape(base)}(?![A-Za-z0-9_.\-])", text
+        ):
+            refs.add(path)
+    return refs
+
+
+def _extract_out(
+    out_files: dict[str, bytes],
+    out_links: dict[str, str],
+    fuzzer: str,
+) -> dict[str, bytes]:
+    """Merged ``/out`` runtime tree to ship for one task.
+
+    Keep:
+      * the task entrypoint itself;
+      * direct non-ELF runtime data files (``magic.mgc``, jars/classes, etc.);
+      * direct siblings explicitly referenced by a wrapper script (for example
+        ``jazzer_driver`` or ``fuzz_search.pkg``).
+    Additional nested ``out/lib/...`` dependencies are added later from the ELF
+    closure once we know which binaries actually run.
+    """
+    target_path = f"out/{fuzzer}"
+    _, target = _resolve_path_with_name(target_path, out_files, out_links)
+    if target is None:
+        return {}
+    selected: dict[str, bytes] = {fuzzer: target}
+    direct_paths = sorted(
+        path for path in ({*out_files.keys(), *out_links.keys()})
+        if path.startswith("out/") and path.count("/") == 1
+    )
+    for path in direct_paths:
+        base = path.split("/", 1)[1]
+        if base == fuzzer:
+            continue
+        _, data = _resolve_path_with_name(path, out_files, out_links)
+        if data is None:
+            continue
+        if data[:4] != b"\x7fELF" and not _is_fuzz_aux(base):
+            selected[base] = data
+    for path in _script_sidecars(target, direct_paths):
+        base = path.split("/", 1)[1]
+        _, data = _resolve_path_with_name(path, out_files, out_links)
+        if data is not None:
+            selected[base] = data
+    return selected
 
 
 def _closure_libs(
-    fuzzer_elf: bytes, files: dict[str, bytes], links: dict[str, str]
-) -> dict[str, bytes]:
-    """Bundle the fuzzer's transitive DT_NEEDED closure, minus base-system libs.
+    out_tree: dict[str, bytes],
+    files: dict[str, bytes],
+    links: dict[str, str],
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    """Bundle the transitive DT_NEEDED closure of every selected ELF.
 
-    Recurses through *every* resolvable lib (denylisted or not) so the discovered
-    set matches ldd's flat closure, but only non-denylisted sonames are bundled —
-    stored under the SONAME name with the dereferenced (real-file) content.
+    Returns:
+      * ``libs/`` payloads for non-base-system libs resolved from image lib dirs;
+      * additional ``out/...`` entries for dependencies resolved via the image's
+        in-tree runtime layout (for example ``out/lib/librnp-0.so.0``).
     """
     bundled: dict[str, bytes] = {}
+    extra_out: dict[str, bytes] = {}
     seen: set[str] = set()
-    stack = list(_elf_needed(fuzzer_elf))
+    stack: list[bytes] = [data for data in out_tree.values() if data[:4] == b"\x7fELF"]
     while stack:
-        soname = stack.pop()
-        if soname in seen:
-            continue
-        seen.add(soname)
-        data = _resolve_soname(soname, files, links)
-        if data is None:
-            continue
-        stack.extend(_elf_needed(data))
-        if soname not in BASE_SYSTEM_LIBS:
-            bundled[soname] = data
-    return bundled
+        data = stack.pop()
+        for soname in _elf_needed(data):
+            if soname in seen:
+                continue
+            seen.add(soname)
+            resolved_path, resolved = _resolve_soname(soname, files, links)
+            if resolved is None:
+                continue
+            stack.extend([resolved] if resolved[:4] == b"\x7fELF" else [])
+            if resolved_path and resolved_path.startswith("out/"):
+                extra_out[resolved_path.split("/", 1)[1]] = resolved
+            elif soname not in BASE_SYSTEM_LIBS:
+                bundled[soname] = resolved
+    return bundled, extra_out
 
 
 # --------------------------------------------------------------------------- #
@@ -339,16 +428,18 @@ def _extract_one(image_tar: Path, dest: Path) -> dict:
     """Extract arvo + out/<fuzzer> + libs/ for a single build into ``dest``."""
     with tarfile.open(image_tar) as outer:
         arvo, files, links = _collect_merged(outer)
+        out_files_all, out_links = _collect_out(outer)
         if arvo is None:
             raise RuntimeError("no /bin/arvo in image")
         fuzzer = _fuzzer_from_arvo(arvo)
         if not fuzzer:
             raise RuntimeError("could not parse fuzz target from /bin/arvo")
-        out_files = _extract_out(outer, fuzzer)
+        out_files = _extract_out(out_files_all, out_links, fuzzer)
         if fuzzer not in out_files:
             raise RuntimeError(f"no /out/{fuzzer} in image")
 
-    bundled = _closure_libs(out_files[fuzzer], files, links)
+    bundled, extra_out = _closure_libs(out_files, files, links)
+    out_files.update(extra_out)
 
     dest.mkdir(parents=True, exist_ok=True)
     # arvo script + fuzz target must be executable (the runner does
@@ -359,7 +450,11 @@ def _extract_one(image_tar: Path, dest: Path) -> dict:
     out_dir = dest / "out"
     out_dir.mkdir(exist_ok=True)
     for name, data in out_files.items():     # target fuzzer + its data files
-        (out_dir / name).write_bytes(data)
+        path = out_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        if data[:4] == b"\x7fELF" or data.startswith(b"#!"):
+            path.chmod(0o755)
     (out_dir / fuzzer).chmod(0o755)
     libs_dir = dest / "libs"
     libs_dir.mkdir(exist_ok=True)

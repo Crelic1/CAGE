@@ -58,6 +58,7 @@ from cage.config.sections import (
     ResumeKeepIf,
     TargetConfig,
 )
+from cage.contracts.exceptions import ConfigError
 from cage.contracts.execution import normalize_max_rounds_config
 from cage.contracts.logging import LoggingConfig
 from cage.experiment.engine.hooks import load_hooks
@@ -103,6 +104,32 @@ def _parse_resume_nonneg(value: Any, field_name: str, kind: type) -> Any | None:
     return parsed
 
 
+def _unknown_model_message(
+    model_id: str,
+    models: dict[str, ModelConfig],
+    models_file: Any,
+    *,
+    role: str = "Model",
+) -> str:
+    """Explain an unresolvable model id, with close matches and where to look.
+
+    A typo in a model id is one of the most common ways a run dies, and the
+    registry usually holds dozens of ids — so "not found" alone leaves the user
+    to go read the file. Offering near-matches turns the common case (a typo or
+    a half-remembered suffix) into a one-line fix.
+    """
+
+    import difflib
+
+    known = sorted(models)
+    lines = [f"{role} {model_id!r} not found in {models_file}"]
+    close = difflib.get_close_matches(model_id, known, n=5, cutoff=0.5)
+    if close:
+        lines.append("  Did you mean: " + ", ".join(close))
+    lines.append(f"  {len(known)} model(s) registered. List them with: cage model list")
+    return "\n".join(lines)
+
+
 def _resolve_models(raw: dict[str, Any], base_dir: Path) -> tuple[dict[str, ModelConfig], Any]:
     """Resolve the model registry. Returns ``(models, models_file)`` where
     ``models_file`` is the path used (for not-found error messages)."""
@@ -146,7 +173,9 @@ def _resolve_judge(
         return None
     judge_model_id = judge_raw["id"]
     if judge_model_id not in models:
-        raise ValueError(f"Judge model '{judge_model_id}' not found in {models_file}")
+        raise ConfigError(
+            _unknown_model_message(judge_model_id, models, models_file, role="Judge model")
+        )
     return JudgeConfig(
         model=models[judge_model_id],
         temperature=judge_raw.get("temperature", 0.0),
@@ -246,7 +275,7 @@ def _resolve_agents(
         if "model" in acfg:
             model_id = acfg.get("model", "")
             if model_id and model_id not in models:
-                raise ValueError(f"Model '{model_id}' not found in {models_file}")
+                raise ConfigError(_unknown_model_message(model_id, models, models_file))
             model = models[model_id] if model_id else next(iter(models.values()))
             agents.append(_build_agent_instance(acfg, at, model))
         elif acfg.get("models"):
@@ -274,8 +303,8 @@ def _resolve_agents(
                     ))
                 else:
                     if model_id not in models:
-                        raise ValueError(
-                            f"Model '{model_id}' not found in {models_file}"
+                        raise ConfigError(
+                            _unknown_model_message(model_id, models, models_file)
                         )
                     agents.append(
                         _build_agent_instance(model_agent_cfg, at, models[model_id])
@@ -285,7 +314,9 @@ def _resolve_agents(
             for subj in subjects:
                 subj_id = subj if isinstance(subj, str) else subj["id"]
                 if subj_id not in models:
-                    raise ValueError(f"Subject '{subj_id}' not found in {models_file}")
+                    raise ConfigError(
+                        _unknown_model_message(subj_id, models, models_file, role="Subject")
+                    )
                 agents.append(_build_agent_instance(acfg, at, models[subj_id]))
         else:
             agents.append(_build_agent_instance(acfg, at, next(iter(models.values()))))
@@ -299,7 +330,7 @@ def _resolve_execution(raw: dict[str, Any], spec: "ExperimentSpec") -> Execution
     reactive_raw = live_check_raw.get("reactive", {}) or {}
     polling_raw = live_check_raw.get("polling", {}) or {}
     live_check = LiveCheckConfig(
-        enabled=live_check_raw.get("enabled", True),
+        enabled=live_check_raw.get("enabled", LiveCheckConfig.enabled),
         max_calls=live_check_raw.get("max_calls", 3),
         stop_on_success=live_check_raw.get("stop_on_success", True),
         reactive=ReactiveLiveCheckConfig(
@@ -327,11 +358,22 @@ def _resolve_execution(raw: dict[str, Any], spec: "ExperimentSpec") -> Execution
         on_failure=runtime_raw.get("on_failure", "continue"),
         chunk_size=raw.get("hooks", {}).get("chunk_size"),
         agent_network_mode=runtime_raw.get("agent_network_mode", "host"),
+        network_containment=bool(runtime_raw.get("network_containment", False)),
+        netproxy_mihomo=str(runtime_raw.get("netproxy_mihomo", "") or ""),
+        netproxy_dns_upstream=str(runtime_raw.get("netproxy_dns_upstream", "") or ""),
+        agent_memory_limit=str(
+            runtime_raw.get("agent_memory_limit", ExecutionConfig.agent_memory_limit)
+            or ""
+        ),
+        agent_cpu_limit=str(
+            runtime_raw.get("agent_cpu_limit", ExecutionConfig.agent_cpu_limit)
+            or ""
+        ),
         max_rounds=spec.protocol.max_rounds,
         max_input_tokens=spec.protocol.max_input_tokens,
         max_output_tokens=spec.protocol.max_output_tokens,
         max_cost=spec.protocol.max_cost,
-        store_proxy=runtime_raw.get("store_proxy", True),
+        store_proxy=runtime_raw.get("store_proxy", ExecutionConfig.store_proxy),
         wait_for_model=bool(runtime_raw.get("wait_for_model", False)),
         wait_timeout=float(runtime_raw.get("wait_timeout", 0.0) or 0.0),
         wait_interval=float(runtime_raw.get("wait_interval", 10.0) or 10.0),
@@ -357,7 +399,8 @@ def _resolve_logging(raw: dict[str, Any]) -> LoggingConfig:
             "none",
             "plain",
         }
-    inspect_mode = str(log_raw.get("inspect_mode", "auto") or "auto").lower()
+    _inspect_default = LoggingConfig.inspect_mode
+    inspect_mode = str(log_raw.get("inspect_mode", _inspect_default) or _inspect_default).lower()
     if inspect_mode not in {"auto", "on", "off"}:
         raise ValueError("logging.inspect_mode must be one of: auto, on, off")
     return LoggingConfig(
@@ -567,6 +610,7 @@ def resolve(
         sample_slice=sample_slice,
         agents=agents,
         models=models,
+        models_file=str(models_file or ""),
         judge=judge,
         hooks=hooks,
         proxy=proxy,
@@ -615,7 +659,11 @@ def _build_agent_instance(
         skill=acfg.get("skill", ""),
         plugins=acfg.get("plugins", []),
         extra_env=acfg.get("extra_env", {}),
-        version=acfg.get("version", "latest"),
+        # Unset ⇒ the agent's own pinned release, not "latest": an agent CLI's
+        # context handling changes between versions, so floating the default
+        # would let an image rebuild change how runs behave with nothing in the
+        # config to show for it. See ``AgentType.default_version``.
+        version=acfg.get("version") or getattr(agent_type, "default_version", "latest"),
         image=acfg.get("image", ""),
         # Agent absent ⇒ None (inherit the runtime budget); "unlimited" / -1 / N
         # otherwise. Resolved against runtime + sample by resolve_max_rounds().
@@ -636,7 +684,8 @@ def _parse_source_entry(entry: Any) -> tuple[str, int | None]:
 
     Accepts ``"glm-5.1-w4a8"``, the suffixed ``"glm-5.1-w4a8:6"`` (CLI form),
     or ``{id: glm-5.1-w4a8, concurrency: 6}`` (yaml form). ``None`` concurrency
-    means "take the default even share of the run's total".
+    means UNCAPPED — that source never blocks on its own and is bounded only by
+    the agent/global gates.
     """
     if isinstance(entry, dict):
         sid = str(entry.get("id") or entry.get("model") or "").strip()
@@ -661,7 +710,7 @@ def _agent_model_entries(
     ``model_id`` is taken from an explicit ``id`` and is a *logical key*: it
     groups the run (run dir / labels / scores) and need not itself be registered.
     A source may carry a per-source concurrency (``id:N`` or ``{id, concurrency}``);
-    ``source_conc`` maps source id → that cap (absent = default even share).
+    ``source_conc`` maps source id → that cap (absent = uncapped).
     """
     if not isinstance(raw, list) or not raw:
         raise ValueError("agents[].models must be a non-empty list")
@@ -714,8 +763,16 @@ def _resolve_model_sources(
 ) -> list[ModelConfig]:
     """Resolve a multi-source entry's source ids to registered ModelConfigs.
 
-    Validates every source is registered and that the pool shares one protocol
-    (the run translates uniformly, so anthropic/openai endpoints can't mix).
+    Validates every source is registered, that the pool shares one protocol
+    (the run translates uniformly, so anthropic/openai endpoints can't mix),
+    and that every source serves the same upstream model.
+
+    The upstream-model check exists because which source a trial lands on is
+    decided by endpoint capacity at runtime, not by a reproducible index — so
+    if the pool held two different models, a run's results would depend on
+    scheduling timing and could never be reproduced. Requiring one model makes
+    the pool genuinely interchangeable, which is the premise the whole
+    load-balancing design rests on. To compare two models, run two runs.
     """
     resolved: list[ModelConfig] = []
     for sid in source_ids:
@@ -730,5 +787,14 @@ def _resolve_model_sources(
         raise ValueError(
             f"Model '{logical_id}' sources must share one protocol; got "
             f"{sorted(protocols)} across {source_ids}"
+        )
+    upstream = {str(m.model) for m in resolved if str(m.model or "")}
+    if len(upstream) > 1:
+        pairs = ", ".join(f"{m.id}->{m.model}" for m in resolved)
+        raise ValueError(
+            f"Model '{logical_id}' sources must all serve the same upstream "
+            f"model; got {sorted(upstream)} ({pairs}). Sources are load-"
+            f"balanced by free capacity, so a mixed pool would make results "
+            f"depend on timing. Use one logical model per upstream model."
         )
     return resolved

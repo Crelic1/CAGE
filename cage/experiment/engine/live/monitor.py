@@ -21,6 +21,7 @@ from cage.artifacts.live_success import (
     parse_live_checks_success,
     record_live_success,
 )
+from cage.contracts.jsonio import iter_jsonl_lines
 from cage.scoring import GatherRuntime, ScoringContext
 
 logger = logging.getLogger(__name__)
@@ -31,12 +32,18 @@ CHECK_DONE_LOG_NAME = "check_done_polls.jsonl"
 
 
 def _json_lines(path: Path, start: int) -> tuple[list[dict[str, Any]], int]:
+    """Return records appended since ``start``, and the new line count.
+
+    Line-safe (see :mod:`cage.contracts.jsonio`): the logs polled here carry
+    agent and tool text, and a record split on a raw U+0085 / U+2028 would not
+    just vanish — it would shift ``start`` and make the tail of the poll read
+    the same records twice.
+    """
     if not path.is_file():
         return [], start
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    new_lines = lines[start:]
+    lines = list(iter_jsonl_lines(path))
     entries: list[dict[str, Any]] = []
-    for line in new_lines:
+    for line in lines[start:]:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
@@ -274,7 +281,7 @@ class ReactiveLiveCheckMonitor:
     def _scan_live_checks(self) -> dict[str, Any] | None:
         if not self.live_checks_jsonl.is_file():
             return None
-        lines = self.live_checks_jsonl.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = list(iter_jsonl_lines(self.live_checks_jsonl))
         for line in lines[self._live_checks_line_count:]:
             entry = parse_live_checks_success(line)
             if entry is None:

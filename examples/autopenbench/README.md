@@ -50,11 +50,11 @@ the index keys (form `apb-<tier>-<category>-<vm>`):
 
 ```bash
 # render this task's prompt + config only (no target, no model call)
-cage benchmark check autopenbench --agent claude_code_baseline --model openai-example \
+cage benchmark check autopenbench --agent claude_code --model openai-example \
   --sample apb-in-vitro-access_control-vm0 --show-prompt
 
 # one trial — boots the target, runs the agent, auto-scores
-cage run autopenbench --agent claude_code_baseline --model openai-example \
+cage run autopenbench --agent claude_code --model openai-example \
   --sample apb-in-vitro-access_control-vm0 \
   --passk 1 --max-concurrent 1 --run-id autopenbench-smoke-001
 ```
@@ -68,7 +68,7 @@ Drop `--sample` to run all 29 tasks. Give the run a `--run-id` to track and
 resume it:
 
 ```bash
-cage run autopenbench --agent claude_code_baseline --model openai-example \
+cage run autopenbench --agent claude_code --model openai-example \
   --run-id autopenbench-full-001
 ```
 

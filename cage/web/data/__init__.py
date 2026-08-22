@@ -30,21 +30,27 @@ from cage.artifacts.run_storage import (
     PROXY_DIRNAME,
     PROXY_LOG_FILENAME,
     RESUME_ARCHIVE_MARKER,
+    TARGET_LOGS_DIRNAME,
+    TARGET_LOGS_INDEX_FILENAME,
     TASK_OUTPUT_FILENAME,
+    TRIAL_ERROR_REPORT_FILENAME,
     TRIALS_DIRNAME,
     discover_run_dirs,
     is_trial_dir,
     iter_live_trial_dirs,
 )
 from cage.contracts.coerce import int_or_zero
+from cage.contracts.jsonio import iter_jsonl_entries
 from cage.contracts.trial_status import (
-    COMPLETED_TRIAL_STATUSES,
+    COMPLETED_TRIAL_STATUSES_ON_READ,
     FAILED_TRIAL_STATUSES,
     INTERRUPTED_TRIAL_STATUSES,
 )
 from cage.experiment.engine.live.fs_signals import (
     dashboard_pending_count as _dashboard_pending_count,
 )
+from cage.experiment.engine.live.run_heartbeat import run_process_is_alive
+from cage.contracts.trial_phase import TrialPhase, is_active_phase, phase_label
 from cage.experiment.model import (
     TrialRecord,
     experiment_record_to_mapping,
@@ -452,24 +458,44 @@ def _load_run_info(
             return cached  # type: ignore[no-any-return]
 
     dashboard_data = _load_json(dashboard_path) if dashboard_mtime >= 0 else {}
-    if dashboard_mtime >= 0 and dashboard_data.get("completed_at"):
-        # Settled run: the dashboard recorded completion, so the trials/ tree is
-        # final and holds no in-flight work. Skip scan_run_signals — on
-        # NAS-backed .cage_runs its hundreds of stat/scandir syscalls cost ~12s
-        # per run, which made a cold ``examples/`` index (every benchmark's runs)
-        # take minutes. Empty signals yield an identical RunInfo here because a
+    # Load the canonical record once here (cheap: one small file) and pass it
+    # down, so the signal decision below can consult its pending-trial count
+    # without _build_run_info re-reading it.
+    record_data, spec_data = _load_canonical_record_payloads(run_dir, record_mtime >= 0)
+    record_pending = _record_pending_count(record_data)
+    completed_recorded = bool(
+        (dashboard_mtime >= 0 and dashboard_data.get("completed_at"))
+        or str(record_data.get("completed_at") or "").strip()
+    )
+    if completed_recorded and record_pending == 0:
+        # Settled run: a completion timestamp was recorded (dashboard or canonical
+        # record) AND no trial is left pending, so the trials/ tree is final and
+        # holds no in-flight work. Skip scan_run_signals — on NAS-backed
+        # .cage_runs its hundreds of stat/scandir syscalls cost ~12s per run,
+        # which made a cold ``examples/`` index (every benchmark's runs) take
+        # minutes. Empty signals yield an identical RunInfo here because a
         # completed run has ``active_count == 0`` (see the ``completed_at`` branch
         # in _build_run_info's running logic).
         signals = _EMPTY_RUN_SIGNALS
+    elif record_mtime >= 0 and record_pending > 0:
+        # Canonical record present with trials still pending — a live candidate.
+        # The record file's mtime bumps only at trial-*completion* boundaries
+        # (mark_run_started, each mark_trial_finished, mark_run_finished) — never
+        # while a trial is merely running — so a record-mtime "recently active?"
+        # test cannot tell a long-running trial (progress.json ticking, no
+        # completion for minutes) from a dead orchestrator, and would wrongly
+        # badge a live run "Stopped". A stale ``completed_at`` can also linger
+        # from a prior attempt after a --resume re-plans pending trials. In both
+        # cases consult real per-trial progress activity — the same authoritative
+        # signal the live *detail* page uses (``run_has_live_activity``), and the
+        # basis of ``active_after_completed`` below — so the summary badge honours
+        # "any trial running ⇒ run running". Settled records (no pending trials)
+        # take the cheap empty-signals path above, so the deep trials/ walk (~9s
+        # on NAS for a 2600-trial run) is paid only by the handful of genuinely
+        # in-flight runs, not by every finished run on the page.
+        signals = scan_run_signals(run_dir)
     elif record_mtime >= 0:
-        # Canonical record present: run-level trial counters come from it, and a
-        # cheap record-mtime-based "running" signal is derived in _build_run_info
-        # (the ``record_present and record_pending and is_recently_active``
-        # branch). So the trials/ deep walk — thousands of scandir/stat syscalls,
-        # ~9s on NAS for a 2600-trial run — is never needed on the list/index
-        # path: a benchmark with dozens of such runs was re-walking every one on
-        # every page load. The live *detail* page (polled) still shows precise
-        # per-trial state; the list only needs counts + a running badge.
+        # Record present, not completed, nothing pending — nothing to walk for.
         signals = _EMPTY_RUN_SIGNALS
     elif not _run_recently_active(
         run_dir, dashboard_mtime, record_mtime, history_mtime, planned_mtime
@@ -492,6 +518,8 @@ def _load_run_info(
         record_mtime_ns=record_mtime,
         planned_mtime_ns=planned_mtime,
         dashboard_data=dashboard_data,
+        record_data=record_data,
+        spec_data=spec_data,
     )
 
     if dashboard_mtime >= 0 and not info.running:
@@ -539,11 +567,14 @@ def _build_run_info(
     record_mtime_ns: int,
     planned_mtime_ns: int,
     dashboard_data: dict[str, Any] | None = None,
+    record_data: dict[str, Any] | None = None,
+    spec_data: dict[str, Any] | None = None,
 ) -> "RunInfo":
     """Construct a RunInfo from cheap signals + (at most) one dashboard read.
 
-    Callers that have already parsed ``dashboard.json`` (e.g. to detect a
-    completed run) pass it via *dashboard_data* to avoid a second read.
+    Callers that have already parsed ``dashboard.json`` / the canonical record
+    (e.g. to decide whether to walk the trials/ tree) pass them via
+    *dashboard_data* / *record_data* / *spec_data* to avoid a second read.
     """
     agent_name, model_name, mode = _parse_agent_label(agent_dir_name)
 
@@ -553,7 +584,8 @@ def _build_run_info(
             data = dashboard_data
         else:
             data = _load_json(run_dir / DASHBOARD_FILENAME)
-    record_data, spec_data = _load_canonical_record_payloads(run_dir, record_present)
+    if record_data is None or spec_data is None:
+        record_data, spec_data = _load_canonical_record_payloads(run_dir, record_present)
 
     run_id = str(data.get("run_id") or record_data.get("run_id") or run_dir.name)
     experiment = str(data.get("experiment") or _record_experiment_name(spec_data) or "")
@@ -610,13 +642,24 @@ def _build_run_info(
     # honour both signals (filesystem progress files + dashboard's
     # pending counter) so very-early startup (dashboard written but no
     # progress.json yet) still reports as running.
-    if completed_at and not active_after_completed:
+    # The orchestrator's recorded pid is the one non-inferential signal
+    # available, so it decides on its own when present. Everything below infers
+    # life from how recently a file changed, which cannot distinguish a healthy
+    # quiet run from a dead one — the reason a live run could show "Stopped"
+    # while pulling an image or sitting inside one long agent turn.
+    process_alive = run_process_is_alive(run_dir)
+    if process_alive is not None:
+        running = process_alive
+    elif completed_at and not active_after_completed:
         running = False
     elif signals.active_count > 0 and is_recently_active(signals.newest_progress_mtime_ns):
         running = True
     elif signals.active_count > 0:
         # Has progress files but nothing has ticked recently — treat as
         # not running so we don't show a stale orchestrator as alive.
+        # Only reachable for pre-heartbeat runs now: anything the current
+        # runtime writes is decided by the pid branch above, where a quiet
+        # in-flight trial is correctly still "running".
         running = False
     elif dashboard_present and dashboard_pending > 0:
         # Dashboard reports pending trials but no progress.json exists
@@ -1809,6 +1852,11 @@ def _canonical_trial_record_row_from_contract(
         "scoring_id": trial_record.scoring_id,
         "started_at": trial_record.started_at,
         "completed_at": trial_record.completed_at,
+        # The lifecycle stage this trial is in. What turns a bare "Running" chip
+        # — which says nothing during the minutes a trial spends booting a
+        # target or snapshotting — into "Running · Launching target".
+        "phase": trial_record.phase,
+        "phase_updated_at": trial_record.phase_updated_at,
         "artifacts": [
             {
                 "artifact_id": artifact.artifact_id,
@@ -2010,7 +2058,7 @@ def _canonical_trial_record_summary(record: dict[str, Any]) -> dict[str, Any]:
         })
     elif reason:
         info.update(_status_from_reason(reason, detail=detail, exit_code=exit_code))
-    elif status in COMPLETED_TRIAL_STATUSES:
+    elif status in COMPLETED_TRIAL_STATUSES_ON_READ:
         info.update({
             "status_kind": "success",
             "status_label": "Completed",
@@ -2184,13 +2232,7 @@ def load_live_check_evidence(trial_dir: Path) -> dict[str, Any] | None:
 
     if has_polls:
         try:
-            for line in polls_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            for entry in iter_jsonl_entries(polls_path):
                 # entry.output is itself JSON-encoded: {"message":..., "status":bool}
                 raw_output = entry.get("output", "")
                 parsed = {}
@@ -2368,10 +2410,16 @@ def _normalize_status_detail(reason: str, detail: Any) -> str:
         if isinstance(detail, bytes)
         else str(detail or "")
     )
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_reason in _TARGET_FAILURE_REASONS:
+        # A target-launch failure detail is the target server's/container's own
+        # error text, never a codex agent event stream. Return it verbatim so the
+        # event-stream path below can't blank a real "why the target failed" cause
+        # that happens to contain stream-like markers (issue Gap C).
+        return text
     summary = parse_codex_event_stream(text)
     if not summary.is_event_stream:
         return text
-    normalized_reason = str(reason or "").strip().lower()
     if normalized_reason in {"model_timeout", "proxy_timeout", "upstream_timeout"}:
         return ""
     return summary.terminal_error or summary.last_error or ""
@@ -2477,6 +2525,125 @@ def build_trial_termination(info: dict[str, Any]) -> dict[str, Any]:
         "is_event_stream": summary.is_event_stream,
         "last_agent_message": summary.last_agent_message,
         "has_content": bool(reason or source or detail or text),
+    }
+
+
+# Termination reasons that mean "the benchmark target (靶机) never came up", so
+# the trial page must surface the target's own error instead of the agent's.
+_TARGET_FAILURE_REASONS = frozenset(
+    {"target_unavailable", "target_launch_failed", "target_setup_failed"}
+)
+
+
+def load_trial_target_logs(trial_dir: Path, *, tail_chars: int = 4000) -> dict[str, Any]:
+    """Read a trial's captured target-container logs for display.
+
+    ``target_logs/index.json`` lists one entry per target container
+    (``{file,name,service,status,exit_code,error}``); each ``<service>.log`` holds
+    that container's captured stdout/stderr (persisted by
+    ``RunStorage.save_target_logs`` from the launch-failure 500 body or the
+    teardown response). Returns those rows enriched with a trimmed ``tail`` of
+    each log (last ``tail_chars`` chars) so the trial page can show the target's
+    own crash output. Missing/empty dir → no entries. Never raises.
+    """
+    logs_dir = trial_dir / TARGET_LOGS_DIRNAME
+    entries: list[dict[str, Any]] = []
+    if not logs_dir.is_dir():
+        return {"entries": entries, "has_logs": False}
+    index_path = logs_dir / TARGET_LOGS_INDEX_FILENAME
+    index = _load_json(index_path) if index_path.is_file() else []
+    if not isinstance(index, list):
+        index = []
+    if not index:
+        # index.json missing or malformed — fall back to whatever .log files
+        # the dir holds so a real crash log is never hidden by a lost index.
+        try:
+            index = [
+                {"file": p.name, "service": p.stem}
+                for p in sorted(logs_dir.glob("*.log"))
+            ]
+        except OSError:
+            index = []
+    for row in index:
+        if not isinstance(row, dict):
+            continue
+        fname = str(row.get("file") or "")
+        tail = ""
+        truncated = False
+        if fname:
+            try:
+                raw = (logs_dir / fname).read_text(encoding="utf-8", errors="replace")
+                truncated = len(raw) > tail_chars
+                tail = (raw[-tail_chars:] if truncated else raw).strip()
+            except OSError:
+                tail = ""
+        entries.append(
+            {
+                "file": fname,
+                "name": row.get("name"),
+                "service": row.get("service"),
+                "status": row.get("status"),
+                "exit_code": row.get("exit_code"),
+                "error": str(row.get("error") or "").strip(),
+                "tail": tail,
+                "truncated": truncated,
+            }
+        )
+    has_logs = any(e["tail"] or e["error"] for e in entries)
+    return {"entries": entries, "has_logs": has_logs}
+
+
+def build_trial_error_report(trial_dir: Path) -> dict[str, Any] | None:
+    """Assemble the "why did this trial raise" block, or ``None``.
+
+    Returns a payload only for trials that failed through the exception path,
+    i.e. that have an ``error_report.json``. This is the panel that ends the
+    "trial errored and I cannot tell why" problem: the exception type, the
+    lifecycle phase it escaped from, and the full traceback all used to exist
+    only inside ``<run_dir>/.cage.runlog`` — a hidden JSON-lines file the
+    inspector never rendered — leaving the UI with a single truncated line.
+    """
+
+    report = _load_json(trial_dir / TRIAL_ERROR_REPORT_FILENAME)
+    if not report:
+        return None
+    phase = str(report.get("failed_phase") or "")
+    return {
+        "error_type": str(report.get("error_type") or "Exception"),
+        "message": str(report.get("message") or ""),
+        "failed_phase": phase,
+        "phase_label": phase_label(phase),
+        "traceback": str(report.get("traceback") or ""),
+    }
+
+
+def build_target_failure(
+    trial_dir: Path,
+    termination: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Assemble a prominent "why did the target fail" block, or ``None``.
+
+    Returns a payload only when this trial failed because its target never came
+    up (``reason in _TARGET_FAILURE_REASONS``). It carries the server-side init
+    error (the normalized ``termination.detail``, falling back to the raw text)
+    plus the target container log tails from :func:`load_trial_target_logs` — the
+    single most diagnostic artifact, which otherwise sits buried in the generic
+    file list (issue Gaps A/B). Target logs captured on a *successful* teardown
+    are left in the file list and do not trigger this alarm block.
+    """
+    reason = str(termination.get("reason") or "").strip().lower()
+    if reason not in _TARGET_FAILURE_REASONS:
+        return None
+    server_error = str(termination.get("detail") or "").strip()
+    if not server_error:
+        server_error = str(termination.get("raw_detail") or "").strip()
+    logs = load_trial_target_logs(trial_dir)
+    return {
+        "reason": reason,
+        "reason_label": str(termination.get("reason_label") or "Target unavailable"),
+        "server_error": server_error,
+        "logs": logs["entries"],
+        "has_logs": logs["has_logs"],
     }
 
 
@@ -2656,6 +2823,18 @@ def load_trial_summary(
             info["scores"] = flat
             if details:
                 info["score_details"] = details
+
+    # Post-mortem for a trial that raised. Loaded here rather than only on the
+    # detail page so the exception type and failing phase are available wherever
+    # a trial row is rendered — previously the full traceback existed only in
+    # the run's hidden ``.cage.runlog`` and the inspector could show nothing but
+    # a truncated one-line message.
+    error_report = _load_json(trial_dir / TRIAL_ERROR_REPORT_FILENAME)
+    if error_report:
+        info["error_report"] = error_report
+        for key in ("error_type", "failed_phase"):
+            if not info.get(key) and error_report.get(key):
+                info[key] = error_report[key]
 
     activity = load_trial_activity(trial_dir)
     progress = activity.get("progress") if activity else {}
@@ -3814,19 +3993,11 @@ def _load_success_entries(proxy_jsonl: Path) -> list[dict[str, Any]]:
         if cached and cached[0] == signature:
             return cached[1]
 
-    entries: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("status") != "success":
-                continue
-            entries.append(entry)
+    entries: list[dict[str, Any]] = [
+        entry
+        for entry in iter_jsonl_entries(path)
+        if entry.get("status") == "success"
+    ]
 
     with _entry_cache_lock:
         if len(_entry_cache) >= _ENTRY_CACHE_MAX:
@@ -4462,13 +4633,29 @@ def _classify_trial_status(
         if str(run_status or "").lower() == "interrupted":
             return {
                 "status_label": "Interrupted",
-                "status_detail": "Stopped by user (Ctrl+C) while still running",
+                "status_detail": "Interrupted while still running",
                 "status_kind": "warning",
             }
+        # Prefer the canonical phase: it is the only signal that says anything
+        # during the stages before the agent starts (container, target launch,
+        # workspace prep) and after it stops (evidence, snapshot, scoring), when
+        # the proxy is silent and "Agent is still running" is simply wrong.
+        #
+        # Only *active* phases decorate the chip. A record written before the
+        # phase axis existed reads back as the ``planned`` bookend, and
+        # "Running · Planned" would be worse than plain "Running".
+        raw_phase = str(info.get("phase") or "")
+        stage = phase_label(raw_phase) if is_active_phase(raw_phase) else ""
         progress = info.get("progress") if isinstance(info.get("progress"), dict) else {}
         last_status = progress.get("last_status")
-        detail = f"Last proxy status: {last_status}" if last_status else "Agent is still running"
-        return {"status_label": "Running", "status_detail": detail, "status_kind": "running"}
+        if stage and raw_phase != TrialPhase.RUNNING_AGENT.value:
+            detail = stage
+        elif last_status:
+            detail = f"Last proxy status: {last_status}"
+        else:
+            detail = stage or "Agent is still running"
+        label = f"Running · {stage}" if stage else "Running"
+        return {"status_label": label, "status_detail": detail, "status_kind": "running"}
 
     reason = str(info.get("termination_reason") or "").strip()
     detail = _normalize_status_detail(reason, info.get("termination_detail", "")).strip()
@@ -4507,7 +4694,7 @@ def _classify_trial_status(
         return {"status_label": "Trial error", "status_detail": error, "status_kind": "error"}
 
     status = str(info.get("status") or "").strip().lower()
-    if status in COMPLETED_TRIAL_STATUSES:
+    if status in COMPLETED_TRIAL_STATUSES_ON_READ:
         return {
             "status_label": "Completed",
             "status_detail": "Task finished",
@@ -4530,7 +4717,7 @@ def _classify_trial_status(
     if str(run_status or "").lower() == "interrupted":
         return {
             "status_label": "Interrupted",
-            "status_detail": "Stopped by user (Ctrl+C)",
+            "status_detail": "Interrupted before the agent finished",
             "status_kind": "warning",
         }
 
@@ -4628,6 +4815,34 @@ _REASON_DISPLAY: dict[str, dict[str, str]] = {
         "label": "Target unavailable", "kind": "error",
         "default_detail": "Target stack failed to launch — agent was not invoked",
     },
+    "target_error": {
+        "label": "Target failed", "kind": "error",
+        "default_detail": "Target stack came up, then failed during the trial",
+    },
+    "container_error": {
+        "label": "Container error", "kind": "error",
+        "default_detail": "Agent container could not be created or driven",
+    },
+    "proxy_error": {
+        "label": "Proxy error", "kind": "error",
+        "default_detail": "In-container LLM proxy failed to start or run",
+    },
+    "agent_setup_error": {
+        "label": "Agent setup failed", "kind": "error",
+        "default_detail": "Agent could not be prepared or launched",
+    },
+    "benchmark_error": {
+        "label": "Benchmark error", "kind": "error",
+        "default_detail": "The benchmark's own code raised while preparing this trial",
+    },
+    "scoring_error": {
+        "label": "Scoring error", "kind": "error",
+        "default_detail": "The trial ran; its scorer raised — re-score offline with `cage score`",
+    },
+    "config_error": {
+        "label": "Config error", "kind": "error",
+        "default_detail": "Configuration could not be resolved — re-running will not help",
+    },
     "trial_error": {
         "label": "Trial error", "kind": "error",
         "default_detail": "Trial raised an exception",
@@ -4640,7 +4855,7 @@ _REASON_DISPLAY: dict[str, dict[str, str]] = {
         # is user input, the trial produced no usable result, and should
         # be visible in the failure count instead of buried in warnings.
         "label": "Interrupted", "kind": "error",
-        "default_detail": "Stopped by user (Ctrl+C)",
+        "default_detail": "Interrupted before the agent finished",
     },
     "cancelled_before_start": {
         "label": "Cancelled", "kind": "pending",

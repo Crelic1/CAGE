@@ -269,15 +269,36 @@
                     Failed {{ agent.failed }}
                   </span>
                   {% if agent.get('running', 0) %}
-                  <span data-run-agent-count="running"
-                        class="rounded border border-sky-500/25 bg-sky-500/10 px-2 py-1 text-sky-200">
-                    Running {{ agent.running }}
+                  {# This block only renders for a NOT-running run (see the
+                     `if run.running` above), so these not-yet-terminal trials
+                     are abandoned, not live — the run stopped before they
+                     finished. Label them "Incomplete", never "Running", so the
+                     card can't say Stopped in its badge and Running in its
+                     counts at the same time. #}
+                  <span data-run-agent-count="incomplete"
+                        class="rounded border border-slate-600/50 bg-slate-700/30 px-2 py-1 text-slate-300"
+                        title="Planned trials that never reached a terminal state — the run stopped first.">
+                    Incomplete {{ agent.running }}
                   </span>
                   {% endif %}
                   <span data-run-agent-count="total"
                         class="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-300">
                     Total {{ agent.total }}
                   </span>
+                  {# The benchmark owns what its headline number means (see
+                     Benchmark.summarize_scores). When it has an opinion we
+                     render its labels and values verbatim; only when it stays
+                     silent do we fall back to the framework's generic mean. #}
+                  {% if agent.get('score_metrics') %}
+                  {% for metric in agent.get('score_metrics') %}
+                  <span {% if metric.get('detail') %}title="{{ metric.detail }}"{% endif %}>
+                    <span class="text-slate-400">{{ metric.label }}:</span>
+                    <span class="{% if metric.value >= 0.7 %}text-green-400{% elif metric.value >= 0.3 %}text-yellow-400{% else %}text-slate-300{% endif %} font-semibold">
+                      {{ "%.2f"|format(metric.value) }}
+                    </span>
+                  </span>
+                  {% endfor %}
+                  {% else %}
                   {% for metric, val in agent.get('mean_scores', {}).items() %}
                   <span>
                     <span class="text-slate-400">{{ metric }}:</span>
@@ -286,6 +307,7 @@
                     </span>
                   </span>
                   {% endfor %}
+                  {% endif %}
                 </div>
                 {% endfor %}
                 {% endif %}

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, TypeVar
 
 from cage.artifacts.resources import ResourceLedgerReader
+from cage.contracts.jsonio import iter_jsonl_lines
 from cage.experiment.model import (
     ArtifactIndex,
     ArtifactRef,
@@ -264,10 +265,7 @@ class ExperimentArtifactReader:
         if not path.is_file():
             return ()
         events: list[TrialEvent] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            text = line.strip()
-            if not text:
-                continue
+        for text in iter_jsonl_lines(path):
             raw = json.loads(text)
             if isinstance(raw, Mapping):
                 events.append(_trial_event_from_mapping(raw))

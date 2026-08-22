@@ -4,21 +4,130 @@
 # that location and prints the verdict + feedback. Exit 0 = passed, 1 = not yet.
 #
 #   $ cage-check
-#   FAIL [port_unreachable]
-#   Your target built and started, but nothing was listening on 0.0.0.0:31137 ...
+#   FAIL [image_contract_mismatch]
+#   The declared archival image tag is not attached to a build-backed service ...
 #
 # Override the validator URL with CAGE_CHECK_URL (default: local validator).
 set -euo pipefail
-URL="${CAGE_CHECK_URL:-http://127.0.0.1:8911/check}"
+MODE="check"
+RAW="0"
+for arg in "$@"; do
+  case "$arg" in
+    stop)
+      MODE="stop"
+      ;;
+    status)
+      MODE="status"
+      ;;
+    --json)
+      RAW="1"
+      ;;
+    *)
+      echo "usage: cage-check [--json] [stop|status]" >&2
+      exit 2
+      ;;
+  esac
+done
 
-resp="$(curl -sS --max-time 600 -X POST "$URL")" || {
-  echo "cage-check: could not reach the validator at $URL" >&2
+if [[ "$MODE" == "stop" ]]; then
+  URL="${CAGE_CHECK_STOP_URL:-${CAGE_CHECK_URL:-http://127.0.0.1:8911/check}}"
+elif [[ "$MODE" == "status" ]]; then
+  URL="${CAGE_CHECK_STATUS_URL:-${CAGE_CHECK_URL:-http://127.0.0.1:8911/check}}"
+else
+  URL="${CAGE_CHECK_URL:-http://127.0.0.1:8911/check}"
+fi
+
+REQUEST_TIMEOUT="${CAGE_CHECK_TIMEOUT_SECONDS:-2580}"
+if [[ ! "$REQUEST_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "cage-check: CAGE_CHECK_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
-}
+fi
+
+BUSY_RETRY_SECONDS="${CAGE_CHECK_BUSY_RETRY_SECONDS:-30}"
+BUSY_MAX_RETRIES="${CAGE_CHECK_BUSY_MAX_RETRIES:-70}"
+if [[ ! "$BUSY_RETRY_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "cage-check: CAGE_CHECK_BUSY_RETRY_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$BUSY_MAX_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "cage-check: CAGE_CHECK_BUSY_MAX_RETRIES must be a non-negative integer" >&2
+  exit 2
+fi
+
+busy_retries=0
+while true; do
+  resp="$(curl -sS --max-time "$REQUEST_TIMEOUT" -X POST "$URL")" || {
+    echo "cage-check: could not reach the validator at $URL" >&2
+    exit 2
+  }
+
+  [[ "$MODE" == "check" ]] || break
+  transient_failure="$(python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("")
+else:
+    failure_class = payload.get("failure_class")
+    transient = {
+        "validator_busy",
+        "host_runtime_network_exhausted",
+        "host_runtime_docker_timeout",
+        "validator_internal_error",
+    }
+    print(failure_class if failure_class in transient else "")
+' <<<"$resp" 2>/dev/null || true)"
+  [[ -n "$transient_failure" ]] || break
+  if (( busy_retries >= BUSY_MAX_RETRIES )); then
+    echo "cage-check: validator remained transiently unavailable after $busy_retries automatic retries" >&2
+    break
+  fi
+
+  busy_retries=$((busy_retries + 1))
+  echo "cage-check: validator transient $transient_failure; retry $busy_retries/$BUSY_MAX_RETRIES in ${BUSY_RETRY_SECONDS}s without consuming a check" >&2
+  sleep "$BUSY_RETRY_SECONDS"
+done
+
+if [[ "$RAW" == "1" ]]; then
+  printf '%s\n' "$resp"
+  exit 0
+fi
 
 echo "$resp" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
+if "stopped" in d:
+    print("STOPPED" if d.get("stopped") else "STOP-ERROR")
+    fb = (d.get("feedback") or "").strip()
+    if fb:
+        print(fb)
+    if d.get("network_name"):
+        print("network: {}".format(d.get("network_name")))
+    if d.get("requires_revalidation"):
+        print("requires_revalidation: true")
+    sys.exit(0 if d.get("stopped") and not d.get("requires_revalidation") else 1)
+
+if "runtime_present" in d:
+    present = bool(d.get("runtime_present"))
+    print("RUNTIME-PRESENT" if present else "NO-RUNTIME")
+    if d.get("runtime_id"):
+        print("runtime_id: {} generation={}".format(
+            d.get("runtime_id"), d.get("runtime_generation")
+        ))
+    if d.get("network_name"):
+        print("network: {} attached={}".format(
+            d.get("network_name"), str(bool(d.get("agent_attached"))).lower()
+        ))
+    for target in d.get("targets") or []:
+        print("target: {} {}:{}/{}".format(
+            target.get("service_name") or "service",
+            target.get("container_addr") or "unknown",
+            target.get("internal_port"),
+            target.get("protocol") or "tcp",
+        ))
+    sys.exit(0 if present and d.get("agent_attached") else 1)
+
 passed = bool(d.get("passed"))
 head = "PASS" if passed else "FAIL"
 fc = d.get("failure_class")
@@ -26,5 +135,47 @@ print(f"{head}" + (f" [{fc}]" if (fc and not passed) else ""))
 fb = (d.get("feedback") or d.get("explanation") or "").strip()
 if fb:
     print(fb)
+if not passed and d.get("retryable") is not None:
+    retryable = str(bool(d.get("retryable"))).lower()
+    print(f"retryable: {retryable}")
+if not passed and d.get("failure_class") == "runtime_probe_failed":
+    failed = (d.get("evidence") or {}).get("failed_probes") or []
+    for probe in failed:
+        attempt = probe.get("last_attempt") or {}
+        detail = json.dumps(attempt, ensure_ascii=False, sort_keys=True)
+        print("probe_failure: {} service={} detail={}".format(
+            probe.get("id"), probe.get("service"), detail[:1200]
+        ))
+if passed and d.get("container_addr"):
+    print("container_addr: {}".format(d.get("container_addr")))
+if passed:
+    tier = d.get("validated_rehost_tier")
+    if tier:
+        print(f"validated_rehost_tier: {tier}")
+    for target in d.get("targets") or []:
+        service = target.get("service_name") or "service"
+        addr = target.get("container_addr") or "unknown"
+        port = target.get("internal_port")
+        proto = target.get("protocol") or "tcp"
+        if port is not None:
+            print(f"target: {service} {addr}:{port}/{proto}")
+        else:
+            print(f"target: {service} {addr}")
+    probe_results = d.get("runtime_probe_results") or {}
+    if probe_results.get("passed"):
+        print("independent_runtime_probes: PASS ({})".format(probe_results.get("probe_count", 0)))
+        for probe in probe_results.get("probes") or []:
+            successful = next((a for a in probe.get("attempts") or [] if a.get("passed")), {})
+            excerpt = ""
+            response = successful.get("response") or {}
+            if response:
+                excerpt = str(response.get("body_excerpt") or "").strip().replace("\n", " ")[:240]
+                if response.get("status") is not None:
+                    excerpt = "HTTP {} {}".format(response.get("status"), excerpt).strip()
+            if not excerpt:
+                step = next((s for s in successful.get("steps") or [] if s.get("matched")), {})
+                excerpt = str(step.get("response_excerpt") or "").strip().replace("\n", " ")[:240]
+            line = "probe: {} service={}".format(probe.get("id"), probe.get("service"))
+            print(line + ((" excerpt=" + repr(excerpt)) if excerpt else ""))
 sys.exit(0 if passed else 1)
 '

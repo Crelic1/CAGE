@@ -381,6 +381,143 @@ def test_max_rounds_counts_successful_non_compact_rounds(tmp_path: Path) -> None
     assert info.reason is TerminationReason.MAX_ROUNDS_REACHED
 
 
+def _websearch_helper_entry(request_id: str) -> dict:
+    """A one-shot auxiliary call — its own conversation, not a root round.
+
+    This is what a harness's WebSearch/WebFetch helper looks like in the proxy
+    log: a single request with no conversation history behind it. The proxy
+    charges it to the round budget all the same.
+    """
+    return {
+        "request_id": request_id,
+        "status": "success",
+        "anthropic_request": {
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Perform a web search for: cage"}],
+            }],
+            "usage": {"input_tokens": 40, "output_tokens": 5},
+        },
+        "anthropic_response": {
+            "content": [{"type": "text", "text": "results"}],
+            "usage": {"input_tokens": 40, "output_tokens": 5},
+        },
+    }
+
+
+def _root_turn_entry(request_id: str, turn: int) -> dict:
+    """A root-conversation turn: history grows by one exchange each time."""
+    messages: list[dict] = []
+    for i in range(turn):
+        messages.append({"role": "user", "content": [{"type": "text", "text": f"step {i}"}]})
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": f"ack {i}"}]})
+    messages.append({"role": "user", "content": [{"type": "text", "text": f"step {turn}"}]})
+    return {
+        "request_id": request_id,
+        "status": "success",
+        "anthropic_request": {"messages": messages},
+        "anthropic_response": {
+            "content": [{"type": "text", "text": f"ack {turn}"}],
+            "usage": {"input_tokens": 100 * (turn + 1), "output_tokens": 20},
+        },
+    }
+
+
+def _compaction_entry(request_id: str) -> dict:
+    """A real compaction call: the model summarizing its own conversation."""
+    return {
+        "request_id": request_id,
+        "status": "success",
+        "anthropic_request": {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "step 0"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ack 0"}]},
+                {"role": "user", "content": [{
+                    "type": "text",
+                    "text": "Your task is to create a detailed summary of the conversation",
+                }]},
+            ],
+        },
+        "anthropic_response": {
+            "content": [{"type": "text", "text": "summary of the conversation so far"}],
+            "usage": {"input_tokens": 900, "output_tokens": 300},
+        },
+    }
+
+
+def test_max_rounds_gate_uses_the_counter_the_proxy_enforced(tmp_path: Path) -> None:
+    """Auxiliary calls spend the budget, so they must count toward the gate.
+
+    The proxy admits calls while ``successful - compact_rewrites < max_rounds``
+    — subagent, helper and compaction calls included. A classifier that
+    re-counted only root turns would see 2 < 3, miss the budget hit, and file
+    the trial under whatever error happened to be nearby.
+    """
+    proxy = _write_proxy_jsonl(tmp_path, [
+        _root_turn_entry("req-1", 0),
+        _websearch_helper_entry("req-2"),
+        _root_turn_entry("req-3", 1),
+    ])
+    info = classify_trial_termination(
+        exit_code=1,
+        timed_out=False,
+        terminated_by_limit=False,
+        proxy_jsonl_path=proxy,
+        max_rounds=3,
+    )
+
+    assert info.reason is TerminationReason.MAX_ROUNDS_REACHED
+    assert "3/3 upstream calls" in info.detail
+    assert "2 root rounds" in info.detail
+    assert "1 tool-side call" in info.detail
+
+
+def test_max_rounds_detail_never_prints_one_counter_as_the_other(tmp_path: Path) -> None:
+    """The reported numerator must be the one compared against max_rounds.
+
+    Reporting root rounds over the configured budget produced details like
+    "476/500" for trials the proxy had stopped at exactly 500 — a number that
+    reads as "stopped 24 rounds early" and sent people hunting for lost data.
+    """
+    proxy = _write_proxy_jsonl(tmp_path, [
+        _root_turn_entry("req-1", 0),
+        _websearch_helper_entry("req-2"),
+    ])
+    info = classify_trial_termination(
+        exit_code=137,
+        timed_out=False,
+        terminated_by_limit=False,
+        terminated_by_max_rounds=True,
+        proxy_jsonl_path=proxy,
+        max_rounds=2,
+    )
+
+    assert info.reason is TerminationReason.MAX_ROUNDS_REACHED
+    assert info.detail.startswith("Hit round budget - 2/2 upstream calls")
+    assert "1 root round" in info.detail
+    assert "orchestrator stopped the agent" in info.detail
+
+
+def test_max_rounds_detail_stays_plain_when_every_call_was_a_root_round(
+    tmp_path: Path,
+) -> None:
+    proxy = _write_proxy_jsonl(tmp_path, [
+        _root_turn_entry("req-1", 0),
+        _root_turn_entry("req-2", 1),
+    ])
+    info = classify_trial_termination(
+        exit_code=137,
+        timed_out=False,
+        terminated_by_limit=False,
+        terminated_by_max_rounds=True,
+        proxy_jsonl_path=proxy,
+        max_rounds=2,
+    )
+
+    assert info.detail.startswith("Hit round budget - 2/2 upstream calls;")
+    assert "root rounds" not in info.detail
+
+
 def test_max_input_tokens_budget_wins_over_terminal_proxy_error(tmp_path: Path) -> None:
     proxy = _write_proxy_jsonl(tmp_path, [
         {
@@ -514,3 +651,88 @@ def test_default_resume_retry_covers_all_unexpected_reasons() -> None:
     }
     assert expected_rerun.issubset(_DEFAULT_RESUME_RETRY_REASONS)
     assert _DEFAULT_RESUME_RETRY_REASONS.isdisjoint(expected_replayed)
+
+
+def test_max_rounds_detail_names_compaction_separately(tmp_path: Path) -> None:
+    """Lumping the leftovers made "3 compaction, 21 other" read as 24 compactions.
+
+    Compaction and helper calls cost the same budget but mean opposite things —
+    a handful of context folds is normal, dozens of side calls is where a budget
+    quietly drains — so the verdict names them apart. The parts still sum to the
+    number that was enforced.
+    """
+    proxy = _write_proxy_jsonl(tmp_path, [
+        _root_turn_entry("req-1", 0),
+        _compaction_entry("req-2"),
+        _root_turn_entry("req-3", 1),
+        _websearch_helper_entry("req-4"),
+    ])
+    info = classify_trial_termination(
+        exit_code=137,
+        timed_out=False,
+        terminated_by_limit=False,
+        terminated_by_max_rounds=True,
+        proxy_jsonl_path=proxy,
+        max_rounds=4,
+    )
+
+    assert "4/4 upstream calls" in info.detail
+    assert "1 compaction" in info.detail
+    assert "1 tool-side call" in info.detail
+    assert "2 root rounds" in info.detail
+
+
+def test_budget_verdict_trusts_the_enforcers_own_count(tmp_path: Path) -> None:
+    """The sidecar publishes what it charged; the host must not recompute it.
+
+    sidecar.py ships as a lone file into every agent container and may not
+    import cage code, so any counting rule written host-side is a second
+    implementation that will drift from the one actually enforcing the budget —
+    it already did once, which is how a trial stopped at its 500th admitted
+    call came to report "476/500". Here the log holds fewer records than the
+    proxy charged (trimmed log, an agent that outlived its own writes): the
+    verdict follows progress.json, not the record count.
+    """
+    proxy = _write_proxy_jsonl(tmp_path, [_root_turn_entry("req-1", 0)])
+    (tmp_path / "progress.json").write_text(
+        json.dumps({"total_requests": 4, "successful_requests": 4, "success": 4}),
+        encoding="utf-8",
+    )
+
+    info = classify_trial_termination(
+        exit_code=137,
+        timed_out=False,
+        terminated_by_limit=False,
+        terminated_by_max_rounds=True,
+        proxy_jsonl_path=proxy,
+        max_rounds=4,
+    )
+
+    assert info.reason is TerminationReason.MAX_ROUNDS_REACHED
+    assert "4/4 upstream calls" in info.detail
+    # The breakdown is still ours to derive, and still adds up to what was
+    # charged: 1 root round we can see, 3 calls we cannot account for.
+    assert "1 root round" in info.detail
+    assert "3 tool-side calls" in info.detail
+
+
+def test_budget_verdict_falls_back_to_the_log_without_progress_json(
+    tmp_path: Path,
+) -> None:
+    """Older and externally-assembled runs carry no progress.json."""
+    proxy = _write_proxy_jsonl(tmp_path, [
+        _root_turn_entry("req-1", 0),
+        _root_turn_entry("req-2", 1),
+    ])
+    assert not (tmp_path / "progress.json").exists()
+
+    info = classify_trial_termination(
+        exit_code=137,
+        timed_out=False,
+        terminated_by_limit=False,
+        terminated_by_max_rounds=True,
+        proxy_jsonl_path=proxy,
+        max_rounds=2,
+    )
+
+    assert "2/2 upstream calls" in info.detail

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from cage.experiment.engine.live.run_heartbeat import RunHeartbeat
 from cage.experiment.engine.scheduler import RunScheduler
 from cage.target.client import ChallengeClient
 from cage.target.provisioning import EmbeddedTargetServer
@@ -120,6 +121,12 @@ class RunCleanup:
         # status so the inspector never shows a phantom "Running" after a dead
         # run. The conductor binds it to the canonical record sweep.
         self.finalize_running_trials_hook: Any = None
+        # Writes ``runtime_status.json`` (orchestrator pid + periodic timestamp)
+        # into every subject's run dir, so "is this run alive?" is answered from
+        # the process itself rather than guessed from how recently some artifact
+        # happened to change. Owned here because it must be removed on *every*
+        # exit path, including the forced ones this class already handles.
+        self.heartbeat = RunHeartbeat()
 
     @classmethod
     def inactive(cls) -> "RunCleanup":
@@ -312,6 +319,14 @@ class RunCleanup:
         # Idempotent with the happy-path ``stop_host_services`` call.
         self.stop_host_services()
 
+        # Drop the heartbeat files. A run that exits — cleanly or not — must
+        # stop advertising itself as live; leaving them behind would make the
+        # inspector trust a pid that is about to disappear.
+        try:
+            self.heartbeat.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("teardown: run heartbeat stop failed: %s", exc)
+
         # Belt-and-suspenders: even after per-instance DELETE /launch teardown,
         # sweep any docker resource still tagged with our run id. Catches cases
         # where a DELETE never landed (server crashed, network error, kill -9,
@@ -454,6 +469,18 @@ class RunCleanup:
             if self._force_in_progress:
                 os._exit(128 + signum)
             self._force_in_progress = True
+            # Request stop BEFORE anything slow. ``teardown_all`` also does this,
+            # but it runs after ``_emit_final_summary`` — which reads every trial
+            # summary off disk to render the table (seconds on a large run). A
+            # ``kill``/``pkill`` that matches the per-trial ``docker exec`` command
+            # lines (they carry the container + model name) terminates those
+            # clients too, and a terminated ``docker exec`` client returns exit
+            # code 0. In-flight worker threads then race through
+            # ``interrupted = scheduler.is_stopped()`` inside that window, see
+            # False, and finalize a killed trial as a clean ``completed`` —
+            # which also makes ``--resume`` skip it. Setting the stop flag first
+            # closes the window; SIGINT already does this on the first press.
+            self.scheduler.request_stop()
             logger.warning("Received signal %s — tearing down active runs", signum)
             self._emit_final_summary()
             try:

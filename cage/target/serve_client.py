@@ -43,8 +43,11 @@ itself (localhost, the bridge IP, or a mounted docker socket) is a cheat the
 server cannot prevent: the host routes to every instance's bridge, and docker
 socket access lets a process ``exec`` into the target to read flags/markers. The
 docker network is host-local, so this strong-isolation path requires the agent
-to be co-located with the server; a genuinely remote agent must fall back to the
-weaker host-published ``entry_urls`` (``network_only=false``).
+to be co-located with the server. A genuinely remote agent cannot join that
+network at all, and is served instead by a server started with
+``--public-host``: its declared entry is published on the host and returned in
+``entry_urls`` (and named in the ``/prompt`` briefing), with the number of such
+instances capped — see ``ttl`` on :meth:`ServeClient.launch`.
 """
 from __future__ import annotations
 
@@ -203,9 +206,10 @@ class ServeClient:
         chal_id: str,
         *,
         target_scope: str = "per_agent",
-        network_only: bool = True,
+        network_only: bool | None = None,
         force_recreate: bool = False,
         prompt_level: str | None = None,
+        ttl: int | None = None,
     ) -> Instance:
         """``GET /launch/{chal_id}`` — start an isolated instance.
 
@@ -214,15 +218,32 @@ class ServeClient:
         ``prompt_level`` (``l0``/``l1``/``l2``) binds the task-briefing hint tier
         to THIS instance (read back via :meth:`prompt`); omit it to use the
         server's ``--prompt-level`` default.
+
+        ``network_only`` is omitted by default so the SERVER decides: normally
+        the target stays on the isolated docker network (reach it at
+        ``container_addr`` from a co-located container), but on a server started
+        with ``--public-host`` an external caller gets the entry published on
+        the host and returned in ``entry_urls``. Pass it explicitly only to
+        override that per launch.
+
+        ``ttl`` leases the instance for N seconds — it is reaped automatically
+        when the lease runs out. On a ``--public-host`` server, host-published
+        instances are capped, so a lease is how you promise to give the slot
+        back; without one, only an explicit :meth:`close` frees it. Over the
+        cap, the server answers 409 and :class:`ServeError` carries the
+        occupants and their remaining leases.
         """
         resp = self._request(
             "GET",
             f"/launch/{urllib.parse.quote(chal_id, safe='')}",
             params={
                 "target_scope": target_scope,
-                "network_only": "true" if network_only else "false",
+                "network_only": (
+                    None if network_only is None else ("true" if network_only else "false")
+                ),
                 "force_recreate": "true" if force_recreate else None,
                 "prompt_level": prompt_level,
+                "ttl": str(ttl) if ttl else None,
             },
         )
         resp = resp or {}

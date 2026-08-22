@@ -1,0 +1,44 @@
+There is NO build material (`AWP`): you have a writeup and a confirmed exploit
+but no Dockerfile/compose/deploy. Infer the runtime primarily from the writeup's
+concrete clues, corroborate it against the exploit's assumptions, and author a
+Dockerfile that realizes it. Cite BOTH sources. The exploit (P) is adapted to
+this rebuilt runtime in the exploit stage — keep the runtime faithful.
+
+## Infer the runtime, writeup-first
+
+{% if instance_data.materials.writeups %}Read the writeups ({% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}) for named runtime facts and quote each:{% else %}Read the writeup for named runtime facts and quote each:{% endif %}
+
+- an explicit Ubuntu/glibc version, a supplied libc name / build-id, allocator
+  behavior (tcache/fastbin notes), symbol availability, or stated offsets.
+- corroborate with the exploit{% if instance_data.materials.exploit %} ({% for p in instance_data.materials.exploit %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}: the leak-offset arithmetic,
+  `one_gadget` constants, and pointer width must agree with the writeup's glibc.
+  When writeup and exploit agree, confidence rises; when they conflict, the
+  exploit's concrete offsets win over the writeup's prose — record the conflict.
+- loader + architecture from the supplied binary's ELF header (attachments), and
+  protections (NX/PIE/canary/RELRO/CET) from both the writeup's description and
+  the exploit's assumptions. Cite the line for each.
+
+Select the catalog bundle (`instance_data.pwn_runtime`, cache
+`{{ instance_data.pwn_runtime.status }}`) matching the corroborated glibc series,
+or the supplied libc/loader pair. Record the selection with per-source citations
+in the `pwn_runtime` object (schema in the category section) with
+`confidence: corroborated` and `authenticity_status: inferred_corroborated` when
+writeup and exploit agree; downgrade to `inferred` for any property only one
+source anchors.
+
+## Realize it as a Dockerfile
+
+Author a Dockerfile installing the inferred libc/loader pair and preserving
+interpreter, arch, permissions, and the hardening both sources describe, served
+over the declared protocol. Do not bend the runtime to fit the historical
+exploit — the exploit is re-fitted to the runtime, not the reverse.
+
+## When neither source pins the runtime
+
+If the writeup names no concrete runtime fact and the exploit hardcodes no libc
+offset, emit `status: blocked` with a `runtime_inference_unsupported` blocker
+citing both sources' gaps; do not upgrade prose into a glibc minor version.
+
+{% if instance_data.category_profile == "pwn" %}
+{% include "_templates/pwn_service.j2" %}
+{% endif %}

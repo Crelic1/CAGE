@@ -75,6 +75,39 @@ inwards is what's expensive to undo.
 
 ---
 
+## Use the Seams That Exist
+
+The layer test says *where* code goes. This says *what to reach for once you're
+there*: *find the seam that already does this before writing a second one.*
+A parallel implementation does not stay equal to the original — it drifts, and
+then two places report two answers for the same fact.
+
+| Need | Go through |
+|---|---|
+| Read or write a JSON / JSONL artifact | `cage/contracts/jsonio.py` |
+| Where an artifact lives under `.cage_runs` | `cage/artifacts/run_storage.py`; indexed refs via `ExperimentArtifactReader` |
+| Name a trial's outcome or lifecycle stage | `cage/contracts/trial_status.py`, `trial_phase.py` |
+| Everything a scorer reads | `ScoringContext` — one scorer, three call sites |
+| Errors that classify a trial | `cage/contracts/exceptions.py` taxonomy |
+
+Two rules follow from it:
+
+- **One fact, one producer.** If a number already exists, read it. Recomputing
+  it beside the original is how a run overview and its own trial page came to
+  quote different call counts for the same trial.
+- **Across the container boundary, rules travel as data.** `proxy/sidecar.py`
+  ships alone into every agent container and imports zero cage code, so
+  whatever it enforces and the host also needs is *published* (`progress.json`)
+  and read back — never re-implemented host-side. A host-side recount of the
+  proxy's round budget drifted exactly this way until a trial stopped at its
+  500th call reported "476/500".
+
+Smells: a private `_read_json`/`splitlines()` helper next to an existing
+reader; a hand-built `run_dir / "trials" / tid / ...` path; a second copy of a
+rule the sidecar already enforces.
+
+---
+
 ## Core Invariants
 
 These are non-negotiable; break one and downstream things stop working:
@@ -101,6 +134,8 @@ These are non-negotiable; break one and downstream things stop working:
 ## When Working in This Repo
 
 - **Layer test first.** Before adding anything to `cage/`, prove it's universal.
+- **Then the seam test.** Adding a helper? Grep for the one that already exists
+  and use it. Two implementations of one rule is a bug with a delay fuse.
 - **Touching the trial lifecycle** (`experiment/engine/conductor.py` +
   `trial_runner.py`) usually means touching `proxy/host.py`, `sandbox/state.py`,
   and at least one example benchmark — keep them in sync.
@@ -139,5 +174,9 @@ These are non-negotiable; break one and downstream things stop working:
   benchmark-only / serve (PULL) mode: an external agent drives `cage benchmark
   serve` targets itself (list → launch → prompt → submit → close). The other
   agent-integration path vs [`agent-cage-managed`](docs/agent-cage-managed.md).
+- [`docs/training-corpus.md`](docs/training-corpus.md) — `cage corpus`:
+  turning finished runs into training rows. Compaction segmentation, the
+  contamination-vs-preference split, and the `admit_for_training` seam a
+  benchmark uses to contribute gates without the framework learning their names.
 - [`docs/serve-external-audience.md`](docs/serve-external-audience.md) —
   the serve HTTP contract: endpoints, two-audience port binding, external token.

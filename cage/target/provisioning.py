@@ -44,12 +44,24 @@ from cage.target.server.network_alloc import (
     allocate_cage_trial_subnet,
     release_cage_trial_subnet,
 )
+from cage.target.server.server_state import (
+    COMPOSE_UP_TIMEOUT_S,
+    STARTUP_TIMEOUT_S,
+)
 
 if TYPE_CHECKING:
     from cage.experiment.engine.run_context import ExperimentRun
 
 
 logger = logging.getLogger("cage.target.provisioning")
+
+# ``target.agent_network_isolation`` vocabulary. ``TRIAL_BRIDGE`` is the
+# default (cage owns the agent↔target network and only public services join
+# it); ``SEALED_TRIAL_BRIDGE`` adds "and the docker host is not on it either";
+# ``TRUST_SERVER`` is the legacy pass-through.
+TRIAL_BRIDGE = "per_trial_bridge"
+SEALED_TRIAL_BRIDGE = "per_trial_bridge_sealed"
+TRUST_SERVER = "trust_server"
 
 
 @dataclass
@@ -292,8 +304,15 @@ def target_launch_request_timeout_s(target_config: Any) -> float:
     if compose_up_timeout is None and startup_timeout is None:
         return 300.0
 
-    compose_s = float(compose_up_timeout if compose_up_timeout is not None else 1200.0)
-    startup_s = float(startup_timeout if startup_timeout is not None else 120.0)
+    # Fall back to the server's own defaults (which honour TARGET_SERVER_*
+    # env overrides) rather than re-hardcoding their values — otherwise a
+    # raised server timeout would be invisible to this client-side estimate.
+    compose_s = float(
+        compose_up_timeout if compose_up_timeout is not None else COMPOSE_UP_TIMEOUT_S
+    )
+    startup_s = float(
+        startup_timeout if startup_timeout is not None else STARTUP_TIMEOUT_S
+    )
     return max(300.0, (2.0 * compose_s) + (3.0 * startup_s) + 60.0)
 
 def challenges_from_benchmark(run: ExperimentRun) -> dict[str, Any]:
@@ -535,8 +554,20 @@ def build_agent_isolation_network(
     trial_id: str,
     target_data: dict[str, Any],
     agent_container_name: str | None = None,
+    *,
+    sealed: bool = False,
 ) -> AgentIsolationNetwork | None:
     """Create a cage-owned bridge with only public target services attached.
+
+    ``sealed=True`` additionally creates the bridge with no host-side IPv4
+    address (``com.docker.network.bridge.inhibit_ipv4``) on top of
+    ``--internal``. A normal docker bridge puts the host on the network as the
+    gateway, so an agent attached to it can dial every port the host has open —
+    sshd, the inspector, other runs' published target ports. Without a gateway
+    address the agent's netns has no route to the host at all ("Network
+    unreachable" at the kernel, not a filter rule), while docker's embedded DNS
+    and container-to-container traffic on the bridge keep working. Needs Docker
+    26+ for the driver option.
 
     The network name is keyed by ``(trial_id, agent_container_name)`` so that
     multiple agents running the same trial in parallel each get their own
@@ -601,6 +632,11 @@ def build_agent_isolation_network(
     ]
     for attempt in range(2):
         create_argv = ["docker", "network", "create", "--driver", "bridge"]
+        if sealed:
+            create_argv += [
+                "--internal",
+                "-o", "com.docker.network.bridge.inhibit_ipv4=true",
+            ]
         if subnet_cidr:
             create_argv += ["--subnet", subnet_cidr]
         create_argv += list(base_labels)
@@ -680,8 +716,9 @@ def build_agent_isolation_network(
         return None
 
     logger.info(
-        "Cage isolation: created %s (subnet=%s) with %d public target(s): %s",
+        "Cage isolation: created %s%s (subnet=%s) with %d public target(s): %s",
         network_name,
+        " [sealed: no host gateway]" if sealed else "",
         subnet_cidr or "docker-default",
         len(connected),
         ", ".join(name for name, _ in targets if _ in connected),
@@ -708,22 +745,70 @@ def attach_agent_to_target(
       ``None`` if no attachment was performed.
     - ``isolation`` is a teardown handle for the cage-private bridge, or
       ``None`` if we fell back to the server-returned network.
+
+    ``per_trial_bridge_sealed`` is ``per_trial_bridge`` plus "the agent gets no
+    route to the docker host". Because that is a containment guarantee rather
+    than a convenience, it fails closed: every fallback in this function ends at
+    a host-reachable network, so under the sealed policy they raise instead.
     """
+    sealed = isolation_policy == SEALED_TRIAL_BRIDGE
+    wants_trial_bridge = isolation_policy in (TRIAL_BRIDGE, SEALED_TRIAL_BRIDGE)
+
     if container.network_mode == "host":
-        if isolation_policy == "per_trial_bridge":
+        if sealed:
+            raise RuntimeError(
+                f"agent_network_isolation={SEALED_TRIAL_BRIDGE} requires a "
+                "docker network namespace, but the agent container uses host "
+                "networking (runtime.agent_network_mode: host) — it already "
+                "shares the host's netns. Set a docker network instead."
+            )
+        if wants_trial_bridge:
             logger.warning(
                 "Cage isolation requested but agent container uses host "
                 "networking — no docker namespace isolation is possible.",
             )
         return None, None
 
-    if isolation_policy == "per_trial_bridge":
+    if wants_trial_bridge:
         isolation = build_agent_isolation_network(
             trial_id, target_data, getattr(container, "name", None),
+            sealed=sealed,
         )
         if isolation is not None:
             container.sync_runtime_network(isolation.name)
             return isolation.name, isolation
+        if sealed:
+            # No bridge to build is normal, not fatal: a range that exposes its
+            # services only on its own compose networks (``exposure_mode:
+            # internal``) has no service flagged public, so there is nothing to
+            # re-home onto a private bridge. What matters is whether the network
+            # we fall back to still has the host on it — under containment the
+            # range's own networks were built with the host off them, and
+            # attaching there is exactly as safe.
+            from cage.sandbox.netproxy import host_holds_address_on
+
+            host_on = host_holds_address_on(server_network) if server_network else None
+            if server_network and host_on is False:
+                logger.info(
+                    "Cage isolation: no public target services for trial %s; "
+                    "attaching to %s, which the host is not on",
+                    trial_id, server_network,
+                )
+                container.sync_runtime_network(server_network)
+                return server_network, None
+            raise RuntimeError(
+                f"agent_network_isolation={SEALED_TRIAL_BRIDGE}: no sealed bridge "
+                f"could be built for trial {trial_id}, and falling back to "
+                f"{server_network or 'the server network'} would put the host "
+                f"back on the agent's network ("
+                + (
+                    "the host holds an address on it — is the target server "
+                    "running with TARGET_SERVER_HOST_OFF_NETWORKS?"
+                    if host_on
+                    else "no server network to fall back to"
+                )
+                + ")."
+            )
         if server_network:
             logger.warning(
                 "Cage isolation: could not enumerate public target containers "

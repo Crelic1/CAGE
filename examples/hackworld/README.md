@@ -30,7 +30,7 @@ cage model set openai-example --provider openai --model gpt-5.5 \
 cage model list
 ```
 
-The default config runs the `claude_code` agent (id `claude_code_baseline`) on
+The default config runs the `claude_code` agent (id `claude_code`) on
 the `openai-example` model. If the container reaches your model only through a
 host-side proxy, uncomment `proxy.upstream_http_proxy: http://<host-ip>:7890` in
 `default_hackworld.yml` (a Docker-reachable LAN IP, not `localhost`).
@@ -50,7 +50,7 @@ cage benchmark check hackworld --sample cb-htb-web-very_easy_flag_command --show
 cage benchmark build hackworld --sample cb-htb-web-very_easy_flag_command
 
 # one trial
-cage run hackworld --agent claude_code_baseline --model openai-example \
+cage run hackworld --agent claude_code --model openai-example \
   --sample cb-htb-web-very_easy_flag_command \
   --passk 1 --max-concurrent 1 --run-id hackworld-smoke-001
 ```
@@ -65,7 +65,7 @@ Build every target up front (still required), then drop `--sample` to run all 36
 
 ```bash
 cage benchmark build hackworld --max-concurrent 4
-cage run hackworld --agent claude_code_baseline --model openai-example --run-id hackworld-full-001
+cage run hackworld --agent claude_code --model openai-example --run-id hackworld-full-001
 ```
 
 Narrow with the same flags (`--sample`, `--passk`, `--max-sample-num N`).

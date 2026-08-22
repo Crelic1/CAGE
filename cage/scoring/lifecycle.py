@@ -282,8 +282,19 @@ def _score_trials(
             # the recovery path.
         _score_one_trial(result, benchmark, storage)
 
-def _build_summary(results: list[TrialResult]) -> dict[str, Any]:
+def _build_summary(
+    results: list[TrialResult],
+    benchmark: Any = None,
+) -> dict[str, Any]:
     """Build summary statistics from trial results.
+
+    ``mean_scores`` and ``pass_at_k`` below are the framework's *generic*
+    fallbacks — the only aggregation Layer 1 can justify knowing nothing about
+    the domain. They are not a claim about what a given benchmark's headline
+    number should be. A benchmark that has an opinion implements
+    :meth:`Benchmark.summarize_scores` and its metrics are emitted as
+    ``score_metrics``, which consumers render in preference. Layer 1 renders
+    what it is handed; it never second-guesses the labels or the arithmetic.
 
     When trials repeat the same ``sample_id`` (pass@k runs), also emit a
     ``pass_at_k`` block keyed by scorer name: pass@1 is the micro-average
@@ -386,7 +397,67 @@ def _build_summary(results: list[TrialResult]) -> dict[str, Any]:
             pass_at_k[scorer] = block
         summary["pass_at_k"] = pass_at_k
 
+    # Layer 2 gets the last word on both aggregates. Whatever it does not
+    # supply keeps the generic value computed above.
+    owned = _benchmark_summary(results, benchmark)
+    if owned.get("metrics"):
+        summary["score_metrics"] = owned["metrics"]
+    if owned.get("pass_at_k"):
+        summary["pass_at_k"] = owned["pass_at_k"]
+
     return summary
+
+
+def _benchmark_summary(
+    results: list[TrialResult],
+    benchmark: Any,
+) -> dict[str, Any]:
+    """Ask the benchmark how it summarizes a run, defensively.
+
+    A benchmark that declines (or predates the hook, or raises) leaves the
+    generic aggregates standing — a summary is never worth failing a finished
+    run over. ``metrics`` entries are normalized to ``{label, value, detail?}``
+    so consumers can render them without validating; anything malformed is
+    dropped rather than shipped to a template that would choke on it.
+    ``pass_at_k`` is passed through as data, only checked for shape.
+    """
+    hook = getattr(benchmark, "summarize_scores", None)
+    if not callable(hook):
+        return {}
+    try:
+        raw = hook(results)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("summarize_scores failed: %s", exc)
+        return {}
+    if not isinstance(raw, dict) or not raw:
+        return {}
+
+    owned: dict[str, Any] = {}
+
+    metrics: list[dict[str, Any]] = []
+    for entry in raw.get("metrics") or []:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            value = float(entry.get("value"))
+        except (TypeError, ValueError):
+            continue
+        metric: dict[str, Any] = {"label": label, "value": round(value, 4)}
+        detail = str(entry.get("detail") or "").strip()
+        if detail:
+            metric["detail"] = detail
+        metrics.append(metric)
+    if metrics:
+        owned["metrics"] = metrics
+
+    pass_at_k = raw.get("pass_at_k")
+    if isinstance(pass_at_k, dict) and pass_at_k:
+        owned["pass_at_k"] = pass_at_k
+
+    return owned
 
 def _sample_group_key(result: TrialResult) -> str:
     """Best-effort grouping key for pass@k breakdown.

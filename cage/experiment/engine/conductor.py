@@ -28,7 +28,6 @@ from cage.agents.base import AgentInstance
 from cage.artifacts.canonical_marks import (
     _mark_canonical_experiment_records_finished,
     _mark_canonical_run_scored,
-    finalize_canonical_running_trials,
     _mark_canonical_run_summary_artifact,
     _mark_canonical_trial_finished,
     _mark_canonical_trial_scoring_for_results,
@@ -36,8 +35,9 @@ from cage.artifacts.canonical_marks import (
     _reset_canonical_trial_for_rerun,
     _save_canonical_experiment_snapshot,
     _save_run_metadata_snapshot,
+    finalize_canonical_running_trials,
 )
-from cage.artifacts.jsonio import _load_json_file, _write_json_file
+from cage.contracts.jsonio import load_json_file, write_json_file
 from cage.artifacts.record_snapshots import (
     _build_run_manifest,
     _result_terminal_status,
@@ -76,8 +76,13 @@ from cage.experiment.engine.resume import (
 )
 from cage.experiment.engine.run_cleanup import RunCleanup
 from cage.experiment.engine.run_context import ExperimentRun
-from cage.experiment.engine.scheduler import RunScheduler
-from cage.experiment.engine.trial_runner import run_trial_isolated
+from cage.experiment.engine.live.run_tuning import TuningWatcher, write_launch_baseline
+from cage.experiment.engine.scheduler import EndpointPool, RunScheduler
+from cage.experiment.engine.trial_runner import (
+    _trial_failure_result,
+    _trial_setup_interrupted_result,
+    run_trial_isolated,
+)
 from cage.experiment.model import Trial, TrialResult
 from cage.rl.reward_sink import report_trial_rewards
 from cage.sandbox.admission import HostMemoryGate
@@ -97,6 +102,20 @@ logger = logging.getLogger(__name__)
 _UNLIMITED_CONCURRENCY = 100_000
 
 
+def _build_endpoint_pool(agent: Any) -> EndpointPool | None:
+    """Build ``agent``'s endpoint pool, or None when it has a single endpoint.
+
+    Capacity comes from ``AgentInstance.source_concurrency`` (source id → cap),
+    populated from ``sources: [box:16]`` / ``{id: box, concurrency: 16}`` in the
+    experiment yaml. A source absent from that mapping is uncapped.
+    """
+    sources = list(getattr(agent, "model_sources", None) or [])
+    if len(sources) <= 1:
+        return None
+    caps: dict[str, int] = dict(getattr(agent, "source_concurrency", None) or {})
+    return EndpointPool([(src, caps.get(str(src.id))) for src in sources])
+
+
 class _TrialCancelled(Exception):
     """A queued trial was skipped because a graceful stop (Ctrl+C) was requested."""
 
@@ -108,7 +127,7 @@ def _archive_existing_run_dirs_for_force(existing_dirs: list[Path], run_id: str)
         run_dir.rename(archive)
         archived_run_id = archive.name
         _tag_force_archived_dashboard(archive, run_id, archived_run_id)
-        _write_json_file(
+        write_json_file(
             archive / "force_archive.json",
             {
                 "archived_from_run_id": run_id,
@@ -126,13 +145,13 @@ def _tag_force_archived_dashboard(
     dashboard_path = archive / "dashboard.json"
     if not dashboard_path.exists():
         return
-    dashboard = _load_json_file(dashboard_path)
+    dashboard = load_json_file(dashboard_path)
     if not isinstance(dashboard, dict):
         return
     dashboard["run_id"] = archived_run_id
     dashboard["archived_from_run_id"] = original_run_id
     dashboard["archive_reason"] = "force_run_id_reuse"
-    _write_json_file(dashboard_path, dashboard)
+    write_json_file(dashboard_path, dashboard)
 
 def _next_force_archive_path(run_dir: Path, archived_at: str) -> Path:
     base = run_dir.with_name(f"{run_dir.name}.previous_{archived_at}")
@@ -257,7 +276,7 @@ def run_experiment(
     _gc = int(run.execution.max_trials_global or 0)
     _trial_cap = _gc if _gc > 0 else _UNLIMITED_CONCURRENCY
     _agent_caps = {
-        id(_agent): int(getattr(_agent, "max_concurrent", 0) or 0) or 1024
+        id(_agent): int(getattr(_agent, "max_concurrent", 0) or 0) or _UNLIMITED_CONCURRENCY
         for _agent in run.agents
     }
     _target_setup_cap = max(0, int(getattr(run.execution, "max_target_setups", 1) or 0))
@@ -270,11 +289,62 @@ def run_experiment(
             for a in run.agents
         },
     )
+    # Endpoint pools: one per multi-source agent. Taking a slot picks the
+    # endpoint, so a box declared with more capacity takes proportionally more
+    # trials and a saturated one is skipped — see ``EndpointPool``. A source
+    # with no declared cap is uncapped; the framework does not invent a number
+    # for a box whose size it cannot know.
+    _endpoint_pools = {
+        id(_agent): pool
+        for _agent in run.agents
+        if (pool := _build_endpoint_pool(_agent)) is not None
+    }
+    for _agent in run.agents:
+        _pool = _endpoint_pools.get(id(_agent))
+        if _pool is None:
+            continue
+        logger.debug(
+            "endpoint pool for %s: %s (total slots=%s)",
+            _agent.label(),
+            {
+                _pool.endpoint(i).id: _pool.capacity(i) if _pool.capacity(i) is not None else "∞"
+                for i in range(len(_pool))
+            },
+            _pool.total_slots if _pool.total_slots is not None else "∞",
+        )
+    primary_run_dir = (
+        cage_runs / run.agents[0].label() / run_id
+        if run.agents
+        else cage_runs / run_id
+    )
+    # The tuning file is the run's live endpoint state. Writing the launch pool
+    # into it makes it the COMPLETE picture instead of a diff: reading it shows
+    # what the run is doing now, and `--tune --clear` has a baseline to restore.
+    _agent_labels = {id(_agent): _agent.label() for _agent in run.agents}
+    _tuning_watcher = None
+    if _endpoint_pools:
+        write_launch_baseline(primary_run_dir, {
+            _agent_labels[_aid]: {
+                _pool.endpoint(i).id: _pool.capacity(i) for i in range(len(_pool))
+            }
+            for _aid, _pool in _endpoint_pools.items()
+        })
+        _tuning_watcher = TuningWatcher(run_dir=primary_run_dir)
+        # Our own write must not read back as an operator change.
+        _tuning_watcher.prime()
+
     scheduler = RunScheduler(
         trial_cap=_trial_cap,
         agent_caps=_agent_caps,
         target_setup_cap=_target_setup_cap,
         admission=HostMemoryGate(run.admission),
+        endpoint_pools=_endpoint_pools,
+        # Only a run with an endpoint pool has anything tunable, so only it pays
+        # the per-trial stat.
+        tuning_watcher=_tuning_watcher,
+        agent_labels=_agent_labels,
+        # Re-read at tune time so an endpoint registered after launch can join.
+        models_file=str(getattr(run, "models_file", "") or ""),
     )
     cleanup = RunCleanup(run_id, scheduler)
     cleanup.install_signal_handlers()
@@ -291,6 +361,12 @@ def run_experiment(
     cleanup.finalize_running_trials_hook = lambda: finalize_canonical_running_trials(
         cage_runs, run_id=run_id, completed_at=time.strftime("%Y-%m-%dT%H:%M:%S")
     )
+    # Start advertising this orchestrator's pid before any subject's run dir
+    # exists; ``_run_single_agent`` calls ``track`` as each one is created. The
+    # heartbeat is what lets the inspector say "running" during the long quiet
+    # stretches — image pulls, target boot, a single multi-hour agent turn —
+    # when no artifact on disk is changing.
+    cleanup.heartbeat.start()
 
     # target_server lifecycle: ALWAYS embedded and bound to this run. The
     # orchestrator spawns a subprocess on a free localhost port and sets
@@ -301,13 +377,21 @@ def run_experiment(
         bench_root = discover_benchmark_root(run.benchmark)
         embedded_log = cage_runs / f"target_server-{run_id}.log"
         try:
+            from cage.experiment.engine.containment import target_server_env
+
             embedded_hub = spawn_embedded_target_server(
                 run_id=run_id, benchmark_root=bench_root,
                 log_path=embedded_log,
-                extra_env=target_server_timeout_env(
-                    run.target,
-                    benchmark_id=str(run.metadata.get("benchmark_id") or ""),
-                ),
+                extra_env={
+                    **target_server_timeout_env(
+                        run.target,
+                        benchmark_id=str(run.metadata.get("benchmark_id") or ""),
+                    ),
+                    # Leg 3 of runtime.network_containment: the range's own
+                    # compose networks get built with the host off them, and the
+                    # egress proxy is attached to each one after compose up.
+                    **target_server_env(run),
+                },
             )
             run.cleanup.embedded_hub = embedded_hub
             run.target.server_url = embedded_hub.server_url
@@ -368,11 +452,6 @@ def run_experiment(
             len(plan.replay) + len(plan.capped) for plan in resume_plans
         )
 
-    primary_run_dir = (
-        cage_runs / run.agents[0].label() / run_id
-        if run.agents
-        else cage_runs / run_id
-    )
     inspect_mode = str(getattr(run.logging, "inspect_mode", "on") or "on").lower()
     board_url = ""
     run_url = ""
@@ -429,6 +508,11 @@ def run_experiment(
         else None
     )
     run.reporter = run_reporter
+    # ``running=N/cap``: the cap must be read live, not frozen at launch — a
+    # tune can grow the pool from 20 slots to 52 and a stale denominator would
+    # keep insisting the run is nearly full.
+    if run_reporter is not None and hasattr(run_reporter, "bind_capacity_source"):
+        run_reporter.bind_capacity_source(scheduler.live_slot_capacity)
     # Forced exit (Ctrl+C×2 / SIGTERM) ``os._exit``s from the signal handler and
     # never reaches the end-of-run results table; let it print the reporter's
     # final status line first so the user always sees the final situation.
@@ -517,6 +601,10 @@ def run_experiment(
         # Stop host-side per-run services (e.g. the OAuth refresher) on the happy
         # path; the signal/atexit teardown covers Ctrl+C and SIGTERM.
         run.cleanup.stop_host_services()
+        # Stop advertising the run as live before the terminal records are
+        # written, so there is no window in which a finished run still carries a
+        # fresh heartbeat.
+        run.cleanup.heartbeat.stop()
         clear_all_context()
 
         if fatal_resume_error is not None:
@@ -569,7 +657,10 @@ def run_experiment(
             ],
             "agents": {
                 label: {
-                    **_build_summary(all_results.get(label, [])),
+                    **_build_summary(
+                        all_results.get(label, []),
+                        getattr(run, "benchmark", None),
+                    ),
                     **agent_artifacts.get(label, {}),
                 }
                 for label in ordered_labels
@@ -633,21 +724,37 @@ def _run_agent_trials_parallel(
         # flips planned→running only for trials genuinely in flight. Marking it at
         # pool admission made every trial queued behind the concurrency gate look
         # "running" on disk while the CLI correctly counted only the N in-flight.
+        attempt_started_ms = int(time.time() * 1000)
         try:
             result = run_trial_isolated(
                 run, agent, trial, cage_runs, run_id, reporter=reporter,
                 scheduler=run.scheduler, cleanup=run.cleanup,
             )
-        except Exception:
-            if reporter is not None:
-                reporter.trial_finished(
-                    agent_label=agent_label,
+        except Exception as exc:
+            # ``run_trial_isolated`` owns most of the trial lifecycle, but a
+            # failure during the outer container/bootstrap phase can escape
+            # before ``execute_trial`` gets a chance to build its structured
+            # failure result.  The worker used to log that exception and drop
+            # it, leaving the durable record permanently at ``running`` (and
+            # omitting the result from scoring/resume).  Project every escaped
+            # exception into a terminal TrialResult here, at the last boundary
+            # shared by serial and parallel execution.
+            if run.scheduler is not None and run.scheduler.is_stopped():
+                result = _trial_setup_interrupted_result(
+                    started=attempt_started_ms,
+                    storage=storage,
+                    trial=trial,
                     trial_id=trial.id,
-                    status="failed",
-                    duration_ms=None,
-                    exit_code=-1,
                 )
-            raise
+            else:
+                result = _trial_failure_result(
+                    exc=exc,
+                    run=run,
+                    started=attempt_started_ms,
+                    storage=storage,
+                    trial=trial,
+                    trial_id=trial.id,
+                )
         _mark_canonical_trial_finished(
             storage=storage,
             agent=agent,
@@ -767,6 +874,11 @@ def _run_single_agent(run: ExperimentRun, agent: AgentInstance) -> list[TrialRes
         _save_planned_trials(storage, trials)
         _save_run_manifest(storage, run_manifest)
 
+        # This subject's run dir now exists and the inspector will discover it;
+        # start stamping the heartbeat into it so it never reads as a dead run
+        # while its first trial is still pulling images or booting a target.
+        run.cleanup.heartbeat.track(storage.run_dir)
+
         # Execution cap (``--max-trial`` / runtime.max_trial): keep the full
         # plan recorded above, but only act on trials below the index cap this
         # invocation. The rest stay pending for a later capless run.
@@ -855,6 +967,16 @@ def _run_single_agent(run: ExperimentRun, agent: AgentInstance) -> list[TrialRes
         else:
             _agent_cap = int(getattr(agent, "max_concurrent", 0) or 0)
             trial_workers = _agent_cap if _agent_cap > 0 else max(1, len(pending_trials))
+        # A worker blocked on the endpoint gate is not running a trial, so the
+        # pool has to be at least as large as the endpoint capacity or those
+        # slots can never all be filled — the pool, not the declared capacity,
+        # would silently become the cap. Threads that are parked cost almost
+        # nothing; unfilled endpoint slots cost throughput.
+        _sched = getattr(run, "scheduler", None)
+        _pool = _sched.endpoint_pool(agent) if _sched is not None else None
+        _endpoint_slots = _pool.total_slots if _pool is not None else None
+        if _endpoint_slots:
+            trial_workers = max(trial_workers, _endpoint_slots)
         if not pending_trials:
             results = []
         elif trial_workers > 1:
@@ -883,7 +1005,7 @@ def _run_single_agent(run: ExperimentRun, agent: AgentInstance) -> list[TrialRes
     # No-op unless this agent's model declares ``rl_reward_sink``.
     report_trial_rewards(run, agent, results)
 
-    summary = _build_summary(results)
+    summary = _build_summary(results, run.benchmark)
     storage.save_summary(summary)
     _mark_canonical_run_summary_artifact(storage)
     _mark_canonical_run_scored(storage, results)

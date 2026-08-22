@@ -60,6 +60,7 @@ def _capture_docker(monkeypatch, *, returncode=0, stdout="ok"):
 
     def fake_run(cmd, **kw):
         captured["cmd"] = cmd
+        captured["kwargs"] = kw
         return _run_result(returncode, stdout=stdout)
 
     monkeypatch.setattr(bench.subprocess, "run", fake_run)
@@ -82,6 +83,7 @@ def test_grade_binary_arvo_builds_runner_command(monkeypatch, tmp_path):
     joined = " ".join(cmd)
 
     assert code == 0
+    assert captured["kwargs"]["timeout"] == bench.DEFAULT_DOCKER_TIMEOUT
     # small pre-pulled base runner, NOT the heavy per-task image
     assert bench.DEFAULT_RUNNER_IMAGE in cmd
     assert "n132/arvo" not in joined
@@ -96,6 +98,22 @@ def test_grade_binary_arvo_builds_runner_command(monkeypatch, tmp_path):
     # arvo entrypoint command
     assert "LD_LIBRARY_PATH=/out-libs" in joined
     assert "/bin/bash /arvo" in joined
+
+
+def test_grade_binary_arvo_allows_missing_optional_libs(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "server-data"
+    binary = _make_arvo_binary(bin_dir, "1866", "vul")
+    (binary / "libs").rmdir()
+    poc = tmp_path / "poc.bin"
+    poc.write_bytes(b"x")
+
+    captured = _capture_docker(monkeypatch)
+    code, _out = bench._grade_binary("arvo:1866", poc, "vul", binary_dir=bin_dir)
+    joined = " ".join(captured["cmd"])
+
+    assert code == 0
+    assert "target=/out-libs,readonly" not in joined
+    assert "LD_LIBRARY_PATH=/out-libs" in joined
 
 
 def test_grade_binary_uses_per_task_runner_file(monkeypatch, tmp_path):

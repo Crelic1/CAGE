@@ -39,6 +39,7 @@ from cage.config import WebInspectorAuthConfig, WebInspectorUIConfig
 from cage.contracts.coerce import int_or_zero
 from cage.contracts.duration import split_duration_hms
 from cage.contracts.scoring import extract_numeric_score_value
+from cage.experiment.engine.termination_model import agent_was_cut_off
 from cage.gc.summary import summarize_resource_ledger
 
 from .cache import (
@@ -52,6 +53,8 @@ from .data import (
     _format_file_size,
     _iter_cage_runs_dirs,
     aggregate_run_tool_counts,
+    build_target_failure,
+    build_trial_error_report,
     build_trial_file_tree,
     build_trial_termination,
     enrich_canonical_trial_rows,
@@ -2609,7 +2612,15 @@ def _render_run_detail(run_dir: Path):
         for agent_data in dashboard.get("agents", {}).values():
             if isinstance(agent_data, dict):
                 agent_data.update(counts)
-        has_running = counts.get("running", 0) > 0
+        # The record's ``running`` count is trials not-yet-terminal, which stays
+        # >0 after a crash/interrupt that never finalized them — so it can't stand
+        # in for "is anything live right now". Gate it on real filesystem activity
+        # (the same authoritative signal the rows were just demoted against, and
+        # that the summary page's running badge uses) so a dead run's header can't
+        # say "Running" while every visible row reads "Interrupted". The scan is
+        # already warm from _demote_stale_running_rows above (1s TTL), so this is
+        # effectively free.
+        has_running = counts.get("running", 0) > 0 and run_has_live_activity(run_dir)
         run_overview = _build_run_overview(
             run_dir, dashboard, trials_with_paths, run_history,
             counts_override=counts, ids_override=all_ids,
@@ -2899,8 +2910,20 @@ def _render_trial_detail(trial_dir: Path):
             "reason_kind": trial_status.get("status_kind", "pending"),
             "url": _trial_url_for(trial_dir, run_dir),
         }]
+    # Whether the recorded output is a conclusion or the middle of a sentence.
+    # The taxonomy already knows; the panel just has to stop calling both of
+    # them "Final Output".
+    output_was_cut_off = agent_was_cut_off(termination.get("reason", ""))
     trial_diagnosis = _build_trial_diagnosis(trial_status, termination, trial)
     trial_outcome = _build_trial_benchmark_outcome(trial)
+    # For a trial that failed because its target (靶机) never came up, surface the
+    # target's own error prominently (issue #1) instead of leaving it as an empty
+    # inline span with the real cause buried in target_logs/.
+    target_failure = build_target_failure(trial_dir, termination)
+    # Same idea for a trial that died of an exception rather than a dead target:
+    # show the type, the phase it escaped from, and the traceback instead of one
+    # truncated line whose real cause is only in the run's hidden log file.
+    trial_error_report = build_trial_error_report(trial_dir)
     score_details = load_trial_score_details(trial_dir)
     # Pretty-printed score payload, shown verbatim like the on-disk score file
     # (ensure_ascii=False keeps real characters such as → instead of →).
@@ -2941,6 +2964,9 @@ def _render_trial_detail(trial_dir: Path):
         termination=termination,
         trial_diagnosis=trial_diagnosis,
         trial_outcome=trial_outcome,
+        output_was_cut_off=output_was_cut_off,
+        target_failure=target_failure,
+        trial_error_report=trial_error_report,
         score_details=score_details,
         score_details_pretty=score_details_pretty,
         token_context=token_context,
@@ -3176,6 +3202,137 @@ def trial_detail_project(project: str, run_id: str, trial_rel: str):
     if run_dir is None:
         abort(404)
     return _redirect_or_render_trial(_resolve_trial_candidate(run_dir, trial_rel), run_dir)
+
+
+def _send_corpus(path: Path, filename: str):
+    """Serve a finished corpus as a plain file.
+
+    ``conditional`` is what gives it a ``Content-Length`` and honours ranges, so
+    a download broken at 90% resumes instead of starting the transfer again.
+    """
+    return send_file(
+        path,
+        mimetype="application/x-ndjson",
+        as_attachment=True,
+        download_name=filename,
+        conditional=True,
+    )
+
+
+def _corpus_export(scope: str, run_dir: Path, trial_id: str = ""):
+    """Start or join the export of a run (or one trial), and serve it when ready.
+
+    Never streams the work into the response. A browser that disconnects used to
+    throw away ninety seconds of parsing, and a second click used to start a
+    second full scan of the same gigabytes. The job runs behind the request, so
+    a disconnect costs nothing and a repeat click joins what is already running.
+
+    Once finished the corpus is an ordinary file, served with a length and with
+    ranges honoured — so an interrupted download resumes instead of starting
+    over.
+    """
+    from cage.artifacts.run_storage import iter_live_trial_dirs
+    from cage.corpus.build import BuildOptions
+    from cage.corpus.export import Selection, Tally, iter_rows, run_ref_for
+    from cage.corpus.jobs import cache_dir, cache_key, registry, run_fingerprint
+
+    ref = run_ref_for(run_dir)
+    if ref is None:
+        abort(404)
+
+    label = f"{ref.run_id}/{trial_id}" if trial_id else ref.run_id
+    filename = (
+        f"{ref.run_id}__{trial_id.replace('/', '__')}.jsonl" if trial_id
+        else f"{ref.run_id}.jsonl"
+    )
+    root = Path(current_app.config["ROOT_DIR"])
+    key = cache_key(scope + "|" + trial_id, run_dir, run_fingerprint(run_dir))
+    path = cache_dir(root) / f"{key}-{filename}"
+
+    want_status = request.args.get("status") == "1"
+
+    job = registry.get(key)
+    # The registry lives in memory; the artifact lives on disk. A restarted
+    # inspector would otherwise re-derive a corpus it already has, which for a
+    # large run is minutes of parsing for a file sitting right there. The name
+    # carries the run's fingerprint, so a file under this key is current by
+    # construction.
+    if job is None and path.is_file():
+        if want_status:
+            sidecar = path.with_suffix(path.suffix + ".meta.json")
+            try:
+                summary = json.loads(sidecar.read_text())
+            except Exception:
+                summary = {"rows": sum(1 for _ in open(path, errors="replace"))}
+            summary.update({"state": "done", "cached": True, "filename": filename})
+            return jsonify(summary)
+        return _send_corpus(path, filename)
+
+    if job is None:
+        selection = Selection(
+            run_ids=(ref.run_id,), tasks=(trial_id,) if trial_id else ()
+        )
+        total = 1 if trial_id else len(iter_live_trial_dirs(run_dir))
+        log = current_app.logger
+        tally = Tally()
+
+        def produce(running_job):
+            yield from iter_rows(run_dir.parent.parent, selection, BuildOptions(), tally)
+            log.info(
+                "corpus export %s: %d rows from %d/%d trials%s",
+                label, tally.rows, tally.trials_kept, tally.trials_seen,
+                f" (refused: {dict(tally.gates)})" if tally.gates else "",
+            )
+
+        job = registry.submit(key, label, path, produce, total=total, tally=tally)
+
+    payload = job.as_dict()
+    payload["download_url"] = request.path
+    if job.state == "done":
+        # The status view stays JSON even when the file is ready, so a caller
+        # can tell an empty-but-correct export (every trial refused by a
+        # contamination gate) from a broken one before downloading nothing.
+        return jsonify(payload) if want_status else _send_corpus(job.path, filename)
+    return jsonify(payload), (500 if job.state == "failed" else 202)
+
+
+@inspector_bp.route("/run/<encoded>/corpus.jsonl")
+def export_run_corpus(encoded: str):
+    """Every trajectory in this run as one training-corpus JSONL.
+
+    Exactly what ``cage corpus export --run <id>`` writes — same code path, same
+    defaults, same benchmark admission gates — so the button and the command
+    cannot drift apart.
+    """
+    run_dir = _decode_path(encoded)
+    if not run_dir.is_dir():
+        abort(404)
+    return _corpus_export("run", run_dir)
+
+
+@inspector_bp.route("/trial/<encoded>/corpus.jsonl")
+def export_trial_corpus(encoded: str):
+    """One trial's trajectory, in the same shape a whole-run export produces."""
+    trial_dir = _decode_path(encoded)
+    if not trial_dir.is_dir():
+        abort(404)
+    run_dir, _ = _run_dir_and_trial_id(trial_dir)
+    if run_dir is None:
+        abort(404)
+    trials_root = run_dir / "trials"
+    try:
+        trial_id = trial_dir.relative_to(trials_root).as_posix()
+    except ValueError:
+        trial_id = trial_dir.name
+    return _corpus_export("trial", run_dir, trial_id)
+
+
+def _run_dir_and_trial_id(trial_dir: Path) -> tuple[Path | None, str]:
+    """Walk up from a trial to its run, however deeply the trial is nested."""
+    for parent in trial_dir.parents:
+        if parent.name == "trials":
+            return parent.parent, trial_dir.relative_to(parent).as_posix()
+    return None, ""
 
 
 @inspector_bp.route("/trial/<encoded>/download/<file_encoded>")

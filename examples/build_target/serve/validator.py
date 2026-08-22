@@ -17,6 +17,7 @@ Endpoints:
   POST /check   → boot-check the designated location now; return verdict + feedback
   GET  /check   → same as POST (convenience)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,6 +44,7 @@ class _Ctx:
         sample_id: str,
         serve_root: Path,
         internal_port: int | None = None,
+        image_names: list[str] | None = None,
     ) -> None:
         self.serve_root = serve_root
         self.benchmark = load_benchmark_from_module(benchmark_module)
@@ -62,6 +64,9 @@ class _Ctx:
             self.sample = {"id": sample_id}
         if internal_port:
             self.sample["internal_port"] = internal_port
+        if image_names:
+            self.sample["image_names"] = list(dict.fromkeys(image_names))
+            self.sample["image_name"] = self.sample["image_names"][0]
         # Reuse the benchmark's prompt so the agent's briefing matches cage run.
         try:
             self.task_prompt = str(self.benchmark.build_prompt(self.sample) or "")
@@ -95,6 +100,11 @@ class _Ctx:
             "service_logs_tail": meta.get("service_logs_tail"),
             "agent_self_check_present": meta.get("agent_self_check_present"),
             "agent_service_output": meta.get("agent_service_output"),
+            "retained_local_images": meta.get("retained_local_images"),
+            "image_manifest": meta.get("image_manifest"),
+            "validated_rehost_tier": meta.get("validated_rehost_tier"),
+            "runtime_probe_results": meta.get("runtime_probe_results"),
+            "runtime_probe_evidence": meta.get("runtime_probe_evidence"),
             "review_files": meta.get("review_files"),
             "evidence": meta.get("evidence", {}),
         }
@@ -140,16 +150,37 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="CAGE artifact-validation serve")
     ap.add_argument("--benchmark", required=True, help="path to benchmark.py")
     ap.add_argument("--sample", required=True, help="sample id to validate against")
-    ap.add_argument("--internal-port", type=int, default=None,
-                    help="target port to probe; overrides/replaces the sample's (needed when the dataset isn't present)")
-    ap.add_argument("--root", required=True, help="serve root; the agent writes into <root>/workspace")
+    ap.add_argument(
+        "--internal-port",
+        type=int,
+        default=None,
+        help=(
+            "target port metadata override (needed when the dataset is absent; "
+            "the current scorer remains boot-only)"
+        ),
+    )
+    ap.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="required local archival image tag (repeatable; needed when the dataset is absent)",
+    )
+    ap.add_argument(
+        "--root", required=True, help="serve root; the agent writes into <root>/workspace"
+    )
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8911)
     args = ap.parse_args()
 
     serve_root = Path(args.root).resolve()
     (serve_root / "workspace").mkdir(parents=True, exist_ok=True)
-    app = _Ctx(Path(args.benchmark).resolve(), args.sample, serve_root, args.internal_port)
+    app = _Ctx(
+        Path(args.benchmark).resolve(),
+        args.sample,
+        serve_root,
+        args.internal_port,
+        args.image,
+    )
 
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(app))
     print(

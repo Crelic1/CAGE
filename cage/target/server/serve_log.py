@@ -36,7 +36,8 @@ On-disk layout (one directory per submission)::
       task_output.json                # {output, sample} — the scorer's sample
       runtime/check_done_output.txt   # frozen verifier evidence (gather output)
       workspace/final_answer/...       # persisted agent findings (judge input)
-      scores/<scorer>.json            # the canonical pass's score
+      scores/<scorer>.json            # the canonical (newest) pass's score
+      scores/passes/<nnn>__<pass>/    # every pass's own score, never overwritten
       scores/judge_io.jsonl           # judge audit log (written by the scorer)
 """
 from __future__ import annotations
@@ -52,6 +53,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from cage.artifacts.records import _sha256_artifact_path, _sha256_file
+from cage.target.server.schemas import epoch_to_rfc3339
 
 SERVE_ROOT_DIRNAME = ".cage_serve"
 
@@ -62,6 +64,7 @@ _CHECK_DONE_FILENAME = "check_done_output.txt"
 _WORKSPACE_DIRNAME = "workspace"
 _FINAL_ANSWER_DIRNAME = "final_answer"
 _SCORES_DIRNAME = "scores"
+_PASSES_DIRNAME = "passes"
 
 SCHEMA_VERSION = "serve_submission.v1"
 
@@ -133,11 +136,21 @@ def _challenge_dir(challenge: Mapping[str, Any]) -> Path | None:
 
 
 def _instance_launch_time(instance: Mapping[str, Any]) -> str:
-    """Best-effort launch timestamp from the instance registry (ISO8601 or "")."""
+    """Best-effort launch timestamp from the instance registry (ISO8601 or "").
+
+    The registry stores ``created_at`` as UNIX EPOCH SECONDS (a float, set by
+    ``launch.py``), while this record declares an ISO8601 string — and the two
+    are *not* interchangeable. Conversion goes through the same
+    :func:`epoch_to_rfc3339` the HTTP layer uses, so an on-disk ``launch_time``
+    and the wire's ``created_at`` cannot drift into two different formats.
+    """
     for key in ("launched_at", "created_at", "launch_time", "start_time", "started_at"):
         val = instance.get(key)
-        if val:
-            return str(val)
+        if not val:
+            continue
+        formatted = epoch_to_rfc3339(val)
+        if formatted:
+            return formatted
     return ""
 
 
@@ -206,6 +219,11 @@ class PassProvenance:
     grader: Grader = field(default_factory=Grader)
     judge_models: tuple[str, ...] = ()
     score_time: str = ""
+    # How this pass came to exist: ``submit`` (the original scoring, gathered
+    # against the live target) or ``rescore`` (an offline re-judge of the frozen
+    # inputs). A reader must be able to tell the two apart without diffing
+    # timestamps — only a ``submit`` pass ever observed a running target.
+    origin: str = "submit"
 
 
 @dataclass(frozen=True)
@@ -392,6 +410,100 @@ def write_record(sub_dir: Path, record: ServeSubmissionRecord) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# scoring passes — write one verdict without destroying the previous one
+# ---------------------------------------------------------------------------
+def sanitize_pass_slug(pass_id: str) -> str:
+    """Filesystem-safe form of a pass id (which carries ``@`` and ``:``)."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(pass_id or ""))[:80]
+
+
+def score_to_dict(score: Any) -> dict[str, Any]:
+    """Serialize a benchmark ``Score`` (dataclass or duck-typed) for the record.
+
+    Every writer of a scoring pass goes through this, so the original submit and
+    a later re-judge cannot drift into two shapes for the same verdict.
+    """
+    if dataclasses.is_dataclass(score) and not isinstance(score, type):
+        return dataclasses.asdict(score)
+    return {
+        "value": getattr(score, "value", None),
+        "answer": getattr(score, "answer", ""),
+        "explanation": getattr(score, "explanation", ""),
+        "metadata": getattr(score, "metadata", {}) or {},
+    }
+
+
+def write_canonical_scores(sub_dir: Path, scores: Mapping[str, Any]) -> str:
+    """Write each scorer's verdict to the stable ``scores/<scorer>.json`` path.
+
+    This is the path every existing reader (the inspector, fleet, ``cage
+    score``) looks at, so it always holds the *current* verdict. Returns the
+    first scorer's relative ref, the record's canonical score ref.
+    """
+    sub_dir = Path(sub_dir)
+    (sub_dir / _SCORES_DIRNAME).mkdir(parents=True, exist_ok=True)
+    first = ""
+    for name, payload in (scores or {}).items():
+        rel = f"{_SCORES_DIRNAME}/{str(name).replace('/', '_')}.json"
+        (sub_dir / rel).write_text(
+            json.dumps({name: payload}, ensure_ascii=False), encoding="utf-8"
+        )
+        first = first or rel
+    return first
+
+
+def _archive_pass(sub_dir: Path, index: int, score_pass: ScorePass) -> ScorePass:
+    """Give one pass its own copy of its scores, at a path nothing overwrites.
+
+    The copy is rendered from the scores embedded in the pass, not by copying
+    the canonical file — so archiving an older pass reproduces *its* verdict
+    exactly, even when the canonical file has since moved on.
+    """
+    rel_dir = (
+        f"{_SCORES_DIRNAME}/{_PASSES_DIRNAME}/"
+        f"{index:03d}__{sanitize_pass_slug(score_pass.pass_id)}"
+    )
+    (Path(sub_dir) / rel_dir).mkdir(parents=True, exist_ok=True)
+    first = ""
+    for name, payload in (score_pass.scores or {}).items():
+        rel = f"{rel_dir}/{str(name).replace('/', '_')}.json"
+        (Path(sub_dir) / rel).write_text(
+            json.dumps({name: payload}, ensure_ascii=False), encoding="utf-8"
+        )
+        first = first or rel
+    return dataclasses.replace(score_pass, score_ref=first or score_pass.score_ref)
+
+
+def append_pass(
+    sub_dir: Path, record: ServeSubmissionRecord, new_pass: ScorePass
+) -> ServeSubmissionRecord:
+    """Record one more scoring pass, preserving every earlier verdict.
+
+    A re-judge must not quietly destroy the verdict it replaces: each pass gets
+    its own archived copy under ``scores/passes/``, and only then is the
+    canonical ``scores/<scorer>.json`` repointed at the newest pass so existing
+    readers keep finding the current verdict where they always looked.
+
+    Passes written before archiving existed point their ``score_ref`` straight
+    at that canonical file — the very file about to be overwritten. Those are
+    migrated to their own archive first, so no pass in the record is left
+    referencing content that is no longer its own.
+    """
+    sub_dir = Path(sub_dir)
+    archived: list[ScorePass] = []
+    for idx, old in enumerate(record.passes):
+        already = old.score_ref.startswith(f"{_SCORES_DIRNAME}/{_PASSES_DIRNAME}/")
+        archived.append(old if already else _archive_pass(sub_dir, idx, old))
+    archived.append(_archive_pass(sub_dir, len(archived), new_pass))
+    write_canonical_scores(sub_dir, new_pass.scores)
+    updated = dataclasses.replace(
+        record, passes=tuple(archived), canonical_pass_id=new_pass.pass_id
+    )
+    write_record(sub_dir, updated)
+    return updated
+
+
 def load_record(sub_dir: Path) -> ServeSubmissionRecord | None:
     """Read back a submission record (for offline re-scoring / inspection)."""
     path = Path(sub_dir) / _RECORD_FILENAME
@@ -406,6 +518,19 @@ def _record_from_dict(raw: Mapping[str, Any]) -> ServeSubmissionRecord:
         keys = ("dataset_commit", "verifier_kind", "scoring_assets_digest")
         return Grader(**{k: d.get(k, "") for k in keys})
 
+    # Only keys this version knows about are passed through: a record written by
+    # a NEWER cage (one that added a provenance field) must still load here
+    # rather than raising an unexpected-keyword TypeError, or a rolling upgrade
+    # across the serve fleet would make older nodes unable to read the records
+    # newer ones wrote.
+    known = {f.name for f in dataclasses.fields(PassProvenance)}
+
+    def _provenance(d: Mapping[str, Any]) -> PassProvenance:
+        fields = {k: v for k, v in d.items() if k in known and k != "grader"}
+        fields["judge_models"] = tuple(d.get("judge_models") or ())
+        fields["grader"] = _grader(d.get("grader") or {})
+        return PassProvenance(**fields)
+
     passes = tuple(
         ScorePass(
             pass_id=p["pass_id"],
@@ -413,13 +538,7 @@ def _record_from_dict(raw: Mapping[str, Any]) -> ServeSubmissionRecord:
             score_time=p.get("score_time", ""),
             score_ref=p.get("score_ref", ""),
             scores=p.get("scores") or {},
-            provenance=PassProvenance(
-                **{
-                    **{k: v for k, v in (p.get("provenance") or {}).items() if k != "grader"},
-                    "judge_models": tuple((p.get("provenance") or {}).get("judge_models") or ()),
-                    "grader": _grader((p.get("provenance") or {}).get("grader") or {}),
-                }
-            ),
+            provenance=_provenance(p.get("provenance") or {}),
         )
         for p in (raw.get("passes") or [])
     )

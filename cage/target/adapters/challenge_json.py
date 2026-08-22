@@ -39,11 +39,48 @@ class ChallengeJsonAdapter:
     )
 
     def discover(self, source: BenchmarkSource) -> dict[str, NormalizedChallenge]:
+        """Discover challenges under ``source.root``.
+
+        Two modes, resolved in this order:
+
+        1. **Index mode** — if an index file is present (an explicit
+           ``options["index"]``, or any top-level ``*.json`` in the root), each
+           index is a flat ``{id: {path, ...}}`` map and drives discovery. This
+           is the historical behaviour; every index-shipping benchmark keeps it.
+        2. **Scan mode** — if there is NO index, the root is scanned for
+           ``challenge.json`` files (each self-describing, carrying its own
+           ``id``). Discovery descends directories but treats any dir holding a
+           ``challenge.json`` as a leaf and does not recurse into it, so it never
+           reads a challenge's own app-source tree (node_modules, vendor, …).
+
+        Convention over enumeration: a new challenge is a new self-describing
+        directory — no central index edit is required for it to be found.
+        """
         root = Path(source.root)
+        index_paths = self._resolve_index_paths(root, source)
+        if index_paths:
+            return self._discover_from_indices(root, index_paths)
+        return self._discover_by_scan(root)
+
+    def _resolve_index_paths(self, root: Path, source: BenchmarkSource) -> list[Path]:
+        """Index files to drive discovery, or ``[]`` to trigger scan mode.
+
+        An explicit ``options["index"]`` pins one file (resolved against the
+        root when relative); otherwise every top-level ``*.json`` is treated as
+        an index, exactly as before.
+        """
+        explicit = source.options.get("index")
+        if explicit:
+            path = Path(explicit)
+            if not path.is_absolute():
+                path = root / path
+            return [path] if path.is_file() else []
+        return sorted(root.glob("*.json"))
+
+    def _discover_from_indices(self, root: Path, index_paths: list[Path]) -> dict[str, NormalizedChallenge]:
         challenges: dict[str, NormalizedChallenge] = {}
         missing: list[str] = []
-
-        for index_path in sorted(root.glob("*.json")):
+        for index_path in index_paths:
             with open(index_path, "r", encoding="utf-8") as handle:
                 index_data = json.load(handle)
 
@@ -61,47 +98,9 @@ class ChallengeJsonAdapter:
                     continue
                 with open(challenge_json_path, "r", encoding="utf-8") as handle:
                     challenge_json = json.load(handle)
-
-                source_fields = dict(entry)
-                source_fields.update(challenge_json)
-                nested_source_fields = challenge_json.get("source_fields")
-                if isinstance(nested_source_fields, dict):
-                    # Some generated challenge.json files keep canonical
-                    # internal fields under source_fields while also carrying
-                    # lossy top-level mirrors for human-facing metadata.
-                    source_fields.update(nested_source_fields)
-                task = challenge_json.get("task") or challenge_json.get("description", "")
-                benchmark_family = (
-                    challenge_json.get("benchmark_family")
-                    or entry.get("benchmark_family")
-                    or benchmark_name
+                challenges[challenge_id] = self._normalize(
+                    challenge_id, entry, challenge_json, challenge_root, benchmark_name
                 )
-                # ``runtime_scoring`` is declared per challenge in challenge.json
-                # (already merged into ``source_fields`` above); the framework
-                # stays benchmark-agnostic and never derives it.
-
-                normalized = {
-                    "id": challenge_id,
-                    "benchmark_name": benchmark_name,
-                    "benchmark": benchmark_name,
-                    "benchmark_family": benchmark_family,
-                    "adapter_kind": self.adapter_kind,
-                    "task_profile": challenge_json.get("task_profile") or entry.get("task_profile") or "ctf_local",
-                    "name": challenge_json.get("name") or entry.get("challenge") or challenge_json.get("target") or challenge_id,
-                    "category": challenge_json.get("category") or entry.get("category", "unknown"),
-                    "description": challenge_json.get("description") or task,
-                    "task": task,
-                    "files": challenge_json.get("files", []),
-                    "flag": challenge_json.get("flag", ""),
-                    "flag_format": derive_flag_format(challenge_json.get("flag", "")),
-                    "full_path": str(challenge_root),
-                    "source_fields": source_fields,
-                }
-                for key in self.top_level_passthrough_fields:
-                    if key in source_fields:
-                        normalized[key] = source_fields.get(key)
-
-                challenges[challenge_id] = normalized
 
         if missing:
             total = len(challenges) + len(missing)
@@ -113,6 +112,116 @@ class ChallengeJsonAdapter:
             )
 
         return challenges
+
+    def _discover_by_scan(self, root: Path) -> dict[str, NormalizedChallenge]:
+        challenges: dict[str, NormalizedChallenge] = {}
+        for challenge_root in sorted(self._iter_challenge_dirs(root)):
+            challenge_json_path = challenge_root / "challenge.json"
+            try:
+                with open(challenge_json_path, "r", encoding="utf-8") as handle:
+                    challenge_json = json.load(handle)
+            except (OSError, ValueError) as exc:
+                logger.warning("challenge_json: skipping unreadable %s: %s", challenge_json_path, exc)
+                continue
+            # Display name defaults to the directory name, and the grouping
+            # category defaults to the parent (collection) directory name; a
+            # file may still override either by carrying it explicitly.
+            challenge_json.setdefault("name", challenge_root.name)
+            challenge_json.setdefault("category", challenge_root.parent.name)
+            challenge_id = str(challenge_json.get("id") or "").strip()
+            if not challenge_id:
+                challenge_id = challenge_root.name
+                logger.warning(
+                    "challenge_json: %s has no 'id' field — falling back to the "
+                    "directory name %r. Add an explicit 'id' to make discovery stable.",
+                    challenge_json_path, challenge_id,
+                )
+            # Self-declared benchmark grouping; falls back to the parent dir name.
+            benchmark_name = (
+                str(challenge_json.get("benchmark")
+                    or challenge_json.get("benchmark_family") or "").strip()
+                or challenge_root.parent.name
+            )
+            if challenge_id in challenges:
+                raise ValueError(
+                    f"Duplicate challenge id discovered by scan: {challenge_id} "
+                    f"({challenge_json_path})"
+                )
+            challenges[challenge_id] = self._normalize(
+                challenge_id, {}, challenge_json, challenge_root, benchmark_name
+            )
+        return challenges
+
+    def _iter_challenge_dirs(self, root: Path, max_depth: int = 4):
+        """Yield every directory that directly holds a ``challenge.json``.
+
+        Descends at most ``max_depth`` levels and prunes at each challenge dir
+        (a dir with a ``challenge.json`` is a leaf — never recursed into), so
+        the walk never enters a challenge's own source tree.
+        """
+        stack: list[tuple[Path, int]] = [(Path(root), 0)]
+        while stack:
+            directory, depth = stack.pop()
+            if (directory / "challenge.json").is_file():
+                yield directory
+                continue
+            if depth >= max_depth:
+                continue
+            try:
+                children = sorted(directory.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if child.is_dir() and not child.name.startswith("."):
+                    stack.append((child, depth + 1))
+
+    def _normalize(
+        self,
+        challenge_id: str,
+        entry: dict,
+        challenge_json: dict,
+        challenge_root: Path,
+        benchmark_name: str,
+    ) -> NormalizedChallenge:
+        source_fields = dict(entry)
+        source_fields.update(challenge_json)
+        nested_source_fields = challenge_json.get("source_fields")
+        if isinstance(nested_source_fields, dict):
+            # Some generated challenge.json files keep canonical internal fields
+            # under source_fields while also carrying lossy top-level mirrors for
+            # human-facing metadata; the nested (canonical) copy wins.
+            source_fields.update(nested_source_fields)
+        task = challenge_json.get("task") or challenge_json.get("description", "")
+        benchmark_family = (
+            challenge_json.get("benchmark_family")
+            or entry.get("benchmark_family")
+            or benchmark_name
+        )
+        # ``runtime_scoring`` is declared per challenge in challenge.json
+        # (already merged into ``source_fields`` above); the framework stays
+        # benchmark-agnostic and never derives it.
+
+        normalized = {
+            "id": challenge_id,
+            "benchmark_name": benchmark_name,
+            "benchmark": benchmark_name,
+            "benchmark_family": benchmark_family,
+            "adapter_kind": self.adapter_kind,
+            "task_profile": challenge_json.get("task_profile") or entry.get("task_profile") or "no_target",
+            "name": challenge_json.get("name") or entry.get("challenge") or challenge_json.get("target") or challenge_id,
+            "category": challenge_json.get("category") or entry.get("category", "unknown"),
+            "description": challenge_json.get("description") or task,
+            "task": task,
+            "files": challenge_json.get("files", []),
+            "flag": challenge_json.get("flag", ""),
+            "flag_format": derive_flag_format(challenge_json.get("flag", "")),
+            "full_path": str(challenge_root),
+            "source_fields": source_fields,
+        }
+        for key in self.top_level_passthrough_fields:
+            if key in source_fields:
+                normalized[key] = source_fields.get(key)
+        return normalized
 
     def build_launch_spec(self, challenge: NormalizedChallenge) -> LaunchSpec:
         challenge_root = Path(challenge["full_path"])

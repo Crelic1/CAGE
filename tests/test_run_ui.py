@@ -41,11 +41,11 @@ def _run_summary() -> dict:
     }
 
 
-def test_logging_config_defaults_to_plain_progress_and_inspect_on() -> None:
+def test_logging_config_defaults_to_plain_progress_and_inspect_auto() -> None:
     config = LoggingConfig()
 
     assert config.terminal_ui is True
-    assert config.inspect_mode == "on"
+    assert config.inspect_mode == "auto"
 
 
 def test_run_command_keeps_terminal_ui_enabled_by_default(
@@ -75,7 +75,7 @@ def test_run_command_keeps_terminal_ui_enabled_by_default(
 
     assert result.exit_code == 0, result.output
     assert captured["terminal_ui"] is True
-    assert captured["inspect_mode"] == "on"
+    assert captured["inspect_mode"] == "auto"
     assert result.output.startswith("   _________   ____________")
     assert "Experiment:" not in result.output
     assert "View with: cage inspect" not in result.output

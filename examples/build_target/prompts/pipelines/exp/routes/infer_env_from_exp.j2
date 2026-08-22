@@ -1,0 +1,30 @@
+## Adapt the exploit; the env is a hypothesis derived FROM it (AP)
+
+There is no build material. The environment was reverse-engineered FROM this
+same exploit — libc/loader, arch, and protections inferred from its
+leaked-address offsets, gadgets, and symbol assumptions. So the (environment,
+exploit) pair are two halves of one hypothesis, and a fidelity gap can live on
+EITHER side.
+
+{% if instance_data.materials.exploit %}Confirmed exploit under:
+{% for path in instance_data.materials.exploit %}- `{{ path }}`
+{% endfor %}{% endif %}
+- PORT the exploit; keep its approach and primitive. Retarget it at the
+  harness-passed instance address; strip hardcoded historical host/port and
+  absolute addresses.
+- Resolve leaks at runtime and recompute every base/target from the live leak
+  against the CHOSEN runtime's libc offsets. Never reuse historical numbers.
+- When `cage-exploit` shows a mismatch, decide WHICH half is wrong:
+  - a leaked libc/loader address whose page offset or one-gadget/symbol
+    displacement is inconsistent with the inferred runtime → the ENVIRONMENT
+    likely chose the wrong libc/loader. Correct the bundle in the env files and
+    re-run; do not bend the exploit to a wrong libc.
+  - a leak consistent with the runtime but arithmetic/flow off → fix the EXPLOIT
+    offsets.
+- Feed every environment-fidelity observation (the leak, the offset it implies,
+  the libc it points to) back into the env files, so env and exploit co-evolve
+  until they agree.
+- Do not weaken protections or swap in an arbitrary libc just to make the old
+  numbers fit; each env change must be justified by a live observation.
+- Prove it: `cage-exploit` must capture the harness-provisioned flag from a
+  fresh clean instance against the corrected runtime.

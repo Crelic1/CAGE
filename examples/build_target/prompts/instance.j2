@@ -1,0 +1,226 @@
+# MISSION
+
+Reconstruct an authorized CTF environment for **{{ instance_data.name }}**. Work only with the supplied challenge material in `{{ workspace }}`. The goal is a faithful, reproducible CAGE target, not a replacement challenge that merely stays alive.
+
+Routing selected by the benchmark:
+
+- `build_profile`: `{{ instance_data.build_profile }}`
+- `category_profile`: `{{ instance_data.category_profile }}`
+- input data maturity: `{{ instance_data.data_tier }}` (`{{ instance_data.data_tier_source }}`)
+- strongest tier implied by the declared material roles: `{{ instance_data.inferred_data_tier }}`
+{% if instance_data.data_tier_evidence %}
+- static tier evidence: candidate `{{ instance_data.data_tier_evidence.get("candidate", "unknown") }}`, confirmed `{{ instance_data.data_tier_evidence.get("confirmed", "unknown") }}`; routing selected `{{ instance_data.data_tier_evidence.get("selected_from", "unspecified") }}`
+{% endif %}
+{% if instance_data.target_maturity %}
+- target output maturity: data `{{ instance_data.target_maturity.get("data", "unchanged") }}`, rehost `{{ instance_data.target_maturity.get("rehost", "R3") }}`, exploit `{{ instance_data.target_maturity.get("exploit", "X0") }}`
+{% endif %}
+
+{% if instance_data.description %}Challenge description: {{ instance_data.description }}
+{% endif %}
+
+# INPUT MATERIALS
+
+The paths below are relative to `{{ workspace }}` and are classified by evidence role. Do not treat a Writeup as deployment source, and do not treat a historical flag as validation truth.
+
+{% for role, paths in instance_data.materials.items() %}
+## {{ role }}
+{% if paths %}{% for path in paths %}- `{{ path }}`
+{% endfor %}{% else %}- none supplied
+{% endif %}
+{% endfor %}
+
+{% if instance_data.material_states %}
+# STATIC EVIDENCE STATUS
+
+Candidate evidence is not automatically confirmed evidence. Preserve these states in the build report and do not silently promote them:
+
+{% for role, evidence in instance_data.material_states.items() %}- `{{ role }}`: state `{{ evidence.get("state", "unknown") }}`, search `{{ evidence.get("search_status", "unknown") }}`, count `{{ evidence.get("count", 0) }}`
+{% endfor %}
+{% endif %}
+{% if instance_data.docker_closure %}
+Docker closure: status `{{ instance_data.docker_closure.get("status", "unknown") }}`, missing refs `{{ instance_data.docker_closure.get("missing_ref_count", 0) }}`, review refs `{{ instance_data.docker_closure.get("review_ref_count", 0) }}`.
+{% endif %}
+{% if instance_data.static_evidence.get("blocker_codes") %}
+Known static blockers: {% for blocker in instance_data.static_evidence.get("blocker_codes") %}`{{ blocker }}`{% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}
+{% if instance_data.static_evidence.get("review_flags") %}
+Review flags: {% for flag in instance_data.static_evidence.get("review_flags") %}`{{ flag }}`{% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}
+{% if instance_data.static_evidence.get("prior_runtime_failures") %}
+Known prior CAGE runtime blockers:
+{% for failure in instance_data.static_evidence.get("prior_runtime_failures") %}- {{ failure.get("reason", "unspecified prior runtime failure") }} ({{ failure.get("batch_id", "unknown batch") }})
+{% endfor %}
+Do not repeat the unchanged failed construction. Resolve the stated host/runtime contract or return a structured blocker.
+{% endif %}
+
+# DATA-TIER POLICY
+
+The D tier describes available static evidence, not environment success. It does not grant an R level and it never proves exploitability. Follow this tier-specific policy together with the actual material roles; if they disagree, record the mismatch instead of silently upgrading the input.
+
+{% include "data_tiers/" ~ instance_data.data_tier|lower ~ ".j2" %}
+
+# BUILD STRATEGY
+
+{% include "build_profiles/" ~ instance_data.build_profile ~ ".j2" %}
+
+# CATEGORY-SPECIFIC REQUIREMENTS
+
+{% include "categories/" ~ instance_data.category_profile ~ ".j2" %}
+
+# DECLARED SERVICE CONTRACT
+
+{% if instance_data.service_contract %}{% for key, value in instance_data.service_contract.items() %}- `{{ key }}`: `{{ value }}`
+{% endfor %}{% else %}- No complete service contract was supplied. Derive only what the material supports and record uncertainty.
+{% endif %}
+
+# FLAG CONTRACT
+
+{% for key, value in instance_data.flag_contract.items() %}- `{{ key }}`: `{{ value }}`
+{% endfor %}
+
+- Never hardcode a historical Writeup flag as proof of success.
+- Prefer runtime injection through the declared environment variable or file contract.
+- A normal readiness probe must not print or otherwise disclose the flag.
+
+# BUILD ENVIRONMENT
+
+{% set network_mode = instance_data.build_environment.get("network", "unspecified") %}
+- network availability: `{{ network_mode }}`
+{% if instance_data.build_environment.get("cached_images") %}- locally available base images: {% for image in instance_data.build_environment.get("cached_images") %}`{{ image }}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
+{% if network_mode == "offline" %}- The build must not use `apt`, `apk`, `pip`, `npm`, `go get`, image pulls, or any other network fetch. Use only supplied material and declared cached images.
+{% elif network_mode == "restricted" %}- Do not assume public internet access. Reuse locked dependencies and configured proxy/cache paths; report an unavailable dependency instead of silently changing it.
+{% elif network_mode == "proxy" %}- Network access is available only through the configured build proxy. Preserve lockfiles and pinned versions.
+{% else %}- Do not assume a dependency can be fetched unless you verify that the build environment permits it. Preserve lockfiles and pinned versions.
+{% endif %}
+
+# VALIDATOR WORKFLOW
+
+- The agent workspace does not own the Docker daemon. Use `cage-check` to ask the host-side validator to build and boot what you have written so far.
+- Do not spend many rounds polishing before the first validator call. As soon as `docker-compose.yml`, `build_report.json`, and `challenge.json` exist in minimally valid form, run `cage-check`.
+- Run `cage-check` after each meaningful Compose or Dockerfile change. A failed check returns a structured failure class plus concrete feedback; fix that exact issue before moving on.
+- `cage-check` itself is the independent validator. It resolves the private target address and executes the structured `runtime_probes` from `challenge.json` on the host; agent-authored `service_output.txt` is never grading truth.
+- On an R4 `PASS`, quote or summarize the returned host-side probe excerpt in your final response, run `cage-check stop`, and finish. Do not repeat the check, manually replace it with `nc -vz`, or continue redesigning a target that already passed.
+- On an R3-only `PASS`, do not call the result R4. A port-open or process-liveness observation cannot promote the environment.
+- If feedback has `retryable: false`, stop blind repair attempts. Preserve the structured blocker, run `cage-check stop` if needed, and finish.
+
+{% set target_rehost = instance_data.target_maturity.get("rehost", "R3") if instance_data.target_maturity else "R3" %}
+{% if target_rehost in ["R4", "R5"] %}
+# REQUIRED R4 PROBE CONTRACT
+
+This task targets `{{ target_rehost }}`. `challenge.json.runtime_probes` is mandatory. Derive a harmless, challenge-specific expected interaction from the supplied Writeup/solve material, cite the exact supplied file, and let CAGE execute it independently.
+
+- HTTP probes must assert both an expected status and non-generic response content such as the real page title, form label, route response, or application marker.
+- TCP/Pwn probes must assert a real banner, menu prompt, PoW line, or benign request/response marker. Merely connecting, checking the port, or expecting a generic `OK` is not sufficient.
+- Every target service needs at least one probe.
+- Each probe's `evidence` must cite a supplied Writeup/solve path and explain why that file supports the expected marker.
+- At least one expectation per probe (an HTTP `expect_body_contains` or a TCP step's `expect_contains`) must be a specific string of four or more characters that actually appears in one of the cited files. CAGE checks this: a marker the built service echoes but no supplied file mentions is rejected as `runtime_probe_marker_unanchored`. Lift the exact string from real material instead of inventing one.
+- The readiness probe must not exploit the target or retrieve the flag. R4 proves faithful normal interaction; exploit/flag reachability remains R5/X work.
+{% endif %}
+
+# SAFETY AND AUTHENTICITY RULES
+
+- Preserve the original vulnerability, architecture, dependency semantics, entrypoint, and intended solve path.
+- Make the smallest evidence-backed compatibility changes and list every such change in `build_report.json`.
+- Do not use `privileged`, host networking/PID/IPC, Docker socket mounts, host filesystem bind mounts, devices, host-administration capabilities such as `cap_add: [SYS_ADMIN]`, unconfined `security_opt` profiles such as `apparmor:unconfined` or `seccomp:unconfined`, `cap_add: [ALL]`, or a fixed `container_name`.
+- If an upstream sample uses `privileged` or another forbidden runtime escape hatch, do not copy it through blindly and do not approximate it with `SYS_ADMIN`, `apparmor:unconfined`, `seccomp:unconfined`, or similar isolation-weakening settings. If the authentic target cannot run without them, return `status: blocked` with the blocker called out explicitly.
+- Keep build contexts inside the workspace. Do not depend on absolute host paths, undeclared files, local secrets, or developer-machine services.
+- Do not turn a missing service into a mock, static page, echo server, or `sleep infinity` container just to satisfy liveness.
+- If the supplied evidence cannot support a faithful environment, stop and emit a structured blocker. An honest blocker is preferable to a fabricated target.
+
+# OUTPUT CONTRACT
+
+Always create `build_report.json` with:
+
+- `status`: `ready` or `blocked`;
+- `data_tier`, `data_tier_source`, `build_profile`, and `category_profile`;
+- material used, assumptions, compatibility changes, and unresolved blockers;
+- the exact independent checks that should be run.
+
+For `status: blocked`, `blockers` must be a non-empty array of objects. Every object needs `code`, `stage`, `reason`, non-empty `evidence`, and `next_action`. Once you can prove a missing upstream image, missing core source, forbidden indispensable runtime feature, or unsupported architecture, report it precisely and stop instead of spending the remaining rounds on speculative substitutions.
+
+For `status: ready`, also produce:
+
+1. A root Compose file named `docker-compose.yml` (it may reference preserved nested Dockerfiles).
+2. `challenge.json` with `compose_files`, `compose_target_services`, `compose_dependency_services`, `target_ports`, and `target_port_protocols` where known.
+3. Dockerfile(s), entrypoint wrappers, configuration, and health checks required by the real service.
+4. A structured `runtime_probes` contract in `challenge.json` when the requested rehost maturity is R4/R5. CAGE writes the independent probe evidence outside the workspace; `service_output.txt` is optional review context and cannot make the score pass.
+{% if instance_data.image_names %}5. Assign every archival tag below to a Compose service that has a `build` section:
+{% for image in instance_data.image_names %}   - `{{ image }}`
+{% endfor %}
+{% endif %}
+
+Minimal valid `challenge.json` shape (keys are Compose service names; `target_ports` values are integers, not strings or arrays):
+
+```json
+{
+  "compose_files": ["docker-compose.yml"],
+  "compose_target_services": ["challenge"],
+  "compose_dependency_services": [],
+  "target_ports": {"challenge": 1337},
+  "target_port_protocols": {"challenge": "tcp"}
+}
+```
+
+{% if target_rehost in ["R4", "R5"] %}
+Add a category-appropriate semantic probe. For a TCP/Pwn service:
+
+```json
+"runtime_probes": [
+  {
+    "id": "menu-banner",
+    "type": "tcp",
+    "service": "challenge",
+    "steps": [{"expect_contains": "Replace this with the real challenge prompt"}],
+    "evidence": [
+      {
+        "path": "replace/with/supplied/writeup-or-solve-path",
+        "basis": "The supplied solve material waits for this exact prompt before sending input."
+      }
+    ]
+  }
+]
+```
+
+For an HTTP service:
+
+```json
+"runtime_probes": [
+  {
+    "id": "real-home-page",
+    "type": "http",
+    "service": "challenge",
+    "method": "GET",
+    "path": "/",
+    "expect_status": 200,
+    "expect_body_contains": "Replace this with a real application-specific marker",
+    "evidence": [
+      {
+        "path": "replace/with/supplied/writeup-or-solve-path",
+        "basis": "The supplied material identifies this page and marker as the normal entry point."
+      }
+    ]
+  }
+]
+```
+{% endif %}
+
+- `target_ports` maps each target service name to one internal port integer.
+- Do not choose or reserve a host port. CAGE removes Compose `ports:` publications,
+  allocates an isolated runtime network, and reaches the service by container IP.
+  If upstream Compose says `31337:1337`, declare internal port `1337`, never `31337`.
+- `target_port_protocols` is an object keyed by the same service names. Use `tcp`, `http`, or `https` when known; otherwise omit unknown entries.
+
+For every archival tag, the same Compose service must contain both an `image:` field equal to that exact tag and a `build:` field. `build.tags` is not a substitute for `image:`. Minimal valid shape:
+
+```yaml
+services:
+  challenge:
+    image: {{ instance_data.image_names[0] if instance_data.image_names else "ctfenv/example-wave:d4-r3-x0" }}
+    build:
+      context: ./build
+```
+
+Before finishing, re-open the Compose file and `build_report.json` and check these schema-sensitive fields literally. Do not retain `privileged`, host namespaces, Docker-socket mounts, `SYS_ADMIN`, unconfined AppArmor/seccomp profiles, or the other forbidden runtime options listed above; if the authentic service cannot run without one, return a structured blocker instead of weakening the isolation contract.
+
+Do not publish or push an image yourself. The independent scorer builds these exact tags, tears down only the temporary containers/networks/volumes, retains successful images in the local Docker daemon, and writes `image_manifest.json`. A result may be called R3 only after that manifest records the local image ID; R4 additionally requires `runtime_probe_evidence.json` with all host-side category-appropriate probes passing. Your text and `service_output.txt` cannot promote either level by themselves.

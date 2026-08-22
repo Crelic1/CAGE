@@ -1,0 +1,26 @@
+{# Combined build⊕exploit route strategy for the R5 fusion pipeline.
+   Build half copied from env/routes/candidate_inventory_only.j2, exploit half from
+   exp/routes/candidate_inventory_only.j2, made self-contained so `{% include %}` resolves
+   under pipelines/full/ (its own routes/, categories/, _templates/). #}
+## Build the environment — route strategy
+
+Rebuild a faithful, bootable target using the strategy for this route.
+
+This challenge has no confirmed attachment (`NO_A`) — only candidate inventory
+facts. It is **not production-eligible**.
+
+- Do not attempt any build. Emit `status: blocked` with a single
+  `candidate_inventory_only` blocker.
+- `next_action`: resolve the candidate attachment/source references upstream
+  before this challenge re-enters any generation queue.
+
+## Prove it exploitable — route strategy
+
+With the target frozen, prove it faithfully exploitable: run the exploit
+under `solve/` from the player vantage against a fresh clean instance until
+it captures the harness-minted flag.
+
+No confirmed attachment (`NO_A`): nothing to build and nothing to exploit.
+
+- Do not attempt exploitation. Emit `status: unresolved` with a single
+  `candidate_inventory_only` blocker; the challenge is not production-eligible.

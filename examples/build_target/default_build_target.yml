@@ -1,12 +1,13 @@
-# build_target — agent builds a bootable CAGE target from attachments.
+# build_target — agent builds a bootable CAGE target from classified materials.
 #
 # Self-declared entry in the `cage benchmark list` registry. The framework
 # discovers this block; it hardcodes no benchmark names.
 registration:
   id: build_target
   display_name: Build Target
-  description: Agent builds a bootable CAGE target (Dockerfile + compose) from raw
-    challenge attachments; a validator independently boots it and probes the port.
+  description: Agent builds a CAGE target from role-classified deployment files,
+    source, attachments, and Writeups; an independent scorer enforces the requested
+    R3 build/liveness, R4 semantic-probe, and optional R5 exploit-capture gates.
   order: 20
 
 project:
@@ -17,7 +18,7 @@ agents:
   - id: claude_code
     kind: claude_code
     models:
-      - id: deepseek-v4-pro
+      - id: deepseek-v4-flash
         extra_env:
           CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
           DISABLE_INTERLEAVED_THINKING: "1"
@@ -29,12 +30,59 @@ agents:
       - bypassPermissions
       - --verbose
 
+  - id: codex
+    kind: codex
+    models:
+      - id: gpt-5.6-sol-proxy
+    image: cage/codex:pentestenv
+    home: /home/agent/workspace
+    max_concurrent: 1
+    session_args:
+      - -c
+      - model_reasoning_effort=high
+
+  - id: codex_aws
+    kind: codex
+    models:
+      - id: gpt-5.6-sol-aws-chatgpt
+    image: cage/codex:oauth-0.147.0
+    home: /home/agent/workspace
+    max_concurrent: 16
+    version: 0.147.0
+    session_args:
+      - -c
+      - model_reasoning_effort=medium
+
+  - id: codex_cyber
+    kind: codex
+    models:
+      - id: gpt-5.6-sol-cyber-chatgpt
+    image: cage/codex:oauth-0.147.0
+    home: /home/agent/workspace
+    max_concurrent: 24
+    version: 0.147.0
+    session_args:
+      - -c
+      - model_reasoning_effort=medium
+
 proxy:
   enabled: true
 
+preflight:
+  custom:
+    - name: Build-target solver contract
+      command: >-
+        test "$(docker image inspect --format
+        '{{ index .Config.Labels "io.cage.build-target.solver-contract" }}'
+        cage/build-target-solver:2026-08-v1)" = "pwn-python-v1"
+        && docker run --rm --network none
+        cage/build-target-solver:2026-08-v1 python3 -c
+        "import Crypto, pwn, requests; print('solver-contract-ok')"
+      level: error
+
 # This is an ARTIFACT task: there is no pre-built per-trial victim stack. The
-# "target" is what the agent produces, and it is validated in the scorer (boot
-# check), not launched by the target_server. Same rationale as CyberGym.
+# "target" is what the agent produces, and it is validated in the scorer, not
+# launched by the target_server. Same rationale as CyberGym.
 target:
   enabled: false
 
@@ -47,8 +95,30 @@ eval:
     module: ./benchmark.py
     class: BuildTarget
     benchmark_root: ./datasets
+    agent_validation: true
+    # A dead BuildKit/Compose session must not hold the single validator gate
+    # forever. Thirty minutes still accommodates large VM/browser rebuilds on a
+    # loaded host; timed-out trials can be separated from pipeline failures.
+    validation_build_timeout: 1800
+    # Keep Docker validation below the eight-agent fan-out, but allow two
+    # independent builds so a long VM/browser build cannot serialize every
+    # final replay past the per-trial wall clock.
+    validation_max_concurrent: 2
+    validation_max_checks: 8
+    # R5 is a bounded 1-of-5 oracle. The image builds once, but each invocation
+    # gets a newly-created target container/volumes, a different fresh flag, and
+    # its own solver timeout. The first exact fresh-flag capture proves the
+    # environment; solver exit hygiene is reported separately.
+    exploit_attempts: 5
+    # Generated locally by scripts/cache_pwn_runtimes.py; binaries are ignored
+    # by git and copied read-only into Pwn agent containers at trial start.
+    pwn_runtime_cache: ./.cage/build-target/pwn-runtimes
 
 runtime:
-  timeout: 2400
-  max_rounds: 40
+  # Includes agent work, queued live checks, and the independent final replay.
+  # The 30-task calibration observed a correct live R5 wait behind the shared
+  # validator until the former 6000-second boundary, which contaminated its
+  # clean replay.  Rounds remain the model-work bound; this is scheduling room.
+  timeout: 14400
+  max_rounds: 200
   agent_network_mode: bridge

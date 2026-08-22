@@ -41,7 +41,7 @@ class LoggingConfig:
     file_level: str = "DEBUG"
     debug_file_enabled: bool = False
     terminal_ui: bool = True
-    inspect_mode: str = "on"
+    inspect_mode: str = "auto"
     console_colors: bool = True  # auto-disabled when stderr is not a TTY
     run_log_path: Path | None = None  # set by orchestrator per agent
     debug_log_path: Path | None = None  # set by orchestrator per agent

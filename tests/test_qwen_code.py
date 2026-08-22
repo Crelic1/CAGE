@@ -77,3 +77,59 @@ models:
         "thinking_budget": 81920,
         "preserve_thinking": True,
     }
+
+
+def test_qwen_streams_its_transcript_so_a_killed_trial_still_has_one() -> None:
+    """A buffered format loses the whole run the moment a trial times out.
+
+    ``--output-format json`` prints its single object at process *exit*, and a
+    trial killed at its timeout never reaches exit. Measured against qwen-code
+    0.15.11 with one prompt and one 75s kill: ``json`` left 0 bytes on stdout,
+    ``stream-json`` left 60 events. That is the difference between a two-hour
+    trial whose agent output is a startup warning and one whose transcript
+    survives, so the flag is pinned here rather than left to taste.
+    """
+
+    command = QwenCodeAgent().build_launch_command("do the thing", model=None)
+    assert "--output-format stream-json" in command
+    assert "--output-format json" not in command
+
+
+def test_qwen_reads_the_stream_it_asks_for() -> None:
+    """Event shapes are verbatim from qwen-code 0.15.11 ``-o stream-json``."""
+
+    from cage.sandbox.exec import ExecResult
+
+    stdout = "\n".join([
+        json.dumps({"type": "system", "subtype": "init", "model": "qwen3.7-max"}),
+        json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Ran STEP1; it printed STEP1."},
+            ]},
+        }),
+        json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Ran STEP2; it printed STEP2."},
+            ]},
+        }),
+    ])
+    parsed = QwenCodeAgent().parse_output(
+        ExecResult(command="qwen", stdout=stdout, stderr="", exit_code=-1, duration_ms=1),
+    )
+    # No ``result`` event: the process was killed mid-run, so the latest
+    # assistant turn is the honest answer.
+    assert parsed == "Ran STEP2; it printed STEP2."
+
+
+def test_qwen_never_reports_a_raw_event_stream_as_the_agents_answer() -> None:
+    """Machine noise in the answer slot reads as an answer. Say nothing instead."""
+
+    from cage.sandbox.exec import ExecResult
+
+    stdout = json.dumps({"type": "system", "subtype": "init", "model": "qwen3.7-max"})
+    parsed = QwenCodeAgent().parse_output(
+        ExecResult(command="qwen", stdout=stdout, stderr="", exit_code=0, duration_ms=1),
+    )
+    assert parsed == ""

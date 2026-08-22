@@ -9,12 +9,19 @@ the very same run.
 
 This module fixes one definition and one classifier. The buckets are:
 
-* ``completed``  — finished and eligible for scoring (incl. ``scored`` /
-  ``not_scored``, which are post-completion scoring states).
+* ``completed``  — finished and eligible for scoring.
 * ``failed``     — a genuine error terminated the trial.
 * ``interrupted``— cancelled or interrupted before a terminal verdict.
 * ``running``    — none of the above could be established (still in flight, or
   an input that carries no terminal signal).
+
+**Runtime status and scoring status are separate axes.** Whether a trial ran is
+independent of whether it has been scored: a failed trial can carry scoring
+evidence, and a completed one can stay unscored. Scoring lives in
+``TrialRecord.scoring.status``. Older runs recorded it in the runtime status
+instead, so the sets below split into a strict *write* vocabulary and a wider
+*read* one — see ``LEGACY_SCORING_TRIAL_STATUSES``. Tolerance belongs on read;
+allowing those values on write is what let the two axes blur in the first place.
 
 It lives in ``contracts`` (Layer 0) because it is universal vocabulary: it
 imports nothing from the rest of ``cage`` and every other package may import it.
@@ -26,9 +33,50 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-COMPLETED_TRIAL_STATUSES = frozenset({"completed", "not_scored", "scored"})
+# ---------------------------------------------------------------------------
+# The runtime axis — what a trial's ``status`` field may actually be set to.
+# ---------------------------------------------------------------------------
+
+COMPLETED_TRIAL_STATUSES = frozenset({"completed"})
 FAILED_TRIAL_STATUSES = frozenset({"failed"})
 INTERRUPTED_TRIAL_STATUSES = frozenset({"interrupted", "cancelled"})
+
+#: Every status the runtime may write. This is the **validation** set: it
+#: mirrors ``TrialStatus`` minus the two non-terminal values, and nothing
+#: outside it should ever reach a trial's ``status``.
+TERMINAL_TRIAL_STATUSES = (
+    COMPLETED_TRIAL_STATUSES | FAILED_TRIAL_STATUSES | INTERRUPTED_TRIAL_STATUSES
+)
+
+# ---------------------------------------------------------------------------
+# Legacy tolerance — read-side only.
+# ---------------------------------------------------------------------------
+
+#: Scoring states that older runs recorded in the *runtime* status field,
+#: before ``TrialRecord.scoring.status`` existed to hold them. They are two
+#: different axes: a trial can fail at runtime and still be scored, or complete
+#: and stay unscored — which is why the current writer
+#: (``mark_trial_scored``) touches only the scoring field and leaves runtime
+#: status alone.
+#:
+#: Kept solely so historical ``.cage_runs`` still classify correctly. Never
+#: write these: the validation set above deliberately excludes them, so a new
+#: write of ``status="scored"`` now fails loudly instead of silently creating a
+#: trial whose runtime status is a scoring state.
+LEGACY_SCORING_TRIAL_STATUSES = frozenset({"scored", "not_scored"})
+
+#: What a *reader* should accept as "this trial completed" — the runtime status
+#: plus the legacy scoring values. Consumers that classify on-disk records use
+#: this; the writer's validator uses the strict set above. Separating the two
+#: is the whole point: tolerance belongs on read, never on write.
+COMPLETED_TRIAL_STATUSES_ON_READ = (
+    COMPLETED_TRIAL_STATUSES | LEGACY_SCORING_TRIAL_STATUSES
+)
+
+#: Terminal-on-read: the strict terminal set widened by the same tolerance.
+TERMINAL_TRIAL_STATUSES_ON_READ = (
+    TERMINAL_TRIAL_STATUSES | LEGACY_SCORING_TRIAL_STATUSES
+)
 
 COMPLETED = "completed"
 FAILED = "failed"
@@ -68,8 +116,9 @@ def classify_trial_status(
     Returns one of ``"completed" | "failed" | "interrupted" | "running"``.
     """
 
+    # Read side: tolerate the legacy scoring values older runs stored here.
     status_norm = _normalize(status)
-    if status_norm in COMPLETED_TRIAL_STATUSES:
+    if status_norm in COMPLETED_TRIAL_STATUSES_ON_READ:
         return COMPLETED
     if status_norm in FAILED_TRIAL_STATUSES:
         return FAILED
@@ -77,7 +126,7 @@ def classify_trial_status(
         return INTERRUPTED
 
     reason_norm = _normalize(termination_reason)
-    if reason_norm in COMPLETED_TRIAL_STATUSES:
+    if reason_norm in COMPLETED_TRIAL_STATUSES_ON_READ:
         return COMPLETED
     if reason_norm in INTERRUPTED_TRIAL_STATUSES:
         return INTERRUPTED

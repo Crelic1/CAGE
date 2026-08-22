@@ -577,7 +577,8 @@ def test_load_experiment_parses_resume_retry_reasons(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -631,7 +632,8 @@ def test_load_experiment_rejects_non_list_retry_reasons(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -961,7 +963,8 @@ def test_load_experiment_parses_resume_max_attempts(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -1007,7 +1010,8 @@ def test_load_experiment_defaults_resume_max_attempts_to_unlimited(tmp_path: Pat
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -1053,7 +1057,8 @@ def test_load_experiment_rejects_invalid_max_attempts(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -1266,7 +1271,8 @@ def test_load_experiment_parses_keep_if_and_select(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -1323,7 +1329,8 @@ def test_load_experiment_rejects_bad_keep_if_regex(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"
@@ -1372,7 +1379,8 @@ def test_load_experiment_rejects_negative_min_rounds(tmp_path: Path) -> None:
         "    provider: openai\n"
         "    model_id: gpt-x\n"
         "    api_base: http://localhost\n"
-        "    api_key_env: NONEXISTENT_KEY\n",
+        "    api_key_env: NONEXISTENT_KEY\n"
+        "    max_context_size: 131072\n",
         encoding="utf-8",
     )
     project_file = tmp_path / "project.yml"

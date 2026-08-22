@@ -30,6 +30,29 @@ models:
   #               — the only kind eligible for `--wait-for-model` startup polling
   #               (SaaS providers are assumed always up).
   #    model      The model string sent upstream, i.e. the provider's own name.
+  #    max_context_size
+  #               This endpoint's context window, in tokens.
+  #
+  #               Agents summarise their conversation before it outgrows the
+  #               window ("compaction"). Every CLI CAGE drives takes that budget
+  #               as an absolute token count, so somebody has to supply the
+  #               number — and the only party who knows it is whoever stood the
+  #               endpoint up. CAGE will not guess: a missing value is an error
+  #               at load time, not a silent default.
+  #
+  #               It belongs to the *deployment*, not the model. The same
+  #               weights served by two hosts can enforce very different limits,
+  #               and a server's advertised limit is not always the one it
+  #               enforces — one endpoint below reports a 1M window while
+  #               refusing anything past ~224k. Treat the model card as a hint
+  #               and your endpoint as the authority.
+  #
+  #               To find the real number, send a deliberately oversized request
+  #               and read the limit back out of the rejection; most servers
+  #               name it. Guess *low* if you must: too small only makes the
+  #               agent compact sooner than it had to, while too large means it
+  #               never compacts at all and every long trial dies at the wall.
+  #               The values below are conservative starting points.
   #
   #  Auth — pick the ONE style that fits the endpoint
   #    api_key    A single key, normally an env ref e.g. ${OPENAI_API_KEY}.
@@ -60,17 +83,11 @@ models:
   #    input_cost_per_1m   USD per 1M input tokens — for cost accounting only.
   #    output_cost_per_1m  USD per 1M output tokens.  (Both unset => not tracked.)
   #    extra_headers       Extra HTTP headers sent upstream, e.g. {X-Title: cage}.
-  #    max_context_size    The endpoint's REAL context window, in tokens. A model
-  #                        capability (not a per-run knob), so it lives here.
-  #                        Agents whose CLI can be told a window honour it —
-  #                        kimi_code and qwen_code (alias: context_window_size).
-  #                        Omit it and the agent CLI keeps its OWN default; CAGE
-  #                        never invents a number. NOTE: the Claude Code CLI has
-  #                        no knob for a custom window (it infers ~200k from the
-  #                        model id), so claude_code CANNOT honour this — a
-  #                        long-context model still caps ~200k under claude_code.
-  #    reserved_context_size  Tokens of output headroom an agent keeps free below
-  #                        max_context_size before it auto-compacts. kimi_code only.
+  #    reserved_context_size  How much of the window to hold back for the reply,
+  #                        for CLIs that want that spelled out separately rather
+  #                        than deriving it (kimi_code). Most CLIs pick their own
+  #                        reply ceiling and subtract it themselves, so leaving
+  #                        this unset is normal.
   #    context_window_size  Accepted alias for max_context_size (qwen naming).
   #    rl_reward_sink      RL training integration. Set this to the URL of an
   #                        external trainer's reward sink to put the model in
@@ -88,6 +105,7 @@ models:
   gpt-5.5:
     provider: openai
     model: gpt-5.5
+    max_context_size: 272000   # OpenAI gpt-5.5
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
     timeout: 3600
@@ -100,6 +118,7 @@ models:
   openai-example:
     provider: openai
     model: gpt-5.5
+    max_context_size: 272000   # OpenAI gpt-5.5
     base_url: https://api.openai.com/v1
     api_keys:
       - ${OPENAI_API_KEY}
@@ -109,6 +128,7 @@ models:
   vllm-example:
     provider: vllm
     model: local-model
+    max_context_size: 131072   # YOUR deployment decides this — check it, do not copy
     base_url: http://127.0.0.1:8000/v1
     api_key: ${VLLM_API_KEY}   # self-hosted servers often accept any/empty key
     # Declare the model's real context window so kimi_code / qwen_code size their
@@ -126,6 +146,7 @@ models:
   rl-policy:
     provider: openai
     model: rl-policy
+    max_context_size: 131072   # YOUR deployment decides this — check it, do not copy
     base_url: ${RL_ENDPOINT}          # trainer's OpenAI-compatible policy server
     api_key: dummy                    # trainer usually ignores the key
     rl_reward_sink: ${RL_REWARD_SINK}  # where per-trial rewards are POSTed
@@ -134,6 +155,7 @@ models:
   claude-opus:
     provider: anthropic
     model: claude-opus-4-7
+    max_context_size: 200000   # Anthropic standard window
     base_url: https://api.anthropic.com
     api_key: ${ANTHROPIC_API_KEY}
     timeout: 3600
@@ -145,6 +167,7 @@ models:
   claude-opus-sub:
     provider: anthropic
     model: claude-opus-4-7
+    max_context_size: 200000   # Anthropic standard window
     agent_model_names:
       claude_code: claude-opus-4-7[1m]   # decorated launch name (e.g. [1m] = 1M context)
     auth_source: ${CAGE_CLAUDE_AUTH_SOURCE}   # host dir with .credentials.json
@@ -157,14 +180,36 @@ models:
   codex-chatgpt:
     provider: openai
     model: gpt-5-codex
+    max_context_size: 272000   # OpenAI gpt-5-codex
     auth_source: ${CAGE_CODEX_AUTH_SOURCE}   # host dir with .codex/auth.json (e.g. ~/.codex)
+
+  # --- OpenAI ChatGPT subscription / Codex OAuth -----------------------
+  #     The Codex agent read-only mounts auth.json and routes through the
+  #     ChatGPT Codex backend. It never substitutes an API key in this mode.
+  gpt-5.6-sol-chatgpt:
+    provider: openai
+    model: gpt-5.6-sol
+    max_context_size: 272000   # conservative Codex-family starting point; verify your endpoint
+    auth_source: ${CAGE_CODEX_AUTH_SOURCE}    # host dir containing auth.json
+    timeout: 3600
 
   # --- Anthropic-compatible 3rd party (custom base_url + agent name) ----
   deepseek-v4-pro:
     provider: anthropic
     model: deepseek-v4-pro
+    max_context_size: 1000000   # DeepSeek V4: 1M
     agent_model_names:
       claude_code: deepseek-v4-pro[1m]
+    base_url: https://api.deepseek.com/anthropic
+    api_key: ${DEEPSEEK_API_KEY}
+    timeout: 3600
+
+  deepseek-v4-flash:
+    provider: anthropic
+    model: deepseek-v4-flash
+    max_context_size: 1000000   # DeepSeek V4: 1M
+    agent_model_names:
+      claude_code: deepseek-v4-flash
     base_url: https://api.deepseek.com/anthropic
     api_key: ${DEEPSEEK_API_KEY}
     timeout: 3600
@@ -173,6 +218,7 @@ models:
   local-openai-compatible:
     provider: openai
     model: local-model
+    max_context_size: 131072   # YOUR deployment decides this — check it, do not copy
     base_url: http://127.0.0.1:8000/v1
     api_key: ${LOCAL_MODEL_API_KEY}
     timeout: 3600
@@ -180,6 +226,7 @@ models:
   glm-5.1:
     provider: openai
     model: GLM-5.1
+    max_context_size: 200000   # GLM-5.1: 200K (GLM-5.2 is 1M)
     base_url: https://open.bigmodel.cn/api/paas/v4
     api_key: ${GLM_API_KEY}
     timeout: 3600
@@ -187,6 +234,7 @@ models:
   qwen3.5-397b-w8a8:
     provider: vllm
     model: qwen3.5-397b-w8a8
+    max_context_size: 131072   # self-hosted — YOUR deployment decides this
     base_url: http://127.0.0.1:8000/v1
     api_key: ${SII_API_KEY}
     timeout: 3600
@@ -194,6 +242,7 @@ models:
   qwen3.6-max-preview:
     provider: openai
     model: qwen3.6-max-preview
+    max_context_size: 262144   # Qwen3.6-Max-Preview: 256K
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key: ${QWEN_API_KEY}
     timeout: 3600
@@ -201,6 +250,7 @@ models:
   qwen3.7-max:
     provider: openai
     model: qwen3.7-max
+    max_context_size: 1000000   # Qwen3.7-Max: 1M
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key: ${QWEN_API_KEY}
     timeout: 3600
@@ -208,9 +258,45 @@ models:
   kimi-k2.6-cli:
     provider: openai
     model: kimi-k2.6
+    max_context_size: 262144   # Kimi K2.6: 256K (K3 is 1M)
     base_url: https://api.moonshot.cn/v1
     api_key: ${KIMI_API_KEY}
     timeout: 3600
+
+  # StepFun (阶跃星辰) serves BOTH protocols, so pick by the agent you run.
+  #
+  # Anthropic Messages — the native path for claude_code. StepFun's own Claude
+  # Code guide sets ANTHROPIC_BASE_URL=https://api.stepfun.com/step_plan, and the
+  # proxy builds `{base_url}/v1/messages`, landing on exactly that endpoint. With
+  # `provider: anthropic` the traffic is forwarded byte-for-byte — no
+  # anthropic->openai translation, and no CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+  # needed on the agent.
+  step-3.7-flash:
+    provider: anthropic
+    model: step-3.7-flash
+    max_context_size: 262144   # StepFun step-3.7: 256K — also measured against the live endpoint
+    base_url: https://api.stepfun.com/step_plan
+    api_key: ${STEPFUN_API_KEY}
+    timeout: 3600
+
+  # OpenAI Chat Completions — same models, for the natively-OpenAI agents
+  # (codex / qwen_code / kimi_code). Note the different base_url: /v1 here,
+  # /step_plan above.
+  step-3.7-flash-oai:
+    provider: openai
+    model: step-3.7-flash
+    max_context_size: 262144   # StepFun step-3.7: 256K — also measured against the live endpoint
+    base_url: https://api.stepfun.com/v1
+    api_key: ${STEPFUN_API_KEY}
+    timeout: 3600
+    # StepFun accepts OpenAI's `reasoning_effort`. Where extra_body actually
+    # reaches upstream: the anthropic->openai TRANSLATION path (claude_code
+    # against this entry) and qwen_code (which passes it CLI-side). Agents that
+    # hit /v1/chat/completions transparently (codex, kimi_code) forward their own
+    # body, and the native anthropic entry above is byte-for-byte — neither gets
+    # it injected.
+    # extra_body:
+    #   reasoning_effort: high
 
   # Google Gemini, driven by the `gemini_cli` agent. `provider: gemini` routes
   # the agent's native generateContent traffic through the proxy to Google
@@ -221,6 +307,7 @@ models:
   gemini-2.5-pro:
     provider: gemini
     model: gemini-2.5-pro
+    max_context_size: 1048576   # Gemini 2.5 Pro: 1M
     base_url: https://generativelanguage.googleapis.com
     api_key: ${GEMINI_API_KEY}
     timeout: 3600

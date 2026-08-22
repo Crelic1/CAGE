@@ -1,0 +1,47 @@
+There is NO build material (`AP`): a confirmed exploit exists, but no Dockerfile,
+compose, or deploy script. Reverse-engineer the runtime FROM the exploit, then
+author a Dockerfile realizing it. Every choice is a HYPOTHESIS — env and exploit
+co-evolve; the exploit stage confirms or refutes each inference against the live
+instance.
+
+## Reverse-engineer the runtime from the exploit
+
+{% if instance_data.materials.exploit %}Read every exploit ({% for p in instance_data.materials.exploit %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}). {% endif %}For each runtime
+property below, quote the exact line(s) it rests on:
+
+- libc series: leaked-address offset arithmetic (`libc.address = leak - <off>`),
+  `one_gadget` constants, `__free_hook`/`__malloc_hook`/`main_arena` offsets, or
+  a `libc.so.6` the solver `LD_PRELOAD`s. A matching offset pins the glibc minor
+  version — cite the constant, do not guess.
+- loader + architecture: the supplied binary's ELF header and `PT_INTERP`
+  (attachments), cross-checked against the exploit's `p64`/`p32` packing.
+- protections the exploit RELIES ON: `NX` (ROP/ret2libc, not stack shellcode),
+  `PIE` off (hardcoded .text/PLT) or on (leak-relative), a canary leak/bypass,
+  partial-RELRO GOT overwrite, CET/`endbr` notes. Set exactly what the exploit
+  assumes; cite the line.
+
+Select the catalog bundle (`instance_data.pwn_runtime`, cache
+`{{ instance_data.pwn_runtime.status }}`) whose glibc series matches the pinned
+offsets, or the solver-shipped libc/loader pair; never cross a libc and loader
+from different bundles. Record the selection and every citation in the
+`pwn_runtime` object (schema in the category section) with `confidence: inferred`
+and `authenticity_status: inferred_reconstruction` — the runtime the exploit
+implies, not an official one.
+
+## Realize it as a Dockerfile
+
+Author a Dockerfile installing the inferred libc/loader pair and preserving the
+binary's interpreter, arch, permissions, and the exact hardening the exploit
+needs, served over the declared protocol. Do NOT weaken a protection to ease
+later exploitation — fidelity first; the exploit adapts to the runtime.
+
+## When the exploit anchors no runtime
+
+If the exploit hardcodes no libc offset, ships no libc, and asserts no
+protection you can tie to a line, do not invent a glibc minor version. Emit
+`status: blocked` with a `runtime_inference_unsupported` blocker citing what the
+exploit does and does not reveal; `next_action`: supply a libc/loader or writeup.
+
+{% if instance_data.category_profile == "pwn" %}
+{% include "_templates/pwn_service.j2" %}
+{% endif %}

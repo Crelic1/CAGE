@@ -1,0 +1,7 @@
+This challenge has no confirmed attachment (`NO_A`) — only candidate inventory
+facts. It is **not production-eligible**.
+
+- Do not attempt any build. Emit `status: blocked` with a single
+  `candidate_inventory_only` blocker.
+- `next_action`: resolve the candidate attachment/source references upstream
+  before this challenge re-enters any generation queue.

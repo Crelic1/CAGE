@@ -19,6 +19,20 @@ class AgentType(ABC):
     dockerfile: str = ""
     plugin_images: dict[str, str] = {}
 
+    #: True when this CLI accepts the task prompt on stdin instead of argv.
+    #:
+    #: An agent launched as ``cli -p '<the whole prompt>'`` carries that prompt
+    #: in its own ``/proc/<pid>/cmdline`` for the entire trial. Agents routinely
+    #: run ``pkill -f <pattern>`` to clean up something they started, and the
+    #: pattern is usually a phrase the prompt also contains (a port, a service
+    #: name, a target host) — so the sweep matches the agent's own process and
+    #: it kills its own session mid-trial. Reading the prompt from stdin keeps
+    #: it out of every command line and removes the self-match entirely.
+    #:
+    #: Only set this after verifying the CLI really consumes stdin as the
+    #: prompt: getting it wrong means the agent starts with no task at all.
+    supports_stdin_prompt: bool = False
+
     def image_for_variant(self, variant: str) -> str:
         """Return the local image ref for a build/runtime ``variant``.
 
@@ -32,6 +46,22 @@ class AgentType(ABC):
         repo = self.default_image.split(":", 1)[0]
         return f"{repo}:{variant}"
 
+    #: Which release of this agent's CLI to install when nobody says otherwise.
+    #:
+    #: ``"latest"`` tracks upstream, which is usually what you want. The cost is
+    #: that an agent CLI decides for itself how much history to keep and when to
+    #: summarise it, and those rules do change between releases — so the same
+    #: experiment run a month apart is not necessarily the same experiment. The
+    #: install layer also sits downstream of files we edit often, so an unrelated
+    #: change can rebuild the image onto a different CLI without anyone asking.
+    #:
+    #: An agent that has hit that can override this with a release whose
+    #: behaviour it has actually observed. Either way callers keep the last word
+    #: (``agents[].version`` in project.yml, ``cage agent build --version``, or
+    #: the image's build arg); this only decides what happens when they say
+    #: nothing.
+    default_version: str = "latest"
+
     @abstractmethod
     def install_command(self, version: str = "latest") -> str:
         """Return the shell command that installs this agent CLI."""
@@ -44,8 +74,17 @@ class AgentType(ABC):
         model: ModelConfig,
         max_rounds: int = -1,
         proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
-        """Build the command used to launch one agent session."""
+        """Build the command used to launch one agent session.
+
+        ``stdin_prompt`` is True when the caller has staged *prompt* in a file
+        and will redirect it onto the command's stdin. Implementations that set
+        :attr:`supports_stdin_prompt` must then leave the prompt out of argv —
+        that omission is the whole point (see the attribute's docstring).
+        Callers only pass True to agents that declare support, so agents which
+        do not may accept and ignore it.
+        """
 
     @abstractmethod
     def parse_output(self, result: ExecResult) -> str:

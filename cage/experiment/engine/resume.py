@@ -16,10 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cage.artifacts.jsonio import (
-    _load_json_file,
-    _write_json_file,
-)
+from cage.contracts.jsonio import load_json_file, write_json_file
 from cage.artifacts.reader import ExperimentArtifactReader
 from cage.artifacts.record_snapshots import (
     RUN_MANIFEST_FILE,
@@ -278,7 +275,7 @@ def _assert_resume_compatible(run_dir: Path, current_manifest: dict[str, Any]) -
     if not run_dir.is_dir():
         raise ResumeCompatibilityError(_resume_run_not_found_message(run_dir))
     manifest_path = run_dir / RUN_MANIFEST_FILE
-    previous_manifest = _load_json_file(manifest_path)
+    previous_manifest = load_json_file(manifest_path)
     current_trials = _normalize_planned_trial_records(
         current_manifest.get("planned_trials", []),
     )
@@ -364,7 +361,7 @@ def _merge_interrupted_planned_trials(
         if not trial_id:
             continue
         meta_path = trial_meta_path(run_dir, trial_id)
-        meta = _load_json_file(meta_path)
+        meta = load_json_file(meta_path)
         trial_info = by_id.get(trial_id)
         if trial_info is None:
             trial_info = _trial_info_from_planned_trial(planned, meta)
@@ -386,7 +383,7 @@ def _merge_interrupted_planned_trials(
             **_trial_info_from_planned_trial(planned, meta),
             **termination.to_metadata(),
         }
-        _write_json_file(meta_path, meta_payload)
+        write_json_file(meta_path, meta_payload)
 
     return sorted(trial_infos, key=_trial_sort_key)
 
@@ -710,7 +707,7 @@ def _load_resume_indexed_trial_json_artifact(
             )
             if indexed is None:
                 continue
-            payload = _load_json_file(reader.resolve_artifact_path(indexed))
+            payload = load_json_file(reader.resolve_artifact_path(indexed))
         except (FileNotFoundError, KeyError, OSError, ValueError):
             continue
         return payload if isinstance(payload, dict) else {}
@@ -720,7 +717,7 @@ def _resume_round_count(run_dir: Path, trial: Trial) -> int | None:
     """Agent rounds the prior attempt executed = ``progress.json`` /
     ``total_requests`` (one entry per upstream LLM request). ``None`` if the
     file is missing/unreadable (e.g. the trial never produced a proxy log)."""
-    prog = _load_json_file(trial_progress_path(run_dir, trial.id))
+    prog = load_json_file(trial_progress_path(run_dir, trial.id))
     if isinstance(prog, dict):
         val = prog.get("total_requests")
         if isinstance(val, (int, float)):
@@ -794,7 +791,7 @@ def _load_resume_trial_meta(storage: RunStorage, trial: Trial) -> dict[str, Any]
 
     meta_path = trial_meta_path(storage.run_dir, trial.id)
     if meta_path.is_file():
-        meta_raw = _load_json_file(meta_path)
+        meta_raw = load_json_file(meta_path)
         if isinstance(meta_raw, dict):
             return meta_raw
 
@@ -818,7 +815,7 @@ def _load_resume_task_output(storage: RunStorage, trial: Trial) -> dict[str, Any
     if canonical_output:
         return canonical_output
     trial_dir = trial_path(storage.run_dir, trial.id)
-    legacy_output = _load_json_file(trial_dir / TASK_OUTPUT_FILENAME)
+    legacy_output = load_json_file(trial_dir / TASK_OUTPUT_FILENAME)
     if isinstance(legacy_output, dict) and legacy_output:
         return legacy_output
     return {}
@@ -1094,7 +1091,7 @@ def _load_planned_trials(run_dir: Path) -> list[dict[str, Any]]:
     """
 
     planned_path = run_dir / "planned_trials.json"
-    data = _load_json_file(planned_path)
+    data = load_json_file(planned_path)
     if not isinstance(data, list):
         return _canonical_plan_resume_trials(run_dir)
     return [item for item in data if isinstance(item, dict)]

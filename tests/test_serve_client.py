@@ -95,7 +95,9 @@ def test_launch_builds_per_agent_request_and_returns_instance(monkeypatch):
     assert req.get_method() == "GET"
     assert "/launch/pb-x?" in req.full_url
     assert "target_scope=per_agent" in req.full_url
-    assert "network_only=true" in req.full_url
+    # network_only is OMITTED by default: the server decides (network-only
+    # normally; host-published for an external caller on a --public-host server).
+    assert "network_only" not in req.full_url
     assert "prompt_level" not in req.full_url   # omitted → server default
     assert req.headers["Authorization"] == "Bearer t"
 

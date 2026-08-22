@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 from cage.target.server.network_alloc import (
+    detach_egress_proxy,
+    host_off_networks_enabled,
     release_octet_slot,
     release_reserved_project_local_subnet,
 )
@@ -70,6 +72,13 @@ def _purge_compose_project_resources(project_name: str, *, log_prefix: str = "")
             if network.name == DOCKER_NETWORK:
                 continue
             try:
+                # The egress proxy joined this network at launch and is not part
+                # of the compose project, so nothing else takes it off — and
+                # docker refuses to delete a network that still has an endpoint.
+                # Without this the retry budget is burned on every teardown and
+                # one network leaks per range launch.
+                if host_off_networks_enabled():
+                    detach_egress_proxy(network.name)
                 remove_network_with_retry(network)
             except Exception as e:
                 logger.warning(f"{pre}Failed to remove network {network.name}: {e}")
@@ -84,6 +93,85 @@ def _purge_compose_project_resources(project_name: str, *, log_prefix: str = "")
                 logger.warning(f"{pre}Failed to remove volume {volume.name}: {e}")
     except Exception as e:
         logger.error(f"{pre}Error cleaning volumes for {project_name}: {e}")
+
+
+def has_resources_for_cage_run_id(cage_run_id: str) -> bool:
+    """True if any container labelled ``cage.run_id=<id>`` still exists.
+
+    Non-destructive liveness probe for restart reconciliation: after a crash the
+    labelled containers survive (an op can be trusted as still up), but after a
+    graceful shutdown they were torn down (a ``ready`` op is now stale). Only
+    containers are checked — a lingering empty network is not a live instance.
+    """
+    if not cage_run_id:
+        return False
+    try:
+        client = get_docker_client()
+        label_filter = {"label": f"cage.run_id={cage_run_id}"}
+        return bool(client.containers.list(all=True, filters=label_filter))
+    except Exception as exc:  # noqa: BLE001 — a probe error must not abort reconcile
+        logger.warning("[reconcile] liveness probe for run_id=%s failed: %s", cage_run_id, exc)
+        return True  # assume alive rather than wrongly reap a maybe-live instance
+
+
+def purge_by_cage_run_id(cage_run_id: str) -> int:
+    """Remove every docker resource labelled ``cage.run_id=<id>``. Returns count.
+
+    The async launch-op path needs to tear a launch down by its stable
+    ``cage_run_id`` even when no internal ``run_id`` / project name is known yet
+    — a launch cancelled or restart-reconciled before provisioning finished. The
+    ``cage.run_id`` label is stamped on every container/network at compose-render
+    time (see ``network_alloc._stamp_cage_run_id_labels``), so it targets exactly
+    this launch's resources across whatever project name they ended up under. The
+    shared docker network is never touched. Best-effort per resource.
+    """
+    if not cage_run_id:
+        return 0
+    client = get_docker_client()
+    label_filter = {"label": f"cage.run_id={cage_run_id}"}
+    removed = 0
+    try:
+        for container in client.containers.list(all=True, filters=label_filter):
+            try:
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+                container.remove(force=True, v=True)
+                removed += 1
+                logger.info("[purge run_id=%s] removed container %s", cage_run_id, container.name)
+            except Exception as e:
+                logger.warning("[purge run_id=%s] container %s: %s", cage_run_id, container.name, e)
+    except Exception as e:
+        logger.error("[purge run_id=%s] listing containers: %s", cage_run_id, e)
+    try:
+        for network in client.networks.list(filters=label_filter):
+            if network.name == DOCKER_NETWORK:
+                continue
+            try:
+                # The egress proxy joined this network at launch and is not part
+                # of the compose project, so nothing else takes it off — and
+                # docker refuses to delete a network that still has an endpoint.
+                # Without this the retry budget is burned on every teardown and
+                # one network leaks per range launch.
+                if host_off_networks_enabled():
+                    detach_egress_proxy(network.name)
+                remove_network_with_retry(network)
+                removed += 1
+            except Exception as e:
+                logger.warning("[purge run_id=%s] network %s: %s", cage_run_id, network.name, e)
+    except Exception as e:
+        logger.error("[purge run_id=%s] listing networks: %s", cage_run_id, e)
+    try:
+        for volume in client.volumes.list(filters=label_filter):
+            try:
+                volume.remove(force=True)
+                removed += 1
+            except Exception as e:
+                logger.warning("[purge run_id=%s] volume %s: %s", cage_run_id, volume.name, e)
+    except Exception as e:
+        logger.error("[purge run_id=%s] listing volumes: %s", cage_run_id, e)
+    return removed
 
 
 def _unlink_runtime_compose(compose_path: Optional[Path]) -> None:

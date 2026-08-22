@@ -1,0 +1,25 @@
+## Fast track — reuse the deployment, no writeup (profile APB)
+
+The deployment (`B`) is present and primary, but there is no writeup. Reuse `B`
+and derive expected behavior from the deployment and source alone.
+
+- Audit and reuse the deployment closure; change only what provably blocks build
+  or boot:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  Read every referenced local file (COPY/ADD sources, entrypoints, init
+  scripts, lockfiles) before editing anything.
+- Preserve every declared service, topology, pinned versions, users, and the
+  flag mechanism. Record each compatibility repair individually in
+  `build_report.json`.
+- With no writeup, derive the intended interaction for your `runtime_probes`
+  from concrete deployment/source evidence only — the entrypoint, listen
+  address, route handlers, printed banners/menus:
+{% if instance_data.materials.get("source") %}{% for path in instance_data.materials.get("source") %}  - `{{ path }}`
+{% endfor %}{% endif %}  Cite the exact file each probe expectation comes from. Where behavior is
+  inferred rather than proven, record the uncertainty in `build_report.json`
+  instead of asserting it as fact.
+- A confirmed exploit exists and the exp stage will validate against a fresh
+  instance. Keep the environment genuinely exploitable: preserve vulnerable
+  versions, protections, entrypoint, and the solve surface exactly.
+- If an image or dependency in the closure is unavailable, report that exact
+  blocker before any substitution.

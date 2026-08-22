@@ -37,7 +37,7 @@ cage model set openai-example --provider openai --model gpt-5.5 \
 cage model list
 ```
 
-The default config runs the `claude_code` agent (id `claude_code_baseline`) on
+The default config runs the `claude_code` agent (id `claude_code`) on
 the `openai-example` model. If the container reaches your model only through a
 host proxy, set
 `proxy.upstream_http_proxy: http://<host-ip>:7890` in the config (a LAN IP the
@@ -57,7 +57,7 @@ cd examples/nyuctfbench
 cage benchmark check nyu_ctf --sample 2021f-cry-collision_course --show-prompt
 
 # one trial
-cage run nyu_ctf --agent claude_code_baseline --model openai-example \
+cage run nyu_ctf --agent claude_code --model openai-example \
   --sample 2021f-cry-collision_course --passk 1 --max-concurrent 1 \
   --run-id nyu-ctf-smoke-001
 ```
@@ -71,7 +71,7 @@ Drop `--sample` to run all 192 challenges; give the run a `--run-id` to track an
 resume it:
 
 ```bash
-cage run nyu_ctf --agent claude_code_baseline --model openai-example --run-id nyu-ctf-full-001
+cage run nyu_ctf --agent claude_code --model openai-example --run-id nyu-ctf-full-001
 ```
 
 Narrow or steer a run: `--sample <id>` (repeatable) for specific challenges,

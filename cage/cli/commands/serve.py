@@ -27,10 +27,10 @@ def _repo_examples_root() -> Path:
 def _looks_like_challenge_index(path: Path) -> bool:
     """True if ``path`` is a challenge INDEX (a flat ``{id: {path, ...}}`` map).
 
-    Distinguishes an index (``agent_pentest_bench.json``, ``post_exp_range.json``)
-    from a per-challenge ``challenge.json`` (which has ``adapter_kind`` at top and
-    no ``path``-bearing entries), so a benchmark's index roots can be discovered
-    without hardcoding its dataset layout.
+    Distinguishes an index from a per-challenge ``challenge.json`` (which carries
+    self-describing fields and no ``path``-bearing entries), so a dataset's index
+    roots can be discovered without hardcoding its layout. Datasets need not ship
+    an index at all — those are discovered by scanning for ``challenge.json``.
     """
     if path.name == "challenge.json":
         return False
@@ -47,27 +47,28 @@ def _looks_like_challenge_index(path: Path) -> bool:
 def _resolve_benchmark_sources(benchmark: str) -> list[dict[str, str]]:
     """Resolve a benchmark NAME to its ``challenge_json`` source roots.
 
-    ``examples/<benchmark>/`` may hold challenge indices at more than one depth
-    (e.g. agent_pentest_bench: ``datasets/agent_pentest_bench.json`` for web +
-    ``datasets/post_exploit_bench/post_exp_range.json`` for post-exploitation).
-    Each directory that contributes NEW challenges becomes one source root, so a
-    single ``cage benchmark serve <benchmark>`` serves the whole benchmark.
+    ``examples/<benchmark>/datasets`` may hold challenge indices at more than one
+    depth (a top-level index plus per-collection ones in subdirectories). Each
+    directory that contributes NEW challenges becomes one source root, so a single
+    ``cage benchmark serve <benchmark>`` serves the whole benchmark. When there is
+    no index at all, the dataset root is handed to the adapter, which discovers
+    targets by scanning for ``challenge.json`` (see the fallback below).
 
     Two hazards this avoids:
 
-    - **Never recurse.** Indices sit at the top of a dataset collection — the
-      dataset root or one level down. A recursive ``rglob`` would descend into
-      every challenge's app-source tree and read tens of thousands of unrelated
-      ``*.json`` (node_modules, vendor, …) — minutes of NAS I/O, so the server
-      appears to hang before it even binds. Scan only depths 0 and 1.
+    - **Never recurse for indices.** Indices sit at the top of a dataset
+      collection — the dataset root or one level down. A recursive ``rglob``
+      would descend into every challenge's app-source tree and read tens of
+      thousands of unrelated ``*.json`` (node_modules, vendor, …) — minutes of
+      NAS I/O, so the server appears to hang before it even binds. Scan only
+      depths 0 and 1.
     - **Skip duplicate indices.** A dataset can ship both a top-level index and
-      per-collection ones that re-list the same challenges (e.g.
-      ``agent_pentest_bench.json`` and ``web_exploit_bench/pentest_bench.json``
-      both list the 15 web challenges). Feeding both roots to the discovery
-      registry raises a duplicate-id error, so prefer the shallower index and
-      skip any whose challenge ids are already covered.
+      per-collection ones that re-list the same challenges. Feeding both roots to
+      the discovery registry raises a duplicate-id error, so prefer the shallower
+      index and skip any whose challenge ids are already covered.
 
-    Raises ``click.BadParameter`` if the benchmark or any index is missing.
+    Raises ``click.BadParameter`` if the benchmark directory is missing or holds
+    neither an index nor any ``challenge.json``.
     """
     bench_dir = _repo_examples_root() / benchmark
     if not bench_dir.is_dir():
@@ -101,11 +102,24 @@ def _resolve_benchmark_sources(benchmark: str) -> list[dict[str, str]]:
             seen_ids |= ids
 
     if not roots:
-        raise click.BadParameter(
-            f"no challenge index found under {search_root} — is the dataset "
-            f"submodule checked out? (git submodule update --init)",
-            param_hint="BENCHMARK",
+        # No index anywhere — fall back to convention: hand the dataset root to
+        # the adapter, which recursively scans for challenge.json (pruning at
+        # each challenge dir, so it never descends into app source). Challenges
+        # sit one or two levels down (``<collection>/<challenge>/challenge.json``
+        # or ``<challenge>/challenge.json``); a root with neither an index nor a
+        # challenge.json is the real "dataset not checked out" error.
+        has_challenges = (
+            any(search_root.glob("*/challenge.json"))
+            or any(search_root.glob("*/*/challenge.json"))
         )
+        if not has_challenges:
+            raise click.BadParameter(
+                f"no challenge index or challenge.json found under {search_root} "
+                f"— is the dataset submodule checked out? "
+                f"(git submodule update --init)",
+                param_hint="BENCHMARK",
+            )
+        return [{"adapter_kind": "challenge_json", "root": str(search_root)}]
     return [{"adapter_kind": "challenge_json", "root": r} for r in roots]
 
 
@@ -178,6 +192,39 @@ def _resolve_benchmark_judge(benchmark: str) -> dict[str, Any] | None:
     ),
 )
 @click.option(
+    "--public-host",
+    "public_host",
+    is_flag=False,
+    flag_value="auto",
+    default="",
+    metavar="ADDR",
+    help=(
+        "Serve targets to agents that are NOT on this host. Publishes each "
+        "challenge's declared entry service(s) on the host and advertises them "
+        "in entry_urls; everything else (scoring sidecars, a range's inner "
+        "hosts) stays off the host. Pass bare to derive the advertised address "
+        "from each caller's request; pass an ADDR to pin it (needed behind a "
+        "reverse proxy or NAT). REQUIRES --external-token: publishing exposes "
+        "the control API on the host too, so it must be gated. Without this flag "
+        "every launch stays network-only and only a co-located container agent "
+        "can reach a target."
+    ),
+)
+@click.option(
+    "--max-public-instances",
+    "max_public_instances",
+    default=1,
+    show_default=True,
+    type=int,
+    help=(
+        "How many host-published instances may run at once (external-access "
+        "mode only; 0 = unlimited). Published entries share the host's address, "
+        "so concurrent instances are mutually discoverable by a port scan — the "
+        "default of 1 keeps one agent from finding another's target. Over the "
+        "cap, /launch returns 409 naming the occupants and their remaining lease."
+    ),
+)
+@click.option(
     "--judge-model",
     default="",
     metavar="MODEL_ID",
@@ -217,6 +264,8 @@ def serve(
     port: int,
     namespace: str,
     external_token: str,
+    public_host: str,
+    max_public_instances: int,
     judge_model: str,
     prompt_level: str,
     adapters: tuple[str, ...],
@@ -232,6 +281,8 @@ def serve(
     Examples:
       cage benchmark serve agent_pentest_bench
       cage benchmark serve agent_pentest_bench --host 0.0.0.0 --external-token "$(openssl rand -hex 16)"
+      cage benchmark serve agent_pentest_bench --host 0.0.0.0 \
+        --external-token "$TOKEN" --public-host   # serve OFF-HOST agents
       cage benchmark serve --benchmark-root path/to/datasets   # explicit dir instead
 
     \b
@@ -241,6 +292,16 @@ def serve(
     if benchmark and benchmark_root:
         raise click.BadParameter(
             "pass BENCHMARK or --benchmark-root, not both", param_hint="BENCHMARK"
+        )
+    # --public-host exposes the control API on the same host address as the
+    # published targets, so it MUST be gated by a token; refuse to start open.
+    if public_host and not external_token:
+        raise click.UsageError(
+            "--public-host requires --external-token. Publishing target entries on "
+            "the host also exposes the control API there, so an off-host agent that "
+            "can reach a target could otherwise drive the API (list/launch/prompt/"
+            "submit/delete every instance) without auth. Pass --external-token to "
+            "gate the API, or drop --public-host to keep targets network-only."
         )
     if benchmark:
         # Resolve the benchmark's (possibly multiple) index roots and hand them
@@ -273,6 +334,13 @@ def serve(
                 + " (benchmark default)"
             )
 
+    # External-access mode: publish declared entries on the host for agents that
+    # are not co-located. Bare ``--public-host`` stores the ``auto`` sentinel —
+    # mode on, advertised address derived per request.
+    if public_host:
+        os.environ["TARGET_SERVER_PUBLIC_HOST"] = public_host
+    os.environ["TARGET_SERVER_MAX_PUBLIC_INSTANCES"] = str(max(0, max_public_instances))
+
     # DEFAULT task-briefing hint tier for GET /prompt. The effective tier is
     # bound per instance at launch (?prompt_level=); this is only the fallback.
     os.environ["TARGET_SERVER_PROMPT_LEVEL"] = prompt_level
@@ -289,6 +357,13 @@ def serve(
     click.echo(f"  prompt  : {prompt_level} default (per-launch ?prompt_level= overrides; GET /prompt/<run_id>)")
     if external_token:
         click.echo("  audience: external ENABLED (bearer token required for non-loopback)")
+    if public_host:
+        advertised = "derived per request" if public_host == "auto" else public_host
+        limit = "unlimited" if max_public_instances <= 0 else str(max_public_instances)
+        click.echo(f"  public  : entries published on host, advertised as {advertised}")
+        click.echo(
+            f"            max {limit} public instance(s); lease via ?ttl=<seconds>"
+        )
     click.echo("")
 
     if open_browser:
@@ -305,5 +380,7 @@ def serve(
         namespace=namespace,
         adapters=adapters,
         external_token=external_token,
+        public_host=public_host,
+        max_public_instances=max_public_instances,
         parent_pid=0,
     )

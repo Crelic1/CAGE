@@ -1,0 +1,68 @@
+{# Combined build⊕exploit route strategy for the R5 fusion pipeline.
+   Build half copied from env/routes/build_then_generate.j2, exploit half from
+   exp/routes/build_then_generate.j2, made self-contained so `{% include %}` resolves
+   under pipelines/full/ (its own routes/, categories/, _templates/). #}
+## Build the environment — route strategy
+
+Rebuild a faithful, bootable target using the strategy for this route.
+
+## Build then generate — reuse the deployment, exploit from writeup (profile AWB)
+
+The deployment (`B`) is present and primary. There is no exploit yet, but the
+writeup (`W`) describes the intended path — an exploit will be generated from it
+against what you build. Preserve the exact primitive the writeup relies on.
+
+- Audit and reuse the deployment closure; smallest evidence-backed compatibility
+  repairs only, each recorded in `build_report.json`:
+{% for path in instance_data.materials.get("deployment", []) %}  - `{{ path }}`
+{% endfor %}  Read every referenced local file before editing.
+- Preserve every declared service, topology, pinned versions, users, and the
+  flag mechanism.
+- Read the writeup to identify the intended vulnerability and primitive:
+{% for path in instance_data.materials.get("writeups") %}  - `{{ path }}`
+{% endfor %}  Whatever the writeup's solve chain depends on — a specific offset-exposing
+  endpoint, a leak, version-specific behavior, a reachable sink — must remain
+  present and reachable in your build. Cite the writeup line each such fact rests
+  on. Use the writeup for behavior only; never treat it as deployment source or
+  as a validation flag.
+- Base `runtime_probes` on the real intended interaction the writeup describes,
+  cited to a supplied file. The probe asserts readiness, not the exploit.
+- Keep the environment genuinely exploitable so exploit generation can succeed;
+  do not harden the bug away. If an image or dependency is unavailable, report
+  that exact blocker before substituting.
+
+## Prove it exploitable — route strategy
+
+With the target frozen, prove it faithfully exploitable: run the exploit
+under `solve/` from the player vantage against a fresh clean instance until
+it captures the harness-minted flag.
+
+Material profile `{{ instance_data.route.material_profile }}`: the writeup (`W`)
+describes the intended solve, but no runnable exploit exists — synthesize one.
+The environment was built from real build material (`B`), so treat the rebuilt
+runtime as trusted ground truth and attribute a failing pair to your exploit
+first, not the environment.
+
+## Read the writeup as a solve spec
+- Extract the ordered chain from {% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}: entry point, the
+  vulnerability, the primitive it grants, and the concrete success signal
+  (shell, win function, revealed flag). Record each step you rely on with its
+  writeup section so every exploit stage is auditable.
+- The writeup fixes the *approach*, not the *numbers*. Any offset, gadget, or
+  leaked value it quotes is historical — recompute each against the binary and
+  service in the frozen environment{% if instance_data.materials.attachments %} (and the local attachments {% for p in instance_data.materials.attachments %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}. Never paste a writeup constant.
+
+## Synthesize and bind to the live instance
+- Rebuild the primitive step by step. Confirm each milestone the writeup names
+  — reached the vulnerable input, achieved the leak, gained control — via
+  the R5 `cage-check` replay before chasing the flag.
+- Resolve every runtime fact (resolved addresses, protection state, service
+  topology) from the actual rebuilt target, not from the writeup's prose.
+
+## Confidence and honesty
+- Fidelity is high because the env came from `B`; a failing pair most likely
+  means the exploit does not yet reproduce a writeup step. Only request an
+  environment change when an observation contradicts the build material itself.
+- If the writeup underspecifies a step you cannot bridge from the attachment,
+  stop and emit `unresolved` naming the last confirmed milestone and the exact
+  writeup gap. Do not invent the missing detail or copy the historical flag.

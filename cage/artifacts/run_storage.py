@@ -72,6 +72,7 @@ TARGET_LOGS_INDEX_FILENAME = "index.json"
 PROGRESS_FILENAME = "progress.json"
 DASHBOARD_FILENAME = "dashboard.json"
 RECORD_FILENAME = "record.json"
+TRIAL_ERROR_REPORT_FILENAME = "error_report.json"
 EXPERIMENT_RECORD_FILENAME = "experiment_record.json"
 PLANNED_TRIALS_FILENAME = "planned_trials.json"
 INITIAL_STATE_DIRNAME = "initial_state"
@@ -175,6 +176,10 @@ TRIAL_ARTIFACTS: tuple[ArtifactSpec, ...] = (
     ArtifactSpec(RECORD_FILENAME, "trial", "json",
         "Canonical per-trial durable record (status, artifacts, scoring refs).",
         "(via ExperimentArtifactReader)"),
+    ArtifactSpec(TRIAL_ERROR_REPORT_FILENAME, "trial", "json",
+        "Post-mortem for a trial that raised: exception type, message, the "
+        "lifecycle phase it escaped from, and the full traceback.",
+        "load_trial_error_report"),
     ArtifactSpec(TARGET_LOGS_DIRNAME, "trial", "dir",
         "Captured target container logs (one .log per service + index.json) — "
         "audit trail for why a target stack came up or failed.",
@@ -745,6 +750,14 @@ class RunStorage:
     def load_trial_meta(self, trial_dir: Path) -> dict[str, Any]:
         """Trial ``meta.json`` (status/timing/termination); ``{}`` if absent."""
         return _read_json(trial_dir / META_FILENAME) or {}
+
+    def load_trial_error_report(self, trial_dir: Path) -> dict[str, Any]:
+        """Trial ``error_report.json`` (type/message/phase/traceback); ``{}`` if absent.
+
+        Only trials that raised have one. Its absence means the trial did not
+        fail through the exception path — not that the post-mortem was lost.
+        """
+        return _read_json(trial_dir / TRIAL_ERROR_REPORT_FILENAME) or {}
 
     def load_trial_progress(self, trial_dir: Path) -> dict[str, Any]:
         """Trial ``proxy/progress.json`` (live counters); ``{}`` if absent."""

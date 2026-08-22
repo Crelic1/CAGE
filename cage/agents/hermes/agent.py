@@ -71,8 +71,13 @@ class HermesAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
         """Launch Hermes in non-interactive mode with the task prompt.
+
+        ``stdin_prompt`` is ignored: ``hermes chat`` takes its query only via
+        ``-q`` and starts an interactive session without it, so
+        :attr:`supports_stdin_prompt` stays False and the prompt rides in argv.
 
         Per-trial config rewriting is handled by :meth:`env_vars` (which
         receives the container handle); this method only emits the CLI
@@ -80,6 +85,7 @@ class HermesAgent(AgentType):
         signature compatibility but not used — Hermes reads everything it
         needs from ``~/.hermes/config.yaml``.
         """
+        del stdin_prompt
         escaped = prompt.replace("'", "'\\''")
         return f"hermes chat -q '{escaped}'"
 

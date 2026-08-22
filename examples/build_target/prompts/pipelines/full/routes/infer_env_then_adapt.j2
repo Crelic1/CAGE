@@ -1,0 +1,86 @@
+{# Combined build⊕exploit route strategy for the R5 fusion pipeline.
+   Build half copied from env/routes/infer_env_then_adapt.j2, exploit half from
+   exp/routes/infer_env_then_adapt.j2, made self-contained so `{% include %}` resolves
+   under pipelines/full/ (its own routes/, categories/, _templates/). #}
+## Build the environment — route strategy
+
+Rebuild a faithful, bootable target using the strategy for this route.
+
+There is NO build material (`AWP`): you have a writeup and a confirmed exploit
+but no Dockerfile/compose/deploy. Infer the runtime primarily from the writeup's
+concrete clues, corroborate it against the exploit's assumptions, and author a
+Dockerfile that realizes it. Cite BOTH sources. The exploit (P) is adapted to
+this rebuilt runtime in the exploit stage — keep the runtime faithful.
+
+## Infer the runtime, writeup-first
+
+{% if instance_data.materials.writeups %}Read the writeups ({% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}) for named runtime facts and quote each:{% else %}Read the writeup for named runtime facts and quote each:{% endif %}
+
+- an explicit Ubuntu/glibc version, a supplied libc name / build-id, allocator
+  behavior (tcache/fastbin notes), symbol availability, or stated offsets.
+- corroborate with the exploit{% if instance_data.materials.exploit %} ({% for p in instance_data.materials.exploit %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}: the leak-offset arithmetic,
+  `one_gadget` constants, and pointer width must agree with the writeup's glibc.
+  When writeup and exploit agree, confidence rises; when they conflict, the
+  exploit's concrete offsets win over the writeup's prose — record the conflict.
+- loader + architecture from the supplied binary's ELF header (attachments), and
+  protections (NX/PIE/canary/RELRO/CET) from both the writeup's description and
+  the exploit's assumptions. Cite the line for each.
+
+Select the catalog bundle (`instance_data.pwn_runtime`, cache
+`{{ instance_data.pwn_runtime.status }}`) matching the corroborated glibc series,
+or the supplied libc/loader pair. Record the selection with per-source citations
+in the `pwn_runtime` object (schema in the category section) with
+`confidence: corroborated` and `authenticity_status: inferred_corroborated` when
+writeup and exploit agree; downgrade to `inferred` for any property only one
+source anchors.
+
+## Realize it as a Dockerfile
+
+Author a Dockerfile installing the inferred libc/loader pair and preserving
+interpreter, arch, permissions, and the hardening both sources describe, served
+over the declared protocol. Do not bend the runtime to fit the historical
+exploit — the exploit is re-fitted to the runtime, not the reverse.
+
+## When neither source pins the runtime
+
+If the writeup names no concrete runtime fact and the exploit hardcodes no libc
+offset, emit `status: blocked` with a `runtime_inference_unsupported` blocker
+citing both sources' gaps; do not upgrade prose into a glibc minor version.
+
+{% if instance_data.category_profile == "pwn" %}
+{% include "_templates/pwn_service.j2" %}
+{% endif %}
+
+## Prove it exploitable — route strategy
+
+With the target frozen, prove it faithfully exploitable: run the exploit
+under `solve/` from the player vantage against a fresh clean instance until
+it captures the harness-minted flag.
+
+## Adapt the exploit; env inferred from writeup + exploit (AWP)
+
+There is no build material. The environment was inferred from the writeup's
+concrete runtime clues, corroborated by the exploit. PORT the confirmed exploit
+to the live instance; use the writeup to disambiguate whenever a live
+observation is ambiguous.
+
+{% if instance_data.materials.exploit %}Confirmed exploit under:
+{% for path in instance_data.materials.exploit %}- `{{ path }}`
+{% endfor %}{% endif %}{% if instance_data.materials.writeups %}Writeup(s):
+{% for path in instance_data.materials.writeups %}- `{{ path }}`
+{% endfor %}{% endif %}
+- Keep the exploit's approach and primitive. Retarget it at the harness-passed
+  instance address; strip hardcoded historical host/port and absolute addresses.
+- Resolve leaks at runtime; recompute every base/target from the live leak
+  against the chosen runtime's offsets. Never reuse historical numbers.
+- The env is inferred, so a failed R5 `cage-check` replay can be env- or exploit-side.
+  Use the writeup to arbitrate: if a leaked address disagrees with the chosen
+  runtime, check the writeup's stated Ubuntu/glibc/build-id and allocator clues.
+  If they name a different libc, the ENVIRONMENT is wrong — correct the env
+  files. If the writeup confirms the runtime, the fix is exploit-side offsets.
+- Feed corrected runtime observations back into the env files; env and exploit
+  co-evolve until they agree with both the writeup and the live leaks.
+- Do not weaken protections, and do not copy any writeup literal (flag, address)
+  into the solve. Each env change must be evidence-backed.
+- Prove it: the R5 `cage-check` replay must capture the harness-provisioned flag from a
+  fresh clean instance.

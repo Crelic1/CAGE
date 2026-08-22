@@ -205,30 +205,73 @@ def _first_user_text(req: dict[str, Any]) -> str:
     return ""
 
 
+def _message_text_blocks(msg: dict[str, Any]) -> list[str]:
+    """Each text block of ONE message, in order (no flattening across blocks)."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [
+        str(b["text"])
+        for b in content
+        if isinstance(b, dict) and b.get("type") in ("text", "input_text", None) and b.get("text")
+    ]
+
+
 def _user_text_blocks(req: dict[str, Any]) -> list[str]:
     """Each text block of each user message, in order (no flattening across blocks)."""
     out: list[str] = []
     for msg in req.get("messages") or []:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            out.append(content)
-        elif isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") in ("text", "input_text", None) and b.get("text"):
-                    out.append(str(b["text"]))
+        out.extend(_message_text_blocks(msg))
     return out
 
 
+def _carries_summary(msg: dict[str, Any]) -> bool:
+    """Does THIS message deliver a compaction summary (rather than mention one)?"""
+    return any(
+        _strip_volatile(text).lstrip().lower().startswith(_COMPACTION_MARKER)
+        for text in _message_text_blocks(msg)
+    )
+
+
 def _is_compaction_request(req: dict[str, Any]) -> bool:
-    """A compaction CALL carries the 'create a detailed summary' instruction."""
+    """A compaction CALL carries the 'create a detailed summary' instruction.
+
+    Only the LAST user message counts. A compaction request appends the
+    instruction as the final turn — everything before it is the history being
+    summarized. Scanning the whole message list instead would latch onto the
+    instruction wherever it later reappears, and it always reappears: the
+    summary the model writes quotes its own task, Claude Code carries that
+    summary into the continuation request as a user text block, and the block
+    then rides along in the history of every subsequent request. One real
+    compaction would flag every call after it for the rest of the trial,
+    inflating ``num_compactions`` and — because ``root_rounds`` is computed by
+    SUBTRACTING compaction calls — deflating the round count by the same amount.
+
+    The continuation that immediately follows needs its own guard: it can carry
+    the summary as its ONLY user message, which puts the quoted instruction in
+    last position too. A continuation is the call that RESUMES from a summary,
+    never the one that generates it, so it is excluded — but that exclusion must
+    be judged on the LAST user message alone, not on the request as a whole.
+    Once a conversation has compacted, the summary rides along in its history
+    forever, so a whole-request test reports "continuation" for every later call
+    and silently swallows the SECOND and every subsequent compaction call. That
+    undercounts ``num_compactions`` and, because ``root_rounds`` subtracts
+    compaction calls, inflates the round count by the same amount — the exact
+    failure this guard exists to prevent, in the other direction.
+    """
+    last_user: dict[str, Any] | None = None
     for msg in req.get("messages") or []:
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        if _COMPACTION_SUMMARY_PROMPT in _content_to_text(msg.get("content")).lower():
-            return True
-    return False
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = msg
+    if last_user is None:
+        return False
+    if _carries_summary(last_user):
+        return False
+    return _COMPACTION_SUMMARY_PROMPT in _content_to_text(last_user.get("content")).lower()
 
 
 def _is_continuation_request(req: dict[str, Any]) -> bool:

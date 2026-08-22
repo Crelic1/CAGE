@@ -1,0 +1,42 @@
+There is NO build material and NO exploit (`AW`): only a writeup. The writeup is
+the SOLE runtime anchor, and no exploit exists to corroborate any inference, so
+confidence is low by construction. Infer the runtime from the writeup alone,
+author a Dockerfile that realizes it, and mark it explicitly unverified.
+
+## Infer the runtime from the writeup alone
+
+{% if instance_data.materials.writeups %}Read the writeups ({% for p in instance_data.materials.writeups %}`{{ p }}`{% if not loop.last %}, {% endif %}{% endfor %}) and quote each concrete runtime clue:{% else %}Read the writeup and quote each concrete runtime clue:{% endif %}
+
+- an explicit Ubuntu/glibc version, a named libc / build-id, allocator behavior,
+  symbol availability, or stated offsets are the ONLY admissible runtime
+  evidence — quote the exact line.
+- loader + architecture from the supplied binary's ELF header (attachments) are
+  compatibility facts, NOT proof of the historical glibc minor version.
+- prose alone ("heap challenge", "ret2libc") does not pin a glibc series. Do not
+  manufacture a version the writeup never states.
+
+Select the catalog bundle (`instance_data.pwn_runtime`, cache
+`{{ instance_data.pwn_runtime.status }}`) matching the writeup's stated glibc, or
+the supplied libc/loader pair. Record it in the `pwn_runtime` object (schema in
+the category section) with `confidence: low` and
+`authenticity_status: unverified_until_exp`: with no exploit, nothing in this
+stage can confirm the runtime is faithful. Only a later current-instance exploit
+(a future enrichment to `AWP`) can resolve that uncertainty.
+
+## Realize it as a Dockerfile
+
+Author a Dockerfile installing the selected libc/loader pair and preserving
+interpreter, arch, permissions, and any hardening the writeup describes, served
+over the declared protocol. Make only the choices the writeup backs; record
+every unbacked assumption as such.
+
+## Prefer an honest blocker
+
+If the writeup gives no concrete runtime clue — no version, no libc, no offset —
+do not guess. Emit `status: blocked` with a `runtime_inference_unsupported`
+blocker quoting the writeup's silence; set `next_action` to supply a libc/loader
+pair or an exploit that would anchor the runtime.
+
+{% if instance_data.category_profile == "pwn" %}
+{% include "_templates/pwn_service.j2" %}
+{% endif %}

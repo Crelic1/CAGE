@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from cage.agents.base.output import failure_banner
+from cage.agents.base.output import extract_stream_json_text, failure_banner
 from cage.agents.base import AgentType, register_agent_type
 from cage.models import ModelConfig
 from cage.sandbox.exec import ExecResult
@@ -105,6 +105,7 @@ def _qwen_settings(
 @register_agent_type
 class QwenCodeAgent(AgentType):
     name = "qwen_code"
+    supports_stdin_prompt = True
     state_paths = [".qwen"]
     default_image = "cage/qwen-code:pentestenv"
     dockerfile = "docker/qwen_code/pentestenv.Dockerfile"
@@ -114,15 +115,33 @@ class QwenCodeAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
         """Launch ``qwen`` in non-interactive single-turn mode.
 
+        With ``stdin_prompt`` the ``-p`` flag is dropped: qwen-code documents
+        ``-p`` as "appended to input on stdin (if any)", so piped stdin alone
+        is a complete prompt.
+
         ``--yolo`` auto-approves tool calls (equivalent to
-        ``--approval-mode=yolo``); ``--output-format json`` produces a
-        structured stdout we can parse; ``--max-session-turns`` enforces
-        Cage's per-trial round budget (the CLI defaults to ``-1``,
-        i.e. unbounded, so passing it conditionally keeps the framework
-        contract that negative ``max_rounds`` means unset).
+        ``--approval-mode=yolo``); ``--output-format stream-json`` emits
+        one NDJSON event per turn as the turn happens;
+        ``--max-session-turns`` enforces Cage's per-trial round budget
+        (the CLI defaults to ``-1``, i.e. unbounded, so passing it
+        conditionally keeps the framework contract that negative
+        ``max_rounds`` means unset).
+
+        ``stream-json`` rather than the plain ``json`` this used to pass,
+        because ``json`` prints one object at *process exit* — and a trial
+        that hits its timeout never gets there. Measured on qwen-code
+        0.15.11 with the same prompt killed at the same 75s mark:
+        ``json`` left 0 bytes on stdout, ``stream-json`` left 60 events.
+        With ``json`` every timed-out qwen trial recorded no agent output
+        at all, so its whole transcript survived only in ``proxy.jsonl``
+        and any scorer reading the agent's answer saw nothing. Same event
+        shapes as claude-code's stream (``system``/``assistant``/
+        ``result``), which is why :func:`extract_stream_json_text` reads
+        it unchanged.
 
         Caveat: qwen-code's "session turn" counter is **not** strictly
         1:1 with LLM API calls — a single session turn can issue
@@ -135,23 +154,34 @@ class QwenCodeAgent(AgentType):
         proxy's.
         """
         escaped = prompt.replace("'", "'\\''")
+        prompt_flag = "" if stdin_prompt else f" -p '{escaped}'"
         max_flag = (
             f" --max-session-turns {int(max_rounds)}" if max_rounds and max_rounds > 0 else ""
         )
         return (
-            f"qwen --yolo --output-format json"
+            f"qwen --yolo --output-format stream-json"
             f"{max_flag}"
-            f" -p '{escaped}'"
+            f"{prompt_flag}"
         )
 
     def parse_output(self, result: ExecResult) -> str:
-        """Extract final assistant text from ``--output-format json`` stdout.
+        """Extract the agent's last words from ``stream-json`` stdout.
 
-        The JSON shape for ``--output-format json`` is a single object
-        with a ``response`` (or similar) field. Schemas have churned
-        across versions, so we try a list of known fields, then fall
-        back to scanning JSON lines for assistant message text, then to
-        raw stdout.
+        The live format is the NDJSON event stream
+        :meth:`build_launch_command` asks for, whose ``result`` /
+        ``assistant`` events are shaped exactly like claude-code's — so
+        the shared extractor reads it and this agent adds no second copy
+        of that loop.
+
+        The single-object ``--output-format json`` branch below stays for
+        run dirs recorded before the switch (``cage score`` re-reads
+        those) and for anyone pointing this agent at the plain format.
+        Its schema churned across qwen-code versions, hence the list of
+        candidate fields rather than one.
+
+        A killed agent has no *final* word, only a latest one; the
+        extractor returns that, which is the honest best available and
+        what every other stream-json agent here already records.
         """
         banner = failure_banner(result)
         if banner is not None:
@@ -160,6 +190,10 @@ class QwenCodeAgent(AgentType):
         stdout = result.stdout.strip()
         if not stdout:
             return ""
+
+        streamed, saw_json = extract_stream_json_text(stdout)
+        if streamed:
+            return streamed
 
         # Single-object JSON (the documented shape for --output-format json)
         try:
@@ -189,8 +223,9 @@ class QwenCodeAgent(AgentType):
                                 if text:
                                     return text
 
-        # Fallback: NDJSON scan (in case the user passed stream-json or the
-        # CLI emits multiple lines)
+        # Tolerant NDJSON scan for the shapes the shared extractor does not
+        # accept — bare ``message`` events and string (rather than block-list)
+        # content, both of which older qwen-code builds emitted.
         last_text = ""
         for line in stdout.splitlines():
             line = line.strip()
@@ -220,7 +255,10 @@ class QwenCodeAgent(AgentType):
         if last_text:
             return last_text
 
-        return stdout[:4000]
+        # Raw stdout is a readable last resort for ``text`` output, but dumping
+        # 4000 characters of an event stream nobody could read as prose just
+        # puts machine noise where the agent's answer belongs.
+        return "" if saw_json else stdout[:4000]
 
     def env_vars(
         self,

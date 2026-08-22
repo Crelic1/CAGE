@@ -13,6 +13,7 @@ from cage.artifacts.run_storage import (
 )
 from cage.cli.commands import model as model_commands
 from cage.cli.paths import display_path
+from cage.contracts.execution import DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S
 
 
 @click.command("debug")
@@ -42,6 +43,10 @@ from cage.cli.paths import display_path
     help="Plugin to install (repeatable, e.g. --plugin openviking-memory)",
 )
 @click.option("--version", default="", help="Agent CLI version to install")
+@click.option(
+    "--check", "check_only", is_flag=True,
+    help="Verify agent → proxy → model end-to-end and exit (no interactive shell).",
+)
 @click.option("--no-proxy", is_flag=True, help="Skip proxy (agent talks directly to upstream)")
 @click.option(
     "--upstream-proxy", "upstream_http_proxy", default="",
@@ -68,6 +73,7 @@ def debug(
     skill: str,
     plugins: tuple[str, ...],
     version: str,
+    check_only: bool,
     no_proxy: bool,
     upstream_http_proxy: str,
     image: str,
@@ -88,6 +94,15 @@ def debug(
          cage agent debug --agent claude_code --model glm-5.1-sii
          cage agent debug --agent claude_code --model glm-5.1-sii --skill self-improving-agent
          cage agent debug --agent claude_code --model glm-5.1-sii --plugin openviking-memory
+
+    \b
+    3. Verify the chain the trials will actually take, then exit:
+         cage agent debug --agent kimi_code --model kimi-k2.6 --check
+
+       This is the same check preflight runs: the agent's own config is written,
+       its CLI is started against the in-container proxy, and the model's reply
+       is read back. Whatever the CLI says is reported verbatim — Cage does not
+       re-implement any agent's own validation.
     """
     import json
     import subprocess
@@ -179,7 +194,7 @@ def debug(
     model = models[model_id]
     agent_type = get_agent_type(agent_name)
     if not version:
-        version = "latest"
+        version = getattr(agent_type, "default_version", "latest")
 
     # Build agent instance
     default_home = (
@@ -199,6 +214,10 @@ def debug(
         shared_paths=run_config.get("shared_paths", []) if run_path else [],
         home=default_home,
     )
+
+    if check_only:
+        _run_chain_check(agent, upstream_http_proxy=upstream_http_proxy)
+        return
 
     effective_image = agent.effective_image
     container_name = f"cage-debug-{int(time.time()) % 100000}"
@@ -337,17 +356,21 @@ def debug(
     # Start proxy if enabled — match trial config when run_dir provided
     proxy = None
     proxy_url = ""
+    _sub_mode = bool(model.auth_source) and not model.base_url
     if not no_proxy:
         from cage.proxy.host import start_container_proxy
         proxy_section = (run_config.get("proxy") or {}) if run_path else {}
         runtime_section = (run_config.get("runtime") or {}) if run_path else {}
-        # Subscription/OAuth fallback — mirror the preflight rule: when
-        # ``auth_source`` is set and no explicit ``base_url``, point the
-        # proxy at ``api.anthropic.com`` so the OAuth Bearer reaches the
-        # real subscription backend. Without this, an empty base_url makes
-        # the proxy try to connect to nowhere.
-        _sub_mode = bool(model.auth_source) and not model.base_url
-        upstream_base = "https://api.anthropic.com" if _sub_mode else model.base_url
+        # Subscription/OAuth routing is agent-specific: Claude and Codex use
+        # different native backends even though both declare ``auth_source``.
+        upstream_base = (
+            agent_type.subscription_upstream_base_url
+            if _sub_mode else model.base_url
+        )
+        if _sub_mode and not upstream_base:
+            raise click.ClickException(
+                f"agent {agent_name!r} does not support subscription auth"
+            )
         # --upstream-proxy overrides anything from config.yaml when given.
         effective_http_proxy = (
             upstream_http_proxy
@@ -361,9 +384,17 @@ def debug(
             trial_id="debug",
             system_template=proxy_section.get("rewrite_system", ""),
             port=0,
-            request_timeout=proxy_section.get("request_timeout", 3600.0),
+            request_timeout=proxy_section.get(
+                "request_timeout", DEFAULT_UPSTREAM_REQUEST_TIMEOUT_S,
+            ),
             http_proxy=effective_http_proxy,
-            max_requests=runtime_section.get("max_rounds", 0),
+            # Unset means "no cap", not "cap at zero". The proxy enforces any
+            # value >= 0 as a hard limit, so the old default of 0 rejected the
+            # very first model call — in an interactive session whose whole
+            # purpose is to make model calls. A debug shell is human-driven and
+            # short-lived; imposing a number would be inventing a budget the
+            # user never asked for.
+            max_requests=runtime_section.get("max_rounds", -1),
             max_input_tokens=runtime_section.get("max_input_tokens"),
             max_output_tokens=runtime_section.get("max_output_tokens"),
             max_cost=runtime_section.get("max_cost"),
@@ -405,7 +436,7 @@ def debug(
     # Use a CUSTOM model_provider (not the built-in `openai`) so codex skips
     # WebSocket probing and server-side /compact endpoint (which most relays
     # like NewAPI don't implement). Equivalent to user-style local config.
-    if agent_name == "codex" and proxy_url:
+    if agent_name == "codex" and proxy_url and not _sub_mode:
         codex_dir = "/home/agent/.codex"
         container.exec(f"mkdir -p {codex_dir}", timeout=5.0)
         # Auth (real key, not placeholder)
@@ -437,7 +468,7 @@ def debug(
     # bind-mounted host file under /home/agent/.claude, so never chown the
     # whole home directory here.
     container.exec("chown agent:agent /home/agent /home/agent/.cage_env", timeout=10.0)
-    if agent_name == "codex":
+    if agent_name == "codex" and not _sub_mode:
         container.exec(
             "chown -R agent:agent /home/agent/.codex 2>/dev/null || true",
             timeout=10.0,
@@ -485,6 +516,34 @@ def debug(
             proxy.stop(artifact_dir=Path.cwd() / ".cage-debug-proxy")
         container.stop()
         click.echo("Debug container removed.")
+
+
+def _run_chain_check(agent, *, upstream_http_proxy: str = "") -> None:
+    """Verify agent → proxy → model and print the outcome; exit non-zero on failure.
+
+    Deliberately the same function preflight calls, so what this reports and what
+    blocks a run can never diverge — a debug command that says "fine" while the
+    run says "broken" would be worse than having no command.
+    """
+
+    from cage.experiment.engine.agent_chain import check_agent_model_chain
+
+    click.echo(
+        f"Checking {agent.agent_type.name} -> proxy -> {agent.model.id} "
+        f"(image: {agent.effective_image}) ..."
+    )
+    outcome = check_agent_model_chain(
+        agent, upstream_http_proxy=upstream_http_proxy,
+    )
+    if outcome.ok:
+        click.echo(f"  OK  {outcome.summary()}")
+        return
+    click.echo(f"  FAIL  {outcome.summary()}", err=True)
+    if outcome.agent_output.strip():
+        click.echo("\n  Agent output:", err=True)
+        for line in outcome.agent_output.strip().splitlines()[:20]:
+            click.echo(f"    {line}", err=True)
+    raise SystemExit(1)
 
 
 def _custom_agent_dirs(cage_root: Path) -> list[Path]:
@@ -663,7 +722,14 @@ def build(agent_name: str, variant: str, version: str, no_cache: bool, build_all
             "-f", str(dockerfile_path),
             "-t", image_tag,
         ]
-        if version:
+        # Unset ``--version`` still pins: fall back to the agent's own declared
+        # release rather than letting the Dockerfile's ``latest`` decide. The
+        # install layer sits downstream of files that change often, so a rebuild
+        # triggered by an unrelated edit would otherwise land on whatever the
+        # registry serves that day — which is how a run's context handling can
+        # change with nothing in the config to explain it.
+        build_version = version or getattr(agent, "default_version", "")
+        if build_version:
             # Override every known agent CLI version ARG; the Dockerfile
             # only consumes the one it declares, the rest are ignored (Docker
             # warns but does not fail on an unconsumed build-arg).
@@ -674,7 +740,7 @@ def build(agent_name: str, variant: str, version: str, no_cache: bool, build_all
                 "KIMI_CLI_VERSION",
                 "QWEN_CODE_VERSION",
             ):
-                cmd += ["--build-arg", f"{arg}={version}"]
+                cmd += ["--build-arg", f"{arg}={build_version}"]
         if no_cache:
             cmd.append("--no-cache")
         cmd.append(str(build_context))

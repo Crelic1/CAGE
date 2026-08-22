@@ -79,6 +79,68 @@ cage run project.yml
 When `agents[].max_concurrent > 1`, CAGE uses `_run_trial_isolated()` so
 each trial gets its own agent container and target stack lifecycle.
 
+### Trial State Axes
+
+A trial carries four independent facts, and each has exactly one home:
+
+| Axis | Field | Vocabulary |
+|------|-------|------------|
+| Did it run, and how did it end? | `TrialRecord.status` | `TrialStatus` — `pending`/`running` + the four terminal values |
+| Where is it right now? | `TrialRecord.phase` | `TrialPhase` (`contracts/trial_phase.py`) |
+| Why did it stop? | `termination.reason` | `TerminationReason` |
+| Has it been scored? | `TrialRecord.scoring.status` | `scored` / `not_scored` |
+
+`TerminationStatus` is the terminal subset of `TrialStatus`; the classifier
+writes it into the same `status` field, so the two must stay identical and a
+test asserts that against `TERMINAL_TRIAL_STATUSES` rather than trusting two
+files to agree.
+
+**Runtime status and scoring status are separate axes.** A failed trial can
+carry scoring evidence; a completed one can stay unscored. Runs written before
+`scoring.status` existed recorded scoring in the runtime status, so
+`contracts/trial_status.py` splits its vocabulary in two:
+
+- `TERMINAL_TRIAL_STATUSES` — what the writer accepts. Strict: a `status="scored"`
+  write is rejected, which is where the two axes would otherwise blur again.
+- `*_ON_READ` — the same sets widened by `LEGACY_SCORING_TRIAL_STATUSES`, used
+  by every consumer that classifies on-disk records so historical runs keep
+  bucketing exactly as before.
+
+Tolerance belongs on read, never on write.
+
+### Trial Phase And Run Liveness
+
+`TrialRecord.status` is the coarse bucket (`planned` / `running` / terminal);
+`TrialRecord.phase` is the position *within* it, from the vocabulary in
+`cage/contracts/trial_phase.py`. The runner advances it through
+`TrialPhaseTracker` (`experiment/engine/trial_phase_tracker.py`) at each stage
+boundary of the flow above. Two consumers depend on it:
+
+- the inspector renders `Running · Launching target` instead of a bare
+  `Running` that stays unchanged for the minutes a trial spends on setup; and
+- a trial that raises records `failed_phase`, which is what lets the classifier
+  attribute the ~160 untyped `RuntimeError`/`ValueError` raises across the
+  framework to a real category instead of one generic `trial_error`.
+
+**Run liveness is answered by the process, not by file mtimes.**
+`experiment/engine/live/run_heartbeat.py` writes `runtime_status.json`
+(orchestrator pid + hostname + a timestamp refreshed every 15 s) into every
+subject's run dir; `RunCleanup` removes it on every exit path. Consumers
+(`live/liveness.py`, `web/cache.py`, `web/data`) call `run_process_is_alive`,
+which is **tri-state**:
+
+| Result | Meaning |
+|--------|---------|
+| `True` | same-host pid is live (`os.kill(pid, 0)`), or a cross-host heartbeat is fresh |
+| `False` | the status file exists but its process is gone — a crashed run |
+| `None` | no status file: a pre-heartbeat or barely-started run → fall back to the mtime heuristics |
+
+That `None` is load-bearing — collapsing it to `False` would mark every
+historical run dead. The older heuristics (recent `proxy/progress.json`, fresh
+`planned_trials.json`) remain only as that fallback. They infer life from recent
+writes, which a healthy run does not produce while pulling an image, waiting out
+a rate-limit backoff, or sitting inside one long agent turn.
+
 ### Target Build And Launch Flow
 
 `cage benchmark build` runs benchmark-owned prebuild hooks without agents or
@@ -259,7 +321,9 @@ on-disk artifacts:
 | `exit_code` | agent process | timeout / OOM / nonzero-exit gating |
 | `timed_out` | orchestrator | `execution_timeout` |
 | `terminated_by_limit` | orchestrator | `tool_limit` (legacy) |
-| `error` | orchestrator exception text | `trial_error` |
+| `error` | orchestrator exception text | the infra/config/benchmark reasons, refined by the two rows below |
+| `error_type` | exception class name | `container_error`, `config_error`, `agent_setup_error`, `target_error`, `benchmark_error`, `scoring_error`, `proxy_error` |
+| `failed_phase` | `TrialPhase` the exception escaped from | same set, for the untyped `RuntimeError`/`ValueError` majority that carries no `error_type` |
 | `proxy.jsonl` records | in-container proxy | `model_*` subtypes via HTTP status + `error.type`; `max_rounds_reached` via successful non-compact round count; token budget fallback totals |
 | `proxy/progress.json` | in-container proxy | `max_input_tokens_reached`, `max_output_tokens_reached`, `max_cost_reached` budget hits |
 | `max_rounds` | `effective_max_rounds` (orchestrator); falls back to `sample.max_rounds` in reclassify | `max_rounds_reached` budget hit |
@@ -267,10 +331,13 @@ on-disk artifacts:
 
 **Detection order** (intentional — earlier branches win):
 
-1. Explicit exception (`termination_info_from_exception`)
+1. Explicit exception (`termination_info_from_exception`: typed exception first, then `failed_phase`)
 2. `timed_out` ⇒ `execution_timeout`
 3. `terminated_by_limit` ⇒ `tool_limit`
-4. orchestrator `error` text ⇒ `trial_error`
+4. orchestrator `error` text ⇒ attributed, in order: the last proxy entry when
+   `failed_phase == running_agent` (a crash whose final upstream call 401'd is
+   an auth failure, not a generic one) → `error_type` → `failed_phase` →
+   `trial_error` when nothing fits
 5. exit 137 ⇒ `oom_killed`
 6. successful non-compact proxy rounds ≥ `max_rounds > 0` and exit ≠ 0 ⇒ `max_rounds_reached`
 7. proxy cumulative usage ≥ token/cost budget and exit ≠ 0 ⇒ `max_input_tokens_reached`, `max_output_tokens_reached`, or `max_cost_reached`
@@ -355,28 +422,6 @@ its first request (1 round) still re-runs. Rounds come from
 auditable before any container starts. The `execution.max_trial` cap (by
 ascending trial index) composes with all of the above — it defers trials at
 or beyond the cap to a later capless invocation.
-
-### Migration for old runs
-
-Pre-classifier runs carry the legacy `agent_exit_nonzero` reason for every
-non-zero exit. A later revision added the `max_rounds_reached` structural
-detection. Both upgrades are batched in
-`scripts/reclassify_meta.py`:
-
-```bash
-python scripts/reclassify_meta.py <run_dir> --dry-run
-python scripts/reclassify_meta.py <run_dir>
-```
-
-The script preserves prior values under `legacy_termination_reason` /
-`legacy_termination_detail` / `legacy_termination_source` /
-`legacy_status` so the migration is auditable. Trials whose reason was
-already set by a non-classifier path (`completed`, `target_unavailable`,
-`execution_timeout`, `user_interrupted`, `tool_limit`, `trial_error`,
-`cancelled_before_start`, `live_success`) are skipped — they came from
-the orchestrator directly and are already right. `max_rounds_reached`
-is rechecked so old runs that counted failed upstream calls against the
-round budget can be corrected.
 
 ## Live Check And Success Verdicts
 
@@ -570,10 +615,12 @@ Run artifacts live under `.cage_runs`.
     run-{timestamp}/
       dashboard.json
       results.csv
+      runtime_status.json      # orchestrator pid + heartbeat; removed on exit
       {mode}/
         trials/
           {trial_id}/
             meta.json
+            error_report.json  # only when the trial raised: type/phase/traceback
             prompt.txt
             task_output.json
             proxy/proxy.jsonl

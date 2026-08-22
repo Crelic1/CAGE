@@ -1,0 +1,90 @@
+{
+  "build_counts_by_candidate_data_tier": {
+    "D4": 313,
+    "D5": 64
+  },
+  "build_counts_by_category": {
+    "pwn": 171,
+    "web": 206
+  },
+  "build_counts_by_category_and_tier": {
+    "pwn/D4": 171,
+    "web/D4": 206
+  },
+  "build_counts_by_data_tier": {
+    "D4": 377
+  },
+  "counts": {
+    "build": 377,
+    "build_with_prior_runtime_blocker": 5,
+    "candidate_tier_not_confirmed": 431,
+    "completed": 210,
+    "confirmed_d0_d1_total": 868,
+    "deferred_d2": 1,
+    "excluded_total": 1078,
+    "input": 1456,
+    "policy_dropped_d0_d1": 437
+  },
+  "generated_at": "2026-07-13T15:49:45.152285+00:00",
+  "image_name_collisions": {
+    "affected_task_count": 0,
+    "base_collision_count": 0,
+    "collisions": {}
+  },
+  "input": {
+    "completion_manifests": [
+      "work/env-candidates/cage-wave1/metadata/inventory.json",
+      "work/cage-wave2/FINAL_SUCCESS.json",
+      "work/cage-pwn-wave3/FINAL_SUCCESS.json"
+    ],
+    "record_count": 1456,
+    "static_materials": "catalog/static_materials.jsonl",
+    "static_materials_sha256": "75a812865265bc08d52f725fb6c5fb9e95908b7833966fbb181906a5e5494baf"
+  },
+  "integrity": {
+    "build_env_ids_sha256": "8b7daeccac7621574b78c3672da39724964fb132901b61453c297d7f10a4852c",
+    "completed_env_ids_sha256": "300b5e9e41e8c1b8e930a2e0176ccd4c0e514157f85e5bf2a802fdf8cc66dd54",
+    "deferred_env_ids_sha256": "6bf466ca4db39fb57ba76cd032daf446320ed99a6a1fb9b18a5b28b311af7c40"
+  },
+  "policy": {
+    "category_order": [
+      "pwn",
+      "web"
+    ],
+    "deferred_data_tiers": [
+      "D2"
+    ],
+    "dropped_data_tiers": [
+      "D0",
+      "D1"
+    ],
+    "main_admission_field": "confirmed_data_tier",
+    "main_data_tiers": [
+      "D3",
+      "D4",
+      "D5"
+    ],
+    "pwn_material_order": [
+      "dockerfile_writeup_attachments",
+      "dockerfile_attachments",
+      "writeup_attachments",
+      "source_attachments",
+      "attachments_only",
+      "incomplete"
+    ],
+    "task_prompt_tier_field": "confirmed_data_tier",
+    "tie_breakers": [
+      "known_prior_runtime_blocker_last",
+      "candidate_material_tier_desc",
+      "docker_closure_quality",
+      "env_id"
+    ]
+  },
+  "pwn_counts_by_material_priority": {
+    "dockerfile_attachments": 99,
+    "dockerfile_writeup_attachments": 69,
+    "incomplete": 3
+  },
+  "schema_version": "cage-build-task-list-v1",
+  "wave": "wave4"
+}

@@ -36,6 +36,12 @@ runtime:
   timeout: 2000
   max_trials_global: 24
   max_rounds: 50
+  # Recommended for this benchmark too: runtime.network_containment keeps the
+  # docker host off the agent's and the targets' networks (see
+  # docs/reference/project-yml.md). Not enabled by default here because it
+  # has only been exercised on agent_pentest_bench — verify a sample run
+  # first, then flip it on.
+  # network_containment: true
   agent_network_mode: bridge
   live_check:
     enabled: true
@@ -51,7 +57,7 @@ runtime:
       stop_on_success: true
 
 agents:
-  - id: claude_code_baseline
+  - id: claude_code
     kind: claude_code
     home: /home/agent/workspace
     session_args:

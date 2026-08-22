@@ -8,11 +8,10 @@ resume module; registers its outputs as canonical run artifacts.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cage.config.sections import OutputConfig
 from cage.experiment.engine.run_context import ExperimentRun
@@ -22,9 +21,7 @@ from cage.experiment.engine.resume import (
     _summary_from_trial_infos,
 )
 from cage.artifacts.canonical_marks import _mark_canonical_run_output_artifacts
-from cage.artifacts.jsonio import (
-    _load_json_file,
-)
+from cage.contracts.jsonio import load_json_file, write_json_file
 from cage.sandbox.naming import (
     _parse_agent_label,
 )
@@ -34,6 +31,9 @@ from cage.scoring.lifecycle import (
 from cage.proxy.monitor import (
     _parse_proxy_stats,
 )
+
+if TYPE_CHECKING:
+    from cage.benchmarks.base import Benchmark
 
 
 logger = logging.getLogger("cage.experiment.engine.reporting")
@@ -75,7 +75,7 @@ def _append_run_history(
     lifecycle across ``cage run --resume`` invocations.
     """
     history_path = run_dir / RUN_HISTORY_FILE
-    raw = _load_json_file(history_path)
+    raw = load_json_file(history_path)
     attempts = raw.get("attempts", []) if isinstance(raw, dict) else []
     if not isinstance(attempts, list):
         attempts = []
@@ -102,11 +102,7 @@ def _append_run_history(
         "version": 1,
         "attempts": attempts,
     }
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    history_path.write_text(
-        json.dumps(history, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json_file(history_path, history)
     return history
 
 def _write_dashboards(
@@ -149,7 +145,7 @@ def _write_dashboards(
             "run_history": run_history,
             "agents": {},
         }
-        summary = _build_summary(results)
+        summary = _build_summary(results, getattr(run, "benchmark", None))
         trials = []
         for r in results:
             trial_info: dict[str, Any] = {
@@ -164,7 +160,7 @@ def _write_dashboards(
             # duration when Timing was not captured (force-killed / resumed
             # trials leave duration_ms at 0) so the settled overview's duration
             # column isn't blank for half the run.
-            _rec = _load_json_file(run_dir / "trials" / str(r.trial_id) / "record.json")
+            _rec = load_json_file(run_dir / "trials" / str(r.trial_id) / "record.json")
             if isinstance(_rec, dict):
                 _start, _end = _rec.get("started_at"), _rec.get("completed_at")
                 if _start:
@@ -205,6 +201,11 @@ def _write_dashboards(
                 "total_requests": proxy_stats["total_requests"],
                 "errors": proxy_stats["errors"],
             }
+            # Only present when the log had records we could not decode: the
+            # projection then knowingly under-reports, and saying so beats a
+            # confident wrong total.
+            if proxy_stats.get("malformed"):
+                trial_info["usage"]["malformed"] = proxy_stats["malformed"]
             if output_cfg.dashboard_reasoning and proxy_stats["reasoning_content"]:
                 trial_info["reasoning_content"] = proxy_stats["reasoning_content"]
             if r.scores:
@@ -250,18 +251,21 @@ def _write_dashboards(
 
     return agent_artifacts
 
-def _maybe_write_dashboard_view(
-    run: ExperimentRun,
-    run_dir: Path,
-) -> Path | None:
-    """Ask the benchmark for a visualization spec and persist it.
+def write_dashboard_view(benchmark: "Benchmark", run_dir: Path) -> Path | None:
+    """Ask a benchmark for its visualization spec and persist it.
 
     Returns the file path on success, ``None`` if the benchmark opted out or
-    raised. Benchmark errors are logged but never block run completion —
-    a missing view just makes the inspector fall back to the generic table.
+    raised. Benchmark errors are logged but never block the caller — a missing
+    view just makes the inspector fall back to the generic table.
+
+    ``build_dashboard`` reads only what is already on disk (task outputs, score
+    artifacts, the run manifest), so this is safe to call long after a run
+    finished. That is what lets ``cage score --dashboard-only`` refresh the
+    inspector's numbers when the dashboard code changes, with no agent rerun
+    and no scorer rerun.
     """
     try:
-        spec = run.benchmark.build_dashboard(run_dir)
+        spec = benchmark.build_dashboard(run_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("build_dashboard failed for %s: %s", run_dir, exc)
         return None
@@ -275,6 +279,17 @@ def _maybe_write_dashboard_view(
     except OSError as exc:
         logger.warning("Failed to write dashboard_view.json under %s: %s", run_dir, exc)
         return None
+
+
+def _maybe_write_dashboard_view(
+    run: ExperimentRun,
+    run_dir: Path,
+) -> Path | None:
+    # ``getattr``, not ``run.benchmark``: a run without a benchmark attached is
+    # the same "no view for this run" case as a benchmark that declines to build
+    # one, and must not break run completion. write_dashboard_view swallows the
+    # resulting AttributeError along with every other build failure.
+    return write_dashboard_view(getattr(run, "benchmark", None), run_dir)
 
 def _write_results_csv(
     path: Path,

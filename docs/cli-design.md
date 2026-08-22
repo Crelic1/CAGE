@@ -143,6 +143,28 @@ cage score .cage_runs/<agent_label>/<run_id> --scorer path/to/scorer.py
 Because it uses the same scorer the live run used, a re-score and the inline
 score agree by construction.
 
+`--dashboard-only` skips scoring altogether and just rebuilds what the inspector
+displays, from the score artifacts already on disk. Two caches back two pages —
+`dashboard_view.json` for the benchmark dashboard, `dashboard.json`'s agent
+payload for the run card — and both are written when a run finishes, so a change
+to `build_dashboard` or `summarize_scores` stays invisible on old runs until they
+are rewritten. This rewrites both, with no agent rerun, no scorer rerun, and no
+live targets:
+
+```bash
+cage score web_exploit_bench --dashboard-only                     # every run
+cage score web_exploit_bench --dashboard-only --run-id web-smoke-001
+```
+
+Pointing it at a bare run dir works too, as long as the run's project can be
+found. Runs whose recorded project path has moved (a deleted worktree, a temp
+effective-config file) need `--project` to say where the benchmark now lives:
+
+```bash
+cage score .cage_runs/<agent_label>/<run_id> --dashboard-only \
+  --project examples/agent_pentest_bench/default_post_exploit.yml
+```
+
 ## `cage inspect` — read the artifacts
 
 A read-only browser over `.cage_runs`. It writes nothing:

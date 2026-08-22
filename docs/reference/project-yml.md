@@ -145,7 +145,7 @@ models:
 | `input_cost_per_1m` | Input token price per 1M tokens |
 | `output_cost_per_1m` | Output token price per 1M tokens |
 | `extra_headers` | Headers attached to upstream model requests |
-| `max_context_size` | Endpoint's real context window in tokens (alias `context_window_size`); `null`/unset ⇒ each agent keeps its CLI's own default. The Claude Code CLI has no window knob, so it cannot honour this |
+| `max_context_size` | **Required.** The endpoint's context window in tokens (alias `context_window_size`). Agents use it to decide when to compact; a registry entry without it will not load. Passed through to `claude_code`, `codex`, `kimi_code` and `qwen_code`. See [models.md](../models.md#choosing-max_context_size) for how to find the real number |
 | `reserved_context_size` | Headroom (tokens) an agent reserves for its next response; `null`/unset ⇒ CLI default |
 | `rl_reward_sink` | RL-training URL. When set, this model runs in RL mode: every LLM call carries an `X-Trial-Id` header and each finished trial's reward is POSTed here. Empty ⇒ ordinary model. Also settable via `cage model set --rl-reward-sink` |
 | `extra` | Inference knobs routed into the upstream OpenAI/vLLM request body — see below |
@@ -408,10 +408,92 @@ target:
 | `parallel_mode` | `network`, `alias`, or benchmark default |
 | `network_mode` | Compose launch mode: `""` \| `compose_project_local` \| `shared_external`. Challenge-declared value wins; empty ⇒ server default (`compose_project_local`) |
 | `exposure_mode` | Service exposure: `""` \| `host_ports` \| `internal`. Challenge-declared value wins; empty ⇒ server default (`host_ports`) |
-| `agent_network_isolation` | `per_trial_bridge` or `trust_server` |
+| `agent_network_isolation` | `per_trial_bridge`, `per_trial_bridge_sealed`, or `trust_server` |
 
 `target.server_url` and `target.embedded` are not user-facing fields. CAGE
 spawns a per-run embedded target server and sets the URL internally.
+
+### Keeping the docker host off the agent's networks
+
+A docker bridge gives the host an address on the network and the host listens on
+`0.0.0.0`, so any container can dial it: `curl 172.17.0.1:<port>` from inside a
+trial reaches sshd, the inspector, and the published ports of every other run.
+And sealing only the agent's own network does not help — the agent takes a
+target and uses **that** machine's network stack instead, which sits on the
+range's compose networks where the host is again the gateway. Both legs have to
+be covered.
+
+The mechanism is a network whose gateway address the host does **not** occupy:
+
+```bash
+docker network create --subnet 10.90.1.0/24 --gateway 10.90.1.1 \
+    -o com.docker.network.bridge.inhibit_ipv4=true <net>
+```
+
+`inhibit_ipv4` leaves the bridge address-less on the host side while docker
+still hands every container `default via 10.90.1.1`. A proxy container claims
+that address and becomes the only way out. Containers need no changes at all: no
+`NET_ADMIN`, no proxy environment variables (those would send `http://web` at
+the proxy and break the alias resolution a range depends on), no image changes.
+
+`cage run` does all of this itself — one switch:
+
+```yaml
+runtime:
+  network_containment: true
+  # Path to a mihomo/clash binary, so the proxy can reach model endpoints
+  # through proxy.upstream_http_proxy. Omit to search PATH; without one the
+  # proxy egresses directly, which is fine when no upstream proxy is configured.
+  netproxy_mihomo: /path/to/mihomo
+```
+
+That builds the proxy image on first use, creates the network, starts the proxy
+(shared by every run on the machine), points the agent containers at it, seals
+the per-trial agent↔target bridge, and tells the target server to build the
+range's own networks the same way and attach the proxy to each after
+`compose up`. Model endpoints on the internal network are carved out of the deny
+rule automatically, read off the models this run actually uses.
+
+`proxy.upstream_http_proxy` keeps its meaning but changes consumer: the agent
+container can no longer reach a proxy on the host (that is the point), so the
+value becomes the *egress proxy's* upstream and is cleared for the in-container
+sidecar.
+
+To inspect or operate it outside a run:
+
+```bash
+python3 scripts/agent_netproxy.py status   # state + bypass probes
+python3 scripts/agent_netproxy.py down
+```
+
+The switch expands to these three, which can also be set individually:
+
+| Leg | Switch |
+|---|---|
+| The agent container's base network | `runtime.agent_network_mode: cage-agent-net` |
+| The agent↔target bridge cage builds | `target.agent_network_isolation: per_trial_bridge_sealed` |
+| The range's own compose networks | `TARGET_SERVER_HOST_OFF_NETWORKS=1` in the target server's environment |
+
+Preflight fails a run whose isolation policy is sealed while the host still
+holds an address on the agent's base network — the seal would be decorative.
+
+Three properties this design depends on, each of which is easy to break by
+"improving" it:
+
+- **Denial belongs in iptables, never in the proxy's own rules.** A transparent
+  proxy completes the TCP handshake before consulting policy, so a reject
+  expressed there makes every scanned port answer — the agent's recon becomes
+  all false positives.
+- **The destination must stay a real IP** (no `fake-ip`, no `sniffer`).
+  Otherwise the proxy forwards a hostname upstream and
+  `http://<host-ip>.nip.io` becomes a working SSRF into the host.
+- **Packets addressed to the proxy are not redirected.** Without that carve-out
+  the blanket redirect answers on all 65535 ports of the gateway.
+
+What this does **not** cover: a target that mounts `/var/run/docker.sock`, runs
+`privileged`, or uses `network_mode: host` — those bypass networking entirely.
+And a benchmark that grades over the host gateway (CyberGym's `grading.host`)
+cannot run in this mode.
 
 ## `runtime`
 

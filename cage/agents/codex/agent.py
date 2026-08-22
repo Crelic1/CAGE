@@ -4,7 +4,6 @@ Codex speaks OpenAI protocol natively.
 """
 
 from __future__ import annotations
-
 import getpass
 import json
 import logging
@@ -14,14 +13,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from cage.agents.base import openviking
 from cage.agents.base import (
     AgentContainerResources,
     AgentType,
     HostRunService,
+    openviking,
     register_agent_type,
 )
+from cage.agents.base.output import failure_banner
 from cage.agents.codex.output import parse_codex_event_stream
+from cage.contracts.exceptions import AgentSetupError, ConfigError
 from cage.models import ModelConfig
 from cage.sandbox.exec import ExecResult
 
@@ -36,6 +37,8 @@ _OAUTH_REFRESH_SCRIPT = (
 
 
 def _container_mounts_target(container: Any, target_path: str) -> bool:
+    """Return whether ``target_path`` is an existing container bind target."""
+
     for container_path in getattr(container, "volumes", {}).values():
         mounted_path = str(container_path).split(":", 1)[0]
         if mounted_path == target_path:
@@ -46,7 +49,21 @@ def _container_mounts_target(container: Any, target_path: str) -> bool:
 @register_agent_type
 class CodexAgent(AgentType):
     name = "codex"
-    state_paths = [".codex"]
+    supports_stdin_prompt = True
+    # Deliberately allowlist non-secret state instead of snapshotting the
+    # whole ~/.codex directory: auth.json is a live OAuth credential and must
+    # never enter run artifacts or state restore paths.
+    state_paths = [
+        ".codex/sessions",
+        ".codex/work-sessions",
+        ".codex/history.jsonl",
+        ".codex/goals_1.sqlite",
+        ".codex/memories_1.sqlite",
+        ".codex/state_5.sqlite",
+        ".codex/queue_1.sqlite",
+        ".codex/logs_2.sqlite",
+        ".codex/shell_snapshots",
+    ]
     default_image = "cage/codex:pentestenv"
     dockerfile = "docker/codex/pentestenv.Dockerfile"
 
@@ -67,8 +84,13 @@ class CodexAgent(AgentType):
 
     def build_launch_command(
         self, prompt: str, *, model: ModelConfig, max_rounds: int = -1, proxy_url: str = "",
+        stdin_prompt: bool = False,
     ) -> str:
         escaped = prompt.replace("'", "'\\''")
+        # ``codex exec -`` is the documented "read instructions from stdin"
+        # form (``codex exec --help``: "If not provided as an argument (or if
+        # `-` is used), instructions are read from stdin").
+        prompt_arg = "-" if stdin_prompt else f"'{escaped}'"
         # Static codex config (model_provider, sandbox, auto-compact disable)
         # lives in ~/.codex/config.toml, seeded by setup_container. The only
         # per-trial dynamic value is the proxy base URL, since the in-container
@@ -89,7 +111,7 @@ class CodexAgent(AgentType):
             f' -c model_providers.cage.base_url="{base_url}"' if base_url else ""
         )
         return (
-            f"codex exec '{escaped}' --model {model.model}"
+            f"codex exec {prompt_arg} --model {model.model}"
             f"{base_flag}"
             f" --dangerously-bypass-approvals-and-sandbox"
             f" --skip-git-repo-check"
@@ -98,8 +120,9 @@ class CodexAgent(AgentType):
         )
 
     def parse_output(self, result: ExecResult) -> str:
-        if result.exit_code != 0 and not result.stdout.strip():
-            return f"[Agent exited with code {result.exit_code}]\n{result.stderr[:1000]}"
+        banner = failure_banner(result)
+        if banner is not None:
+            return banner
         summary = parse_codex_event_stream(result.stdout)
         if summary.is_event_stream:
             parsed = summary.final_output()
@@ -138,21 +161,15 @@ class CodexAgent(AgentType):
         self, container: Any, *, home_dir: str,
         model: ModelConfig | None = None,
     ) -> None:
-        """Seed ``~/.codex/auth.json`` and ``~/.codex/config.toml``.
+        """Seed the Codex provider config for API-key or ChatGPT OAuth mode.
 
-        Static codex configuration lives in ``config.toml`` (the supported
-        upstream path) so ``codex exec`` invocations stay short. Two auth modes
-        share this method:
-
-        * **API-key** (default): ``auth.json`` carries ``OPENAI_API_KEY`` and
-          the ``cage`` provider reads it via ``env_key``.
-        * **ChatGPT-subscription / OAuth** (``model.auth_source`` set, no
-          ``base_url``): ``auth.json`` carries the host's ChatGPT OAuth tokens
-          (normally bind-mounted by :meth:`container_resources`), and the
-          ``cage`` provider declares ``requires_openai_auth = true`` with NO
-          ``env_key`` — so Codex authenticates with those tokens and emits the
-          OAuth ``Bearer`` + ``ChatGPT-Account-ID`` headers, which the proxy
-          forwards to the ChatGPT Codex backend verbatim.
+        OAuth mode is selected by ``auth_source`` with no explicit
+        ``base_url``.  Only the single host ``auth.json`` is mounted read-only;
+        CAGE never copies it into an image, workspace, or state artifact.
+        ``requires_openai_auth`` tells Codex to use that ChatGPT credential and
+        emit the OAuth ``Bearer`` + ``ChatGPT-Account-ID`` headers while
+        omitting ``env_key`` entirely. API-key mode seeds only the key-shaped
+        ``auth.json`` expected by the CLI.
 
         The proxy ``base_url`` is set per-trial via ``-c`` in
         :meth:`build_launch_command` because the in-container proxy chooses a
@@ -166,14 +183,8 @@ class CodexAgent(AgentType):
         oauth = (
             model is not None and bool(model.auth_source) and not model.base_url
         )
-
         if oauth:
-            # OAuth tokens come from the host auth.json (bind-mounted, or copied
-            # in for legacy callers). ``requires_openai_auth = true`` + NO
-            # ``env_key`` keeps Codex in ChatGPT-subscription mode.
-            self._seed_oauth_auth(
-                container, codex_dir=codex_dir, source=model.auth_source,
-            )
+            self._require_oauth_mount(container, codex_dir=codex_dir)
             provider_block = (
                 '[model_providers.cage]\n'
                 'name = "Cage Proxy"\n'
@@ -181,9 +192,7 @@ class CodexAgent(AgentType):
                 'wire_api = "responses"\n'
             )
         else:
-            # Auth — real API key when known, placeholder otherwise. codex exec
-            # tolerates a placeholder when OPENAI_API_KEY is set in env, but the
-            # interactive TUI insists on a non-empty auth.json.
+            # API-key mode retains the existing provider contract.
             api_key = (model.api_key if model is not None else "") or "placeholder"
             container.write_file(
                 f"{codex_dir}/auth.json", json.dumps({"OPENAI_API_KEY": api_key}),
@@ -211,6 +220,7 @@ class CodexAgent(AgentType):
         # ``chown`` it (that would rewrite host ownership) — the agent reaches
         # it through Docker ``--group-add`` instead (see container_resources).
         if oauth:
+            # Never recurse across the read-only host credential mount.
             container.exec(
                 f"chown agent:agent {codex_dir} {codex_dir}/config.toml",
                 timeout=5.0,
@@ -219,22 +229,22 @@ class CodexAgent(AgentType):
             container.exec(f"chown -R agent:agent {codex_dir}", timeout=5.0)
 
     # ------------------------------------------------------------------ #
-    # ChatGPT-subscription / OAuth support (mirrors claude_code)
+    # ChatGPT subscription / OAuth support
     # ------------------------------------------------------------------ #
 
     def validate_auth(self, model: ModelConfig) -> None:
         """Verify a usable ChatGPT ``auth.json`` exists before any trial runs.
 
-        Only checked in subscription mode (``auth_source`` set). Requires an
-        ``auth.json`` carrying ``tokens.access_token``; otherwise raises
-        ``ValueError`` naming host / user / how to fix.
+        The read-only mount relies on the host refresher, so both access and
+        refresh tokens must be present before any Docker work starts.
         """
         if not model.auth_source:
             return
         try:
             auth_path = self._resolve_oauth_auth_path(model.auth_source)
             data = json.loads(auth_path.read_text())
-            if (data.get("tokens") or {}).get("access_token"):
+            tokens = data.get("tokens") or {}
+            if tokens.get("access_token") and tokens.get("refresh_token"):
                 return
         except (RuntimeError, OSError, json.JSONDecodeError):
             pass
@@ -243,9 +253,9 @@ class CodexAgent(AgentType):
             user = getpass.getuser()
         except Exception:  # noqa: BLE001
             user = "?"
-        raise ValueError(
+        raise ConfigError(
             f"config/models.yml::{model.id}: auth_source={model.auth_source!r} "
-            f"has no usable ChatGPT auth.json (tokens.access_token) on this host.\n"
+            "has no usable ChatGPT auth.json with access/refresh tokens on this host.\n"
             f"  Host: {host}\n"
             f"  User: {user}\n"
             f"Fix one of:\n"
@@ -265,15 +275,16 @@ class CodexAgent(AgentType):
         holds session/history state that would leak across stateless trials).
         A single-file bind mount shares the host inode, so the host-side
         refresher's in-place writes keep the container's token fresh. The agent
-        user reaches the host-owned file through Docker ``--group-add``.
+        user reaches the host-owned file read-only through Docker
+        ``--group-add``.
         """
-        if not model.auth_source:
+        if not (model.auth_source and not model.base_url):
             return AgentContainerResources()
         auth_path = self._resolve_oauth_auth_path(model.auth_source)
         group_id = self._prepare_credential_file_mount(auth_path)
-        home = home_dir.rstrip("/")
+        target = f"{home_dir.rstrip('/')}/.codex/auth.json:ro"
         return AgentContainerResources(
-            volumes={str(auth_path): f"{home}/.codex/auth.json"},
+            volumes={str(auth_path): target},
             group_add=[str(group_id)],
         )
 
@@ -292,90 +303,76 @@ class CodexAgent(AgentType):
         if not (model.auth_source and not model.base_url):
             return []
         if not _OAUTH_REFRESH_SCRIPT.is_file():
-            logger.warning(
-                "subscription mode but Codex OAuth refresher missing at %s; "
-                "trials may hit HTTP 401 once the on-disk access token expires",
-                _OAUTH_REFRESH_SCRIPT,
+            raise AgentSetupError(
+                f"Codex OAuth refresher missing: {_OAUTH_REFRESH_SCRIPT}"
             )
-            return []
         auth_path = self._resolve_oauth_auth_path(model.auth_source)
         env: dict[str, str] = {}
         if http_proxy:
             env["HTTPS_PROXY"] = http_proxy
             env["https_proxy"] = http_proxy
-        argv = [
-            sys.executable,
-            str(_OAUTH_REFRESH_SCRIPT),
-            "--daemon",
-            "--creds",
-            str(auth_path),
-        ]
         return [
             HostRunService(
                 name="codex-oauth-refresh",
-                argv=argv,
+                argv=[
+                    sys.executable,
+                    str(_OAUTH_REFRESH_SCRIPT),
+                    "--daemon",
+                    "--creds",
+                    str(auth_path),
+                ],
                 env=env,
+                # Different profiles get different daemons; the same profile
+                # is deduplicated so rotating refresh tokens cannot race.
                 dedup_key=str(auth_path),
             )
         ]
 
-    def _seed_oauth_auth(
-        self, container: Any, *, codex_dir: str, source: str,
-    ) -> None:
-        """Make the host ChatGPT ``auth.json`` visible at ``{codex_dir}/auth.json``.
-
-        Normally a bind mount created before container start (see
-        :meth:`container_resources`); legacy callers without that mount get a
-        copy of the host file. Missing tokens are fatal — a subscription trial
-        is pointless without them.
-        """
-        auth_path = self._resolve_oauth_auth_path(source)
+    def _require_oauth_mount(self, container: Any, *, codex_dir: str) -> None:
         target = f"{codex_dir}/auth.json"
-        if _container_mounts_target(container, target):
-            logger.info("Codex OAuth auth.json bind-mounted from %s", auth_path)
-            return
-        container.write_file(target, auth_path.read_text())
-        logger.info("Codex OAuth auth.json copied from %s", auth_path)
+        if not _container_mounts_target(container, target):
+            raise AgentSetupError(
+                "Codex subscription auth must be a pre-start single-file "
+                f"bind mount at {target}; refusing to copy OAuth credentials"
+            )
 
-    def _resolve_oauth_auth_path(self, source: str) -> Path:
-        """Resolve ``auth_source`` to the ``auth.json`` file (accepts dir or file)."""
+    @staticmethod
+    def _resolve_oauth_auth_path(source: str) -> Path:
         src = Path(source).expanduser()
         if src.is_file():
             return src
         candidate = src / "auth.json"
         if candidate.is_file():
             return candidate
-        raise RuntimeError(
+        raise AgentSetupError(
             f"auth_source={source!r}: no auth.json at {candidate} or at {src}"
         )
 
-    def _prepare_credential_file_mount(self, cred_path: Path) -> int:
-        """Make a file bind mount readable/writable by the container agent.
+    @staticmethod
+    def _prepare_credential_file_mount(cred_path: Path) -> int:
+        """Grant the container supplemental group read, never group write."""
 
-        Docker bind mounts preserve the host file's uid/gid/mode. Codex writes
-        ``auth.json`` ``0600`` owned by the operator, while the container's
-        ``agent`` user is uid/gid 1000. We keep the mount scoped to the single
-        file and grant access through its group plus Docker ``--group-add`` —
-        group-writable so the CLI can still write if it ever refreshes.
-        """
         st = cred_path.stat()
         mode = stat.S_IMODE(st.st_mode)
-        needed = stat.S_IRGRP | stat.S_IWGRP
-        if (mode & needed) != needed:
+        if not mode & stat.S_IRGRP:
             try:
-                cred_path.chmod(mode | needed)
+                cred_path.chmod(mode | stat.S_IRGRP)
             except OSError as exc:
-                raise RuntimeError(
-                    f"auth_source credential file {cred_path} must be group "
-                    "readable/writable for bind mounting into the agent "
-                    f"container; chmod failed: {exc}"
+                raise AgentSetupError(
+                    f"auth_source credential {cred_path} must be group-readable "
+                    f"for the read-only bind mount: {exc}"
                 ) from exc
         return st.st_gid
 
     def version_command(self) -> str:
         # NOTE: do NOT run 'codex --version' — it initialises a Landlock
         # sandbox as root, which permanently blocks later user-level execs.
-        return "which codex >/dev/null 2>&1 && dpkg-query -W codex 2>/dev/null || (ls /usr/bin/codex >/dev/null 2>&1 && echo 'codex installed') || echo unknown"
+        return (
+            "which codex >/dev/null 2>&1 && "
+            "dpkg-query -W codex 2>/dev/null || "
+            "(ls /usr/bin/codex >/dev/null 2>&1 && echo 'codex installed') || "
+            "echo unknown"
+        )
 
     # ------------------------------------------------------------------ #
     # Plugin installation

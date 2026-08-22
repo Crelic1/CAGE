@@ -9,7 +9,8 @@
 #     -v /srv/cage_target:/srv/cage_target \        # SAME path host<->container
 #     -p 8911:8911 cage-serve \
 #     --benchmark /cage/examples/build_target/benchmark.py \
-#     --sample my_first_pwnie --root /srv/cage_target
+#     --sample my_first_pwnie --root /srv/cage_target \
+#     --image ctfenv/pwn-my-first-pwnie-build-target:d3-r3-x0
 
 # docker CLI + compose plugin come from the local image — no network needed.
 FROM docker:29.1.5-cli AS dockercli
@@ -31,6 +32,7 @@ RUN pip install --no-cache-dir /cage
 # .dockerignore; the validator takes --internal-port instead, so it doesn't need
 # the sample files).
 COPY examples/build_target/benchmark.py /cage/examples/build_target/benchmark.py
+COPY examples/build_target/pwn_runtime_catalog.json /cage/examples/build_target/pwn_runtime_catalog.json
 COPY examples/build_target/prompts/ /cage/examples/build_target/prompts/
 COPY examples/build_target/serve/ /cage/examples/build_target/serve/
 

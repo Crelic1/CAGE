@@ -6,6 +6,11 @@ import json
 from pathlib import Path
 from typing import Mapping
 
+from cage.contracts.jsonio import (
+    append_jsonl_record,
+    count_jsonl_lines,
+    iter_jsonl_lines,
+)
 from cage.experiment.model import ResourceRecord, resource_record_to_json
 
 
@@ -39,7 +44,6 @@ class ResourceLedgerWriter:
         """
 
         ledger_path = self.run_dir / "resources.jsonl"
-        ledger_path.parent.mkdir(parents=True, exist_ok=True)
         record = ResourceRecord(
             schema_version="resource_record.v1",
             record_id=self._next_record_id(ledger_path),
@@ -55,8 +59,7 @@ class ResourceLedgerWriter:
             metadata=dict(metadata or {}),
             cleanup_error=cleanup_error,
         )
-        with ledger_path.open("a", encoding="utf-8") as handle:
-            handle.write(resource_record_to_json(record))
+        append_jsonl_record(ledger_path, resource_record_to_json(record))
         return record
 
     def _next_record_id(self, ledger_path: Path) -> str:
@@ -64,11 +67,7 @@ class ResourceLedgerWriter:
 
         if not ledger_path.is_file():
             return "res_000001"
-        count = sum(
-            1
-            for line in ledger_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
+        count = count_jsonl_lines(ledger_path)
         return f"res_{count + 1:06d}"
 
 
@@ -87,10 +86,7 @@ class ResourceLedgerReader:
         if not ledger_path.is_file():
             return ()
         records: list[ResourceRecord] = []
-        for line in ledger_path.read_text(encoding="utf-8").splitlines():
-            text = line.strip()
-            if not text:
-                continue
+        for text in iter_jsonl_lines(ledger_path):
             try:
                 raw = json.loads(text)
             except json.JSONDecodeError:

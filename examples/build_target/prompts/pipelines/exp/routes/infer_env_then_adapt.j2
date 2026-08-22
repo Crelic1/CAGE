@@ -1,0 +1,27 @@
+## Adapt the exploit; env inferred from writeup + exploit (AWP)
+
+There is no build material. The environment was inferred from the writeup's
+concrete runtime clues, corroborated by the exploit. PORT the confirmed exploit
+to the live instance; use the writeup to disambiguate whenever a live
+observation is ambiguous.
+
+{% if instance_data.materials.exploit %}Confirmed exploit under:
+{% for path in instance_data.materials.exploit %}- `{{ path }}`
+{% endfor %}{% endif %}{% if instance_data.materials.writeups %}Writeup(s):
+{% for path in instance_data.materials.writeups %}- `{{ path }}`
+{% endfor %}{% endif %}
+- Keep the exploit's approach and primitive. Retarget it at the harness-passed
+  instance address; strip hardcoded historical host/port and absolute addresses.
+- Resolve leaks at runtime; recompute every base/target from the live leak
+  against the chosen runtime's offsets. Never reuse historical numbers.
+- The env is inferred, so a `cage-exploit` mismatch can be env- or exploit-side.
+  Use the writeup to arbitrate: if a leaked address disagrees with the chosen
+  runtime, check the writeup's stated Ubuntu/glibc/build-id and allocator clues.
+  If they name a different libc, the ENVIRONMENT is wrong — correct the env
+  files. If the writeup confirms the runtime, the fix is exploit-side offsets.
+- Feed corrected runtime observations back into the env files; env and exploit
+  co-evolve until they agree with both the writeup and the live leaks.
+- Do not weaken protections, and do not copy any writeup literal (flag, address)
+  into the solve. Each env change must be evidence-backed.
+- Prove it: `cage-exploit` must capture the harness-provisioned flag from a
+  fresh clean instance.
