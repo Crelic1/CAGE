@@ -238,6 +238,9 @@ def test_render_scope_pairs_access_with_urls_without_leaking_ground_truth(
     assert "http://127.0.0.1:31003" in scope
     assert "alex / password-one" in scope
     assert "blair / password-two" in scope
+    assert "Scope status: in scope" in scope
+    assert "Maximum bounty: USD 1,000" in scope
+    assert "Only the URL bullets" in scope
     for hidden in (
         "pb-secret-vulnerable-id",
         "pb-secret-clean-id",
