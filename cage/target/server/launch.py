@@ -70,6 +70,7 @@ from cage.target.server.network_debug import (
     _build_entry_urls,
     build_container_addrs,
     build_network_debug,
+    entry_url_hints_from_challenge,
 )
 from cage.target.server.launch_workflow import (
     ensure_docker_cli_config_dir,
@@ -317,6 +318,7 @@ def _reused_launch_response(
     audience: str = "internal",
     public_host: str = "",
     public_host_source: str = "",
+    entry_url_hints: Dict[str, str] | None = None,
 ) -> LaunchResponse:
     debug = instance.get("debug", {}) or {}
     network_debug = debug.get("network", {}) or {}
@@ -332,6 +334,7 @@ def _reused_launch_response(
             services=services,
             entry_service_keys=entry_keys,
             host_ip=advertise_host,
+            url_hints=entry_url_hints or instance.get("entry_url_hints") or {},
         )
     return LaunchResponse(
         status="reused",
@@ -453,6 +456,7 @@ def _launch_challenge_impl(
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     meta = challenges[chal_id]
+    entry_url_hints = entry_url_hints_from_challenge(meta)
     effective_parallel_mode = resolve_parallel_mode(meta, parallel_mode)
     effective_target_scope = resolve_server_target_scope(meta, target_scope)
     allow_parallel_runs = effective_target_scope == "per_agent"
@@ -504,6 +508,7 @@ def _launch_challenge_impl(
                 audience=audience,
                 public_host=public_host,
                 public_host_source=public_host_source,
+                entry_url_hints=entry_url_hints,
             )
 
     if should_recreate:
@@ -848,6 +853,7 @@ def _launch_challenge_impl(
         # run at different tiers without restarting serve.
         "prompt_level": prompt_level,
         "entry_service_keys": sorted(entry_service_keys),
+        "entry_url_hints": entry_url_hints,
         # Holds one of the server's host-published slots (see
         # ``_enforce_public_instance_limit``); re-stated here because this
         # record replaces the ``launching`` one wholesale.
@@ -875,6 +881,7 @@ def _launch_challenge_impl(
             services=final_services,
             entry_service_keys=entry_service_keys,
             host_ip=advertise_host,
+            url_hints=entry_url_hints,
         )
 
     status = "launched" if not should_recreate else "recreated"

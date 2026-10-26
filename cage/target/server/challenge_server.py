@@ -106,7 +106,11 @@ from cage.target.server.submit import (
     render_task_prompt,
     score_submission,
 )
-from cage.target.server.network_debug import _build_entry_urls, build_container_addrs
+from cage.target.server.network_debug import (
+    _build_entry_urls,
+    build_container_addrs,
+    entry_url_hints_from_challenge,
+)
 from cage.target.server.public_access import (
     default_network_only,
     instance_expired,
@@ -558,10 +562,12 @@ def launch_challenge(
     # gets a unique run_id, so the per-chal lock would needlessly serialize concurrent
     # samples and cause multi-minute startup delays under batch concurrency.
     effective_scope = "per_challenge"
+    entry_url_hints: dict[str, str] = {}
     try:
         challenges = load_all_challenges()
         if chal_id in challenges:
             effective_scope = resolve_server_target_scope(challenges[chal_id], target_scope)
+            entry_url_hints = entry_url_hints_from_challenge(challenges[chal_id])
     except Exception:
         pass
 
@@ -622,6 +628,7 @@ def launch_challenge(
                     audience=audience,
                     public_host=public_host,
                     public_host_source=public_host_source,
+                    entry_url_hints=entry_url_hints,
                 )
             with lock:
                 return _launch_challenge_impl(
@@ -933,6 +940,9 @@ def _project_instance(
             services=services,
             entry_service_keys=entry_keys,
             host_ip=advertise_host,
+            url_hints=(
+                info.get("entry_url_hints") or entry_url_hints_from_challenge(meta)
+            ),
         )
 
     healthy: Optional[bool] = None

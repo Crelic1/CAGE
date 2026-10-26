@@ -88,6 +88,44 @@ def test_project_instance_pulls_benchmark_from_challenge_meta():
     assert summ.category == "real-world-web"
 
 
+def test_project_instance_prefers_agent_facing_http_scheme_on_port_8443():
+    info = _seed(
+        public_intent=True,
+        services=[
+            ServiceInfo(
+                service_name="web",
+                alias="web",
+                ip="1.2.3.4",
+                inner_ip="172.30.0.5",
+                internal_port=8443,
+                external_port=32101,
+                external_host="0.0.0.0",
+                host="9.9.9.9",
+                port=32101,
+                protocol="tcp",
+            )
+        ],
+    )
+    challenges = {
+        "SIYUCMS": {
+            "source_fields": {
+                "agent_input": {"application_targets": "http://web:8443/login"}
+            }
+        }
+    }
+
+    summary = cs._project_instance(
+        info,
+        audience="external",
+        challenges=challenges,
+        probe_health=False,
+        public_host="range.example.test",
+    )
+
+    assert summary.entry_urls[0].url == "http://range.example.test:32101/login"
+    assert summary.entry_urls[0].protocol == "http"
+
+
 def test_instances_endpoint_lists_running_targets():
     ss.set_running_instance("run-01", _seed(run_id="run-01"))
     ss.set_running_instance("run-02", _seed(run_id="run-02", chal_id="range-1",

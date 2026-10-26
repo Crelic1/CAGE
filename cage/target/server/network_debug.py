@@ -2,10 +2,30 @@
 from __future__ import annotations
 
 import ipaddress
+import re
+import urllib.parse
+from typing import Any, Dict, List
+
 from cage.target.server.network_admin import list_project_containers
 from cage.target.server.schemas import EntryUrl, ServiceInfo
 from cage.target.server.server_state import get_docker_client
-from typing import Any, Dict, List
+
+
+def entry_url_hints_from_challenge(meta: Dict[str, Any]) -> Dict[str, str]:
+    """Return agent-facing HTTP URL templates keyed by compose service name."""
+    source_fields = meta.get("source_fields", {}) or {}
+    agent_input = source_fields.get("agent_input") or meta.get("agent_input") or {}
+    if not isinstance(agent_input, dict):
+        return {}
+
+    targets = str(agent_input.get("application_targets") or "")
+    hints: Dict[str, str] = {}
+    for match in re.finditer(r"https?://[^\s,]+", targets):
+        candidate = match.group(0).strip()
+        parsed = urllib.parse.urlsplit(candidate)
+        if parsed.hostname and parsed.scheme in {"http", "https"}:
+            hints[parsed.hostname] = candidate
+    return hints
 
 def build_network_debug(project_name: str, network_name: str, parallel_mode: str) -> Dict[str, Any]:
     debug: Dict[str, Any] = {
@@ -102,11 +122,13 @@ def _build_entry_urls(
     services: List[ServiceInfo],
     entry_service_keys: set[str],
     host_ip: str,
+    url_hints: Dict[str, str] | None = None,
 ) -> List[EntryUrl]:
     """Render published entry-service ports into client-usable URLs.
 
-    HTTP scheme is inferred from common web ports (80/8080/8000/8888/5000/3000 →
-    http, 443/8443 → https). Anything else is returned as bare ``host:port``
+    The benchmark's agent-facing target URL wins when supplied. Otherwise,
+    HTTP scheme is inferred from common web ports (80/8080/8000/8888/5000/3000
+    → http, 443/8443 → https). Anything else is returned as bare ``host:port``
     so SSH/RDP/raw TCP entries still get a usable string.
     """
     if not entry_service_keys:
@@ -119,7 +141,19 @@ def _build_entry_urls(
             continue
         protocol = (svc.protocol or "tcp").lower()
         internal = svc.internal_port
-        if protocol == "tcp" and internal in {443, 8443}:
+        hint = (url_hints or {}).get(svc.service_name)
+        parsed_hint = urllib.parse.urlsplit(hint) if hint else None
+        if parsed_hint is not None and parsed_hint.scheme in {"http", "https"}:
+            suffix = parsed_hint.path or ""
+            if parsed_hint.query:
+                suffix += f"?{parsed_hint.query}"
+            if parsed_hint.fragment:
+                suffix += f"#{parsed_hint.fragment}"
+            protocol = parsed_hint.scheme
+            url = f"{protocol}://{host_ip}:{svc.external_port}{suffix}"
+        elif protocol in {"http", "https"}:
+            url = f"{protocol}://{host_ip}:{svc.external_port}"
+        elif protocol == "tcp" and internal in {443, 8443}:
             url = f"https://{host_ip}:{svc.external_port}"
         elif protocol == "tcp" and internal in {80, 8080, 8000, 8888, 5000, 3000}:
             url = f"http://{host_ip}:{svc.external_port}"
