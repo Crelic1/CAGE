@@ -58,7 +58,7 @@
           },
           "objective_kind": {
             "default": "",
-            "description": "What one objective IS for this challenge — `vulnerability` for a single-target app, `host` for a multi-host range; `\"\"` when unknown. A range counts hosts it is possible to own, not marker stages: several stages can belong to one host, and a host offering only a file read can never be owned. The count above is uniform whatever the noun, so a caller reads a denominator without branching on the challenge's shape.",
+            "description": "What one objective IS for this challenge — `vulnerability` for a single-target app, `clean_scope` for a negative control, `host` for a multi-host range; `\"\"` when unknown. A range counts hosts it is possible to own, not marker stages: several stages can belong to one host, and a host offering only a file read can never be owned. The count above is uniform whatever the noun, so a caller reads a denominator without branching on the challenge's shape.",
             "title": "Objective Kind",
             "type": "string"
           },
@@ -1254,7 +1254,7 @@
   "paths": {
     "/challenges": {
       "get": {
-        "description": "List challenges with public-safe metadata only.\n\nStrictly excludes flag, verify scripts, ``agent_input``, and any\n``source_fields`` content. ``entry_service_count`` is the number of\nuser-facing entry services (web challenges declare them as\n``application_service_keys``, post-exploitation ranges as ``entry_services``):\n1 for a single-entry web challenge, 2+ for a multi-entry range.\n\n``objective_count`` is what a result is scored out of, available here BEFORE\nanything is launched, with ``objective_kind`` naming the unit\n(``vulnerability`` / ``marker``). It is the same number the scorer later\nreports as ``objective_total``. Note that it is NOT ``entry_service_count``:\na range can publish more entry services than it has objectives.\n\nAuthentication is the same as ``/launch``: loopback OR bearer token.",
+        "description": "List challenges with public-safe metadata only.\n\nStrictly excludes flag, verify scripts, ``agent_input``, and any\n``source_fields`` content. ``entry_service_count`` is the number of\nuser-facing entry services (web challenges declare them as\n``application_service_keys``, post-exploitation ranges as ``entry_services``):\n1 for a single-entry web challenge, 2+ for a multi-entry range.\n\n``objective_count`` is what a result is scored out of, available here BEFORE\nanything is launched, with ``objective_kind`` naming the unit\n(``vulnerability`` / ``clean_scope`` / ``host``). It is the same number the\nscorer later reports as ``objective_total``. Note that it is NOT\n``entry_service_count``:\na range can publish more entry services than it has objectives.\n\nAuthentication is the same as ``/launch``: loopback OR bearer token.",
         "operationId": "list_challenges_challenges_get",
         "parameters": [
           {

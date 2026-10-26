@@ -812,6 +812,13 @@ def _challenge_objectives(source_fields: dict) -> tuple[int, str]:
     if isinstance(vulnerabilities, list) and vulnerabilities:
         return len(vulnerabilities), "vulnerability"
 
+    # A deliberately clean target is one negative-control objective: avoid
+    # producing a customer-ready false positive. It has no vulnerability rows,
+    # but advertising zero objectives would disagree with the scorer's 1/1 or
+    # 0/1 verdict and make clean scopes disappear from aggregate progress.
+    if source_fields.get("expected_clean") is True:
+        return 1, "clean_scope"
+
     stages = source_fields.get("marker_stages")
     if isinstance(stages, list) and stages:
         declared, _ = range_objectives(stages)
@@ -836,8 +843,9 @@ def list_challenges(
 
     ``objective_count`` is what a result is scored out of, available here BEFORE
     anything is launched, with ``objective_kind`` naming the unit
-    (``vulnerability`` / ``marker``). It is the same number the scorer later
-    reports as ``objective_total``. Note that it is NOT ``entry_service_count``:
+    (``vulnerability`` / ``clean_scope`` / ``host``). It is the same number the
+    scorer later reports as ``objective_total``. Note that it is NOT
+    ``entry_service_count``:
     a range can publish more entry services than it has objectives.
 
     Authentication is the same as ``/launch``: loopback OR bearer token.

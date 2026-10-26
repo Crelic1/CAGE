@@ -16,7 +16,7 @@
 	branch = main
 [submodule "examples/agent_pentest_bench/datasets/web_exploit_bench"]
 	path = examples/agent_pentest_bench/datasets/web_exploit_bench
-	url = https://github.com/AgentCyberRange/WebExploitBench.git
+	url = https://github.com/Crelic1/WebExploitBench.git
 	branch = main
 [submodule "third_party/Cairn"]
 	path = third_party/Cairn

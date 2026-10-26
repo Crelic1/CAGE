@@ -317,8 +317,9 @@ class ChallengeSummary(BaseModel):
         default="",
         description=(
             "What one objective IS for this challenge — `vulnerability` for a "
-            "single-target app, `host` for a multi-host range; `\"\"` when "
-            "unknown. A range counts hosts it is possible to own, not marker "
+            "single-target app, `clean_scope` for a negative control, `host` "
+            "for a multi-host range; `\"\"` when unknown. A range counts hosts "
+            "it is possible to own, not marker "
             "stages: several stages can belong to one host, and a host offering "
             "only a file read can never be owned. The count above is uniform "
             "whatever the noun, so a caller reads a denominator without "

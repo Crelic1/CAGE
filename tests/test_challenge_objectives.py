@@ -15,7 +15,6 @@ import pytest
 
 from cage.target.server.challenge_server import _challenge_objectives
 
-
 # --- the listing half -------------------------------------------------------- #
 
 
@@ -57,6 +56,11 @@ def test_objectives_skip_a_host_that_can_only_be_read():
 def test_objectives_are_blank_when_nothing_is_declared():
     assert _challenge_objectives({}) == (0, "")
     assert _challenge_objectives({"vulnerabilities": [], "marker_stages": []}) == (0, "")
+
+
+def test_expected_clean_target_is_one_negative_control_objective():
+    fields = {"expected_clean": True, "vulnerabilities": []}
+    assert _challenge_objectives(fields) == (1, "clean_scope")
 
 
 def test_objectives_ignore_entry_services():
