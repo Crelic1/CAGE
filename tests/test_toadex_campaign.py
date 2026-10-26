@@ -427,7 +427,9 @@ def test_route_findings_uses_exact_public_origin_and_rejects_ambiguous_host() ->
         )
 
 
-def test_build_scan_request_locks_one_agent_and_blackbox_scope(tmp_path: Path) -> None:
+def test_build_scan_request_locks_baseline_model_agents_and_blackbox_scope(
+    tmp_path: Path,
+) -> None:
     manifest = tmp_path / "campaign.json"
     manifest.write_text(
         json.dumps(
@@ -461,8 +463,14 @@ def test_build_scan_request_locks_one_agent_and_blackbox_scope(tmp_path: Path) -
     assert request["assessment_mode"] == "bounty"
     assert request["project"] == "bench/discovery-001"
     assert request["max_concurrent"] == 1
-    assert request["swarm_size"] == 1
+    assert request["swarm_size"] == 2
     assert request["subagents_enabled"] is False
+    assert request["model_provider"] == "openai"
+    assert request["model"] == "gpt-5.6-sol"
+    assert request["reasoning_effort"] == "xhigh"
+    assert request["validation_model_provider"] == "openai"
+    assert request["validation_model"] == "gpt-5.6-sol"
+    assert request["validation_reasoning_effort"] == "xhigh"
     assert request["validate_only"] is False
     assert request["recon_only"] is False
     assert "http://bench.example:31001" in request["scope_material"]
@@ -471,11 +479,13 @@ def test_build_scan_request_locks_one_agent_and_blackbox_scope(tmp_path: Path) -
     assert "goal_limit" not in request
     assert campaign_module.required_toadex_settings() == {
         "workers": 1,
+        "auth_profile": "zeroday-cloud-codex",
         "codex": {
             "early_hangup": False,
             "always_daybreak": True,
             "fast_mode": False,
             "experimental_context": False,
+            "http_response_dedup": False,
         },
     }
 
@@ -690,6 +700,7 @@ def test_validate_toadex_config_rejects_noncomparable_settings() -> None:
                 "always_daybreak": True,
                 "fast_mode": False,
                 "experimental_context": False,
+                "http_response_dedup": False,
             }
         }
     }
@@ -700,6 +711,219 @@ def test_validate_toadex_config_rejects_noncomparable_settings() -> None:
     bad["values"]["codex"]["fast_mode"] = True
     with pytest.raises(campaign_module.CampaignError, match="fast_mode"):
         campaign_module.validate_toadex_config(bad)
+
+
+def test_select_toadex_auth_profile_accepts_only_exact_ready_profile() -> None:
+    campaign_module = _module()
+
+    class FakeToadex:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def json(self, method, path, *, payload=None):
+            self.calls.append((method, path, payload))
+            return {
+                "profiles": [
+                    {
+                        "id": 17,
+                        "name": "zeroday-cloud-codex",
+                        "active": True,
+                        "has_auth": True,
+                        "auth_mode": "chatgpt",
+                        "login_status": "complete",
+                        "auth_check_status": "valid",
+                    }
+                ]
+            }
+
+    client = FakeToadex()
+
+    assert campaign_module.select_toadex_auth_profile(client) == 17
+    assert client.calls == [("GET", "/api/v1/account/auth-profiles", None)]
+
+
+def test_select_toadex_auth_profile_activates_and_verifies_exact_profile() -> None:
+    campaign_module = _module()
+    ready = {
+        "id": 17,
+        "name": "zeroday-cloud-codex",
+        "has_auth": True,
+        "auth_mode": "chatgpt",
+        "login_status": "complete",
+        "auth_check_status": "valid",
+    }
+
+    class FakeToadex:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def json(self, method, path, *, payload=None):
+            self.calls.append((method, path, payload))
+            if method == "GET":
+                return {"profiles": [{**ready, "active": False}]}
+            return {"profiles": [{**ready, "active": True}]}
+
+    client = FakeToadex()
+
+    assert campaign_module.select_toadex_auth_profile(client) == 17
+    assert client.calls == [
+        ("GET", "/api/v1/account/auth-profiles", None),
+        ("PATCH", "/api/v1/account/auth-profiles/17", {"active": True}),
+    ]
+
+
+def test_start_scan_pins_profile_and_verifies_persisted_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_module = _module()
+    manifest = tmp_path / "campaign.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "profile-pin",
+                "targets": [{"challenge_id": "target", "expected_clean": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "state.json"
+    campaign_module.save_campaign_state(
+        state_path,
+        campaign_module.CampaignState(
+            campaign_id="profile-pin",
+            manifest_sha256=campaign_module.campaign_manifest_sha256(manifest),
+            project="bench/profile-pin",
+            launches=(
+                campaign_module.CampaignLaunch(
+                    challenge_id="target",
+                    run_id="run-target",
+                    urls=("http://bench.test:31001",),
+                ),
+            ),
+        ),
+    )
+    job_path = tmp_path / "job.json"
+    calls = []
+
+    class FakeToadex:
+        def json(self, method, path, *, payload=None):
+            calls.append((method, path, payload))
+            if path == "/api/v1/config":
+                return {
+                    "values": {
+                        "codex": {
+                            "early_hangup": False,
+                            "always_daybreak": True,
+                            "fast_mode": False,
+                            "experimental_context": False,
+                            "http_response_dedup": False,
+                        }
+                    }
+                }
+            return {
+                "profiles": [
+                    {
+                        "id": 17,
+                        "name": "zeroday-cloud-codex",
+                        "active": True,
+                        "has_auth": True,
+                        "auth_mode": "chatgpt",
+                        "login_status": "complete",
+                        "auth_check_status": "valid",
+                    }
+                ]
+            }
+
+        def start_scan(self, payload):
+            calls.append(("START", payload))
+            return {"id": "scan-started", "status": "queued"}
+
+        def scan_job(self, job_id):
+            calls.append(("GET_JOB", job_id))
+            return {
+                "id": job_id,
+                "status": "queued",
+                "options": {
+                    "project": "bench/profile-pin",
+                    "codex_auth_profile_id": 17,
+                    "model_provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "validation_model_provider": "openai",
+                    "validation_model": "gpt-5.6-sol",
+                    "validation_reasoning_effort": "xhigh",
+                    "swarm_size": 2,
+                    "subagents_enabled": False,
+                },
+                "worker_spec": {
+                    "traffic_log": True,
+                    "codex_fast_mode_enabled": False,
+                    "codex_always_daybreak_enabled": True,
+                    "codex_experimental_context_enabled": False,
+                    "codex_early_hangup_enabled": False,
+                    "codex_http_response_dedup_enabled": False,
+                },
+                "runtime": {"log_json": True},
+            }
+
+    monkeypatch.setattr(campaign_module, "_toadex_client", lambda _args: FakeToadex())
+
+    result = campaign_module.main(
+        [
+            "--manifest",
+            str(manifest),
+            "start-scan",
+            "--state",
+            str(state_path),
+            "--job",
+            str(job_path),
+        ]
+    )
+
+    assert result == 0
+    assert calls[0][:2] == ("GET", "/api/v1/config")
+    assert calls[1][:2] == ("GET", "/api/v1/account/auth-profiles")
+    assert calls[-1] == ("GET_JOB", "scan-started")
+    assert json.loads(job_path.read_text(encoding="utf-8"))["options"][
+        "codex_auth_profile_id"
+    ] == 17
+
+
+def test_validate_started_job_rejects_disabled_monitoring() -> None:
+    campaign_module = _module()
+    state = campaign_module.CampaignState(
+        campaign_id="monitoring",
+        manifest_sha256="e" * 64,
+        project="bench/monitoring",
+        launches=(),
+    )
+    job = {
+        "id": "scan-monitoring",
+        "options": {
+            "project": "bench/monitoring",
+            "codex_auth_profile_id": 17,
+            "model_provider": "openai",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "validation_model_provider": "openai",
+            "validation_model": "gpt-5.6-sol",
+            "validation_reasoning_effort": "xhigh",
+            "swarm_size": 2,
+            "subagents_enabled": False,
+        },
+        "worker_spec": {
+            "traffic_log": False,
+            "codex_fast_mode_enabled": False,
+            "codex_always_daybreak_enabled": True,
+            "codex_experimental_context_enabled": False,
+            "codex_early_hangup_enabled": False,
+            "codex_http_response_dedup_enabled": False,
+        },
+        "runtime": {"log_json": True},
+    }
+
+    with pytest.raises(campaign_module.CampaignError, match="traffic_log"):
+        campaign_module.validate_started_toadex_job(job, state, auth_profile_id=17)
 
 
 def test_start_scan_refuses_existing_job_file_before_api_side_effect(
@@ -745,6 +969,7 @@ def test_start_scan_refuses_existing_job_file_before_api_side_effect(
                         "always_daybreak": True,
                         "fast_mode": False,
                         "experimental_context": False,
+                        "http_response_dedup": False,
                     }
                 }
             }
