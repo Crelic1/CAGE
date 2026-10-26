@@ -473,6 +473,7 @@ def test_build_scan_request_locks_baseline_model_agents_and_blackbox_scope(
     assert request["validation_reasoning_effort"] == "xhigh"
     assert request["validate_only"] is False
     assert request["recon_only"] is False
+    assert request["local_scope"] is False
     assert "http://bench.example:31001" in request["scope_material"]
     assert "hidden-vulnerable-name" not in request["scope_material"]
     assert "expected_clean" not in request["scope_material"]
@@ -488,6 +489,36 @@ def test_build_scan_request_locks_baseline_model_agents_and_blackbox_scope(
             "http_response_dedup": False,
         },
     }
+
+
+def test_build_scan_request_can_bind_an_existing_manual_engagement(tmp_path: Path) -> None:
+    manifest = tmp_path / "campaign.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "manual-binding",
+                "targets": [{"challenge_id": "hidden", "expected_clean": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign_module = _module()
+    campaign = campaign_module.load_campaign(manifest)
+    launch = campaign_module.CampaignLaunch(
+        challenge_id="hidden",
+        run_id="run-hidden",
+        urls=("http://bench.example:31001",),
+    )
+
+    request = campaign_module.build_toadex_scan_request(
+        campaign,
+        (launch,),
+        project="manual-binding",
+        engagement_ref="catalogue:manual-1",
+    )
+
+    assert request["engagement_ref"] == "catalogue:manual-1"
+    assert "project" not in request
 
 
 def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() -> None:
@@ -772,6 +803,44 @@ def test_select_toadex_auth_profile_activates_and_verifies_exact_profile() -> No
     ]
 
 
+def test_ensure_toadex_manual_engagement_creates_blackbox_workspace() -> None:
+    campaign_module = _module()
+    state = campaign_module.CampaignState(
+        campaign_id="workspace",
+        manifest_sha256="a" * 64,
+        project="bench/workspace-001",
+        launches=(
+            campaign_module.CampaignLaunch(
+                challenge_id="hidden-target",
+                run_id="run-target",
+                urls=("http://bench.test:31001",),
+            ),
+        ),
+    )
+
+    class FakeToadex:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def json(self, method, path, *, payload=None):
+            self.calls.append((method, path, payload))
+            if method == "GET":
+                return {"engagements": []}
+            return {"ref": "catalogue:manual-1", "slug": "workspace-001"}
+
+    client = FakeToadex()
+
+    engagement_ref = campaign_module.ensure_toadex_manual_engagement(client, state)
+
+    assert engagement_ref == "catalogue:manual-1"
+    assert client.calls[0] == ("GET", "/api/v1/engagement-catalogue/manual", None)
+    created = client.calls[1]
+    assert created[:2] == ("POST", "/api/v1/engagement-catalogue/manual")
+    assert created[2]["name"] == "workspace-001"
+    assert created[2]["scope"] == "http://bench.test:31001\n"
+    assert "hidden-target" not in created[2]["scope"]
+
+
 def test_start_scan_pins_profile_and_verifies_persisted_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -820,6 +889,12 @@ def test_start_scan_pins_profile_and_verifies_persisted_job(
                         }
                     }
                 }
+            if path == "/api/v1/engagement-catalogue/manual":
+                return {
+                    "engagements": [
+                        {"ref": "catalogue:profile-pin", "slug": "profile-pin"}
+                    ]
+                }
             return {
                 "profiles": [
                     {
@@ -843,8 +918,9 @@ def test_start_scan_pins_profile_and_verifies_persisted_job(
             return {
                 "id": job_id,
                 "status": "queued",
+                "engagement_slug": "profile-pin",
                 "options": {
-                    "project": "bench/profile-pin",
+                    "engagement_ref": "catalogue:profile-pin",
                     "codex_auth_profile_id": 17,
                     "model_provider": "openai",
                     "model": "gpt-5.6-sol",
@@ -883,6 +959,10 @@ def test_start_scan_pins_profile_and_verifies_persisted_job(
     assert result == 0
     assert calls[0][:2] == ("GET", "/api/v1/config")
     assert calls[1][:2] == ("GET", "/api/v1/account/auth-profiles")
+    assert calls[2][:2] == ("GET", "/api/v1/engagement-catalogue/manual")
+    assert calls[3][0] == "START"
+    assert calls[3][1]["engagement_ref"] == "catalogue:profile-pin"
+    assert "project" not in calls[3][1]
     assert calls[-1] == ("GET_JOB", "scan-started")
     assert json.loads(job_path.read_text(encoding="utf-8"))["options"][
         "codex_auth_profile_id"
