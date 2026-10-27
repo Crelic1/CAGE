@@ -65,12 +65,21 @@ def test_bundled_campaign_matches_dataset_ground_truth() -> None:
     assert campaign.target_count == 24
     assert campaign.clean_count == 18
     assert campaign.cohort_counts == {
-        "patched": 6,
+        "hardened": 6,
         "reference": 6,
         "upstream": 6,
         "vulnerable": 6,
     }
-    assert {target.challenge_id for target in campaign.targets} == set(challenges)
+    campaign_ids = {target.challenge_id for target in campaign.targets}
+    assert campaign_ids <= set(challenges)
+    assert set(challenges) - campaign_ids == {
+        "pb-comfyui-patched",
+        "pb-jetlinks-patched",
+        "pb-notes-idor-patched",
+        "pb-prestashop-patched",
+        "pb-siyucms-patched",
+        "pb-white-jotter-patched",
+    }
     for target in campaign.targets:
         challenge = challenges[target.challenge_id]
         vulnerabilities = challenge.get("vulnerabilities")
@@ -89,11 +98,13 @@ def test_bundled_campaign_matches_dataset_ground_truth() -> None:
     image_locks = json.loads(
         (DATASET_ROOT / "campaigns" / "images.lock.json").read_text(encoding="utf-8")
     )["images"]
-    compose_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in DATASET_ROOT.glob("*/docker-compose.cage.yml")
+    deployment_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for pattern in ("*/docker-compose.cage.yml", "*/Dockerfile*")
+        for path in DATASET_ROOT.glob(pattern)
     )
     for image, digest in image_locks.items():
-        assert f"{image}@{digest}" in compose_text
+        assert f"{image}@{digest}" in deployment_text
 
 
 def test_load_campaign_rejects_duplicate_challenge_ids(tmp_path: Path) -> None:
@@ -465,6 +476,7 @@ def test_build_scan_request_locks_baseline_model_agents_and_blackbox_scope(
 
     assert request["assessment_mode"] == "bounty"
     assert request["project"] == "bench/discovery-001"
+    assert request["exclude_from_webhook_reporting"] is True
     assert request["max_concurrent"] == 1
     assert request["swarm_size"] == 2
     assert request["subagents_enabled"] is False
@@ -524,7 +536,7 @@ def test_build_scan_request_can_bind_an_existing_manual_engagement(tmp_path: Pat
     assert "project" not in request
 
 
-def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() -> None:
+def test_aggregate_scores_keeps_unmatched_findings_pending() -> None:
     campaign_module = _module()
     campaign = campaign_module.Campaign(
         id="aggregate",
@@ -545,7 +557,10 @@ def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() ->
                         "objective_total": 2,
                         "submitted_findings": 2,
                         "true_positive_findings": 1,
-                        "false_positive_findings": 1,
+                        "expected_true_positive_findings": 1,
+                        "unexpected_finding_candidates": 1,
+                        "unadjudicated_findings": 1,
+                        "false_positive_findings": 0,
                     },
                 }
             }
@@ -558,6 +573,8 @@ def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() ->
                         "objective_achieved": 1,
                         "objective_total": 1,
                         "submitted_findings": 0,
+                        "unexpected_finding_candidates": 0,
+                        "unadjudicated_findings": 0,
                         "false_positive_findings": 0,
                     },
                 }
@@ -569,9 +586,11 @@ def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() ->
                     "value": 0.0,
                     "metadata": {
                         "objective_achieved": 0,
-                        "objective_total": 1,
+                        "objective_total": 0,
                         "submitted_findings": 1,
-                        "false_positive_findings": 1,
+                        "unexpected_finding_candidates": 1,
+                        "unadjudicated_findings": 1,
+                        "false_positive_findings": 0,
                     },
                 }
             }
@@ -584,6 +603,8 @@ def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() ->
                         "objective_achieved": 1,
                         "objective_total": 1,
                         "submitted_findings": 0,
+                        "unexpected_finding_candidates": 0,
+                        "unadjudicated_findings": 0,
                         "false_positive_findings": 0,
                     },
                 }
@@ -596,13 +617,90 @@ def test_aggregate_scores_reports_discovery_precision_and_clean_specificity() ->
     assert result["findings"] == {
         "submitted": 3,
         "true_positive": 1,
-        "false_positive": 2,
-        "precision": pytest.approx(1 / 3),
+        "expected_true_positive": 1,
+        "unexpected_true_positive": 0,
+        "unexpected_pending": 2,
+        "patch_leak": 0,
+        "false_positive": 0,
+        "precision": None,
+        "precision_lower_bound": pytest.approx(1 / 3),
     }
     assert result["vulnerability_recall"] == pytest.approx(0.5)
-    assert result["clean_specificity"] == pytest.approx(2 / 3)
-    assert result["discovery_f1"] == pytest.approx(0.4)
+    assert result["clean_specificity"] is None
+    assert result["clean_abstention_rate"] == pytest.approx(2 / 3)
+    assert result["clean_targets"] == {
+        "total": 3,
+        "silent": 2,
+        "needs_adjudication": 1,
+        "contaminated": 0,
+        "confirmed_false_positive": 0,
+    }
+    assert result["discovery_f1"] is None
+    assert result["discovery_f1_lower_bound"] == pytest.approx(0.4)
     assert result["cohorts"]["reference"]["objective_achieved"] == 0
+    assert result["cohorts"]["reference"]["unexpected_pending"] == 1
+
+
+def test_aggregate_scores_rejects_missing_required_judge() -> None:
+    campaign_module = _module()
+    campaign = campaign_module.Campaign(
+        id="judge-required",
+        targets=(campaign_module.CampaignTarget("vuln", False, "vulnerable"),),
+    )
+    verdicts = {
+        "vuln": {
+            "scores": {
+                "agent_pentest_bench": {
+                    "value": 0.0,
+                    "metadata": {
+                        "objective_achieved": 0,
+                        "objective_total": 1,
+                        "submitted_findings": 1,
+                        "needs_judge": True,
+                        "judge_available": False,
+                        "judge_findings": [],
+                    },
+                }
+            }
+        }
+    }
+
+    with pytest.raises(campaign_module.CampaignError, match="judge.*unavailable"):
+        campaign_module.aggregate_scores(campaign, verdicts)
+
+
+def test_aggregate_scores_rejects_judge_errors() -> None:
+    campaign_module = _module()
+    campaign = campaign_module.Campaign(
+        id="judge-error",
+        targets=(campaign_module.CampaignTarget("vuln", False, "vulnerable"),),
+    )
+    verdicts = {
+        "vuln": {
+            "scores": {
+                "agent_pentest_bench": {
+                    "value": 0.0,
+                    "metadata": {
+                        "objective_achieved": 0,
+                        "objective_total": 1,
+                        "submitted_findings": 1,
+                        "needs_judge": True,
+                        "judge_available": True,
+                        "judge_findings": [
+                            {
+                                "answer_id": "001",
+                                "verdict": "uncertain",
+                                "judge_error": "HTTP 500",
+                            }
+                        ],
+                    },
+                }
+            }
+        }
+    }
+
+    with pytest.raises(campaign_module.CampaignError, match="judge failed.*HTTP 500"):
+        campaign_module.aggregate_scores(campaign, verdicts)
 
 
 def test_summarize_toadex_efficiency_joins_usage_with_discovery_results() -> None:
@@ -925,6 +1023,7 @@ def test_start_scan_pins_profile_and_verifies_persisted_job(
                 "options": {
                     "engagement_ref": "catalogue:profile-pin",
                     "codex_auth_profile_id": 17,
+                    "exclude_from_webhook_reporting": True,
                     "model_provider": "openai",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "xhigh",
@@ -985,6 +1084,7 @@ def test_validate_started_job_rejects_disabled_monitoring() -> None:
         "options": {
             "project": "bench/monitoring",
             "codex_auth_profile_id": 17,
+            "exclude_from_webhook_reporting": True,
             "model_provider": "openai",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
