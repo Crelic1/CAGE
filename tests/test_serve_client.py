@@ -138,6 +138,38 @@ def test_submit_without_output_sends_empty_body(monkeypatch):
     assert captured[0].get_method() == "POST"
 
 
+def test_operator_submit_posts_labeled_independent_arm(monkeypatch, tmp_path):
+    final_answer = tmp_path / "final_answer"
+    final_answer.mkdir()
+    (final_answer / "v1.json").write_text('{"a": 1}')
+    captured = []
+    _install_fake_urlopen(
+        monkeypatch,
+        [{"status": "scored", "scores": {"s": {"value": 1.0}}}],
+        captured,
+    )
+
+    result = ServeClient("http://h:8000").operator_submit(
+        "pb-x_ab12",
+        label="run013-off",
+        judge_model="judge-a",
+        final_answer_dir=final_answer,
+    )
+
+    assert result["scores"]["s"]["value"] == 1.0
+    request = captured[0]
+    assert request.get_method() == "POST"
+    assert "/operator/submit/pb-x_ab12?" in request.full_url
+    assert "label=run013-off" in request.full_url
+    assert "judge_model=judge-a" in request.full_url
+    assert request.headers["Content-type"].startswith("multipart/form-data")
+
+
+def test_operator_submit_requires_label():
+    with pytest.raises(ValueError, match="label is required"):
+        ServeClient("http://h:8000").operator_submit("pb-x_ab12", label="")
+
+
 def test_prompt_fetches_task_briefing(monkeypatch):
     captured = []
     _install_fake_urlopen(

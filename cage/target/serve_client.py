@@ -319,6 +319,45 @@ class ServeClient:
             headers={"Content-Type": content_type},
         )
 
+    def operator_submit(
+        self,
+        run_id: str,
+        *,
+        label: str,
+        judge_model: str = "",
+        final_answer_dir: str | Path | None = None,
+        archive: str | Path | bytes | None = None,
+    ) -> dict[str, Any]:
+        """Score one controlled A/B arm without consuming one-shot submission.
+
+        This calls the deployment-private ``/operator/submit`` route.  It is for
+        harness operators comparing isolated agent runs against the same live
+        target, not for benchmark agents.  Every call creates a separate frozen
+        submission record and leaves the target running.
+        """
+        if not label.strip():
+            raise ValueError("operator submission label is required")
+        if archive is not None:
+            payload = (
+                Path(archive).read_bytes()
+                if isinstance(archive, (str, Path))
+                else bytes(archive)
+            )
+        elif final_answer_dir is not None:
+            payload = _pack_final_answer(final_answer_dir)
+        else:
+            payload = b""
+        content_type, body = _encode_multipart_file(
+            "agent_output", "submission.tar.gz", payload
+        )
+        return self._request(
+            "POST",
+            f"/operator/submit/{urllib.parse.quote(run_id, safe='')}",
+            params={"label": label, "judge_model": judge_model or None},
+            data=body,
+            headers={"Content-Type": content_type},
+        )
+
     def attach(
         self,
         instance_or_run: "Instance | str",

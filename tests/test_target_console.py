@@ -223,6 +223,48 @@ def test_submit_is_one_shot_per_instance(monkeypatch):
     assert calls["n"] == 1                            # scored once; the repeat is cached
 
 
+def test_operator_submit_scores_each_ab_arm_independently(monkeypatch):
+    """Operator A/B scoring must not inherit the first arm's verdict."""
+    ss.set_running_instance("pb-x_r1", {"chal_id": "pb-x", "services": []})
+    monkeypatch.setattr(
+        cs,
+        "load_all_challenges",
+        lambda: {"pb-x": {"id": "pb-x", "full_path": "/x"}},
+    )
+    calls = []
+
+    def _fake_score(**kwargs):
+        calls.append(kwargs)
+        return {
+            "benchmark_module": "m",
+            "scores": {"s": {"value": float(len(calls))}},
+            "run_dir": f"rd-{len(calls)}",
+        }
+
+    monkeypatch.setattr(cs, "score_submission", _fake_score)
+    try:
+        client = TestClient(cs.app)
+        off = client.post(
+            "/operator/submit/pb-x_r1",
+            params=[("label", "ab-off"), ("judge_model", "judge-a")],
+        )
+        on = client.post(
+            "/operator/submit/pb-x_r1",
+            params=[("label", "ab-on"), ("judge_model", "judge-a")],
+        )
+    finally:
+        instance = ss.pop_running_instance("pb-x_r1")
+
+    assert off.status_code == 200 and on.status_code == 200
+    assert off.json()["scores"]["s"]["value"] == 1.0
+    assert on.json()["scores"]["s"]["value"] == 2.0
+    assert off.json()["run_dir"] == "rd-1"
+    assert on.json()["run_dir"] == "rd-2"
+    assert [call["label"] for call in calls] == ["ab-off", "ab-on"]
+    assert all(call["judge"] == {"models": ["judge-a"]} for call in calls)
+    assert instance is not None and "submission" not in instance
+
+
 def test_prompt_endpoint_uses_instance_bound_level(monkeypatch):
     # The hint tier is bound to the instance at launch; GET /prompt renders at
     # THAT level, winning over the server-wide default (env).

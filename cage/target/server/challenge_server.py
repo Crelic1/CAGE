@@ -1240,6 +1240,92 @@ async def submit_challenge(
     )
 
 
+@app.post(
+    "/operator/submit/{run_id}",
+    response_model=SubmitResponse,
+    include_in_schema=False,
+)
+async def operator_submit_challenge(
+    run_id: str,
+    request: Request,
+    agent_output: Annotated[
+        Optional[UploadFile],
+        File(description="Operator-supplied agent output archive."),
+    ] = None,
+    label: Annotated[
+        str,
+        Query(
+            min_length=1,
+            max_length=120,
+            description="Unique operator label for this independently scored arm.",
+        ),
+    ] = "",
+    judge_model: Annotated[
+        Optional[list[str]],
+        Query(description="Judge model id(s) used for this scoring pass."),
+    ] = None,
+    _audience: str = Depends(resolve_audience),
+):
+    """Score another operator-controlled arm against one live instance.
+
+    The public ``/submit`` contract remains one-shot so an agent cannot fish for
+    a pass.  Controlled A/B harness experiments are different: two isolated
+    agents may intentionally assess the same live target, and each arm needs
+    its own frozen findings, live verifier evidence, and verdict.  This hidden
+    operator route creates a separate serve submission record on every call,
+    never replaces the instance's canonical agent submission, and never closes
+    the target.
+
+    Deployment policy keeps the management API and bearer token outside the
+    agent network; this route therefore adds no capability to benchmark agents.
+    """
+    instance = get_running_instance(run_id)
+    if instance is None:
+        raise HTTPException(404, f"no running instance for run_id={run_id!r}")
+    chal_id = str(instance.get("chal_id") or "")
+    try:
+        challenge = load_all_challenges().get(chal_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"challenge registry unavailable: {exc}")
+    if challenge is None:
+        raise HTTPException(404, f"challenge {chal_id!r} not found in registry")
+
+    workdir = Path(tempfile.mkdtemp(prefix="cage_operator_submit_"))
+    try:
+        if agent_output is not None:
+            _safe_extract_upload(
+                await _read_upload_capped(
+                    agent_output,
+                    request.headers.get("content-length", "") if request is not None else "",
+                ),
+                workdir,
+            )
+        try:
+            result = score_submission(
+                run_id=run_id,
+                agent_output_dir=workdir,
+                instance=instance,
+                challenge=challenge,
+                agent_id=_resolve_agent_id(request),
+                label=label,
+                judge=_resolve_rescore_judge(judge_model or []),
+            )
+        except SubmissionError as exc:
+            raise HTTPException(400, str(exc))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    return SubmitResponse(
+        run_id=run_id,
+        chal_id=chal_id,
+        benchmark_module=result.get("benchmark_module", ""),
+        scores=result.get("scores", {}),
+        run_dir=result.get("run_dir", ""),
+        closed=False,
+        already_submitted=False,
+    )
+
+
 def _serve_roots() -> list[Path]:
     """The ``.cage_serve`` trees this server's submissions live in."""
     try:
