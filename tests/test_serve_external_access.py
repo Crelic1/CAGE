@@ -163,6 +163,20 @@ def test_entry_only_publishes_the_entry_and_nothing_else(tmp_path):
     assert plan.config["services"]["web"]["ports"] == ["0.0.0.0:32101:80"]
 
 
+def test_entry_only_can_bind_an_arm_specific_host_ip(tmp_path, monkeypatch):
+    """Two public servers can expose disjoint target surfaces on one host."""
+    monkeypatch.setattr(ss, "PUBLIC_BIND_IP", "10.221.20.11", raising=False)
+    plan = _materialize(
+        tmp_path,
+        audience="external",
+        network_only=False,
+        publish_scope="entry_only",
+    )
+    assert plan.config["services"]["web"]["ports"] == ["10.221.20.11:32101:80"]
+    assert "ports" not in plan.config["services"]["evaluator"]
+    assert "ports" not in plan.config["services"]["inner_db"]
+
+
 def test_entry_only_overrides_a_range_declaring_exposure_internal(tmp_path):
     # ``exposure_mode: internal`` means "do not spill this whole topology onto
     # the host" — the entry point is still the way in, so external-access mode

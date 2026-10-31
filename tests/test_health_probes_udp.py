@@ -15,6 +15,7 @@ unavailable so the tests exercise pure branch selection.
 from __future__ import annotations
 
 from cage.target.server import health_probes as hp
+from cage.target.server import server_state as ss
 from cage.target.server.schemas import ServiceInfo
 
 
@@ -68,6 +69,14 @@ def test_published_tcp_entry_still_tcp_probes_host_port(monkeypatch):
     tcp_pub = _service(protocol="tcp", external_port=32101, port=32101)
     assert hp.probe_inner_service(network_name="net", service=tcp_pub) is True
     assert tcp_calls == [("127.0.0.1", 32101)]
+
+
+def test_published_tcp_entry_probes_configured_bind_ip(monkeypatch):
+    tcp_calls = _patch(monkeypatch)
+    monkeypatch.setattr(ss, "PUBLIC_BIND_IP", "10.221.20.11", raising=False)
+    tcp_pub = _service(protocol="tcp", external_port=32101, port=32101)
+    assert hp.probe_inner_service(network_name="net", service=tcp_pub) is True
+    assert tcp_calls == [("10.221.20.11", 32101)]
 
 
 def test_network_only_tcp_falls_back_to_inner_tcp(monkeypatch):

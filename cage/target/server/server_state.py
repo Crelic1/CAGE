@@ -35,6 +35,10 @@ EXTERNAL_TOKEN: Optional[str] = os.getenv("TARGET_SERVER_EXTERNAL_TOKEN") or Non
 # on with the advertised address derived per request; any other value = on with
 # that address pinned. See ``server/public_access.py`` for the whole contract.
 PUBLIC_HOST = os.getenv("TARGET_SERVER_PUBLIC_HOST", "").strip()
+# Optional interface address used for Docker's published target entry ports.
+# Separate CAGE namespaces can bind distinct host IPs, preventing a port scan
+# of one arm's advertised address from discovering another arm's targets.
+PUBLIC_BIND_IP = os.getenv("TARGET_SERVER_PUBLIC_BIND_IP", "").strip()
 
 
 def _int_env(name: str, default: int) -> int:

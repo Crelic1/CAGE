@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import logging
 import re
-import yaml
-from cage.target.adapters.base import LaunchSpec
-from cage.target.server.server_state import TARGET_SERVER_NAMESPACE
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
+from cage.target.adapters.base import LaunchSpec
+from cage.target.compose_files import (
+    _absolutize_compose_paths,
+    _compose_project_directory,
+    _inject_external_network,
+    expand_compose_env_values,
+    load_compose_stack,
+)
+from cage.target.server import server_state as _server_state
 from cage.target.server.network_alloc import (
     _allocate_project_local_subnet,
     _inject_compose_project_local_ipam,
@@ -25,13 +33,7 @@ from cage.target.server.network_alloc import (
     _stamp_target_server_network_labels,
     host_off_networks_enabled,
 )
-from cage.target.compose_files import (
-    _absolutize_compose_paths,
-    _compose_project_directory,
-    _inject_external_network,
-    expand_compose_env_values,
-    load_compose_stack,
-)
+from cage.target.server.server_state import TARGET_SERVER_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +106,11 @@ def _resolve_publish_bind_ip(
     127.0.0.1 so external clients cannot reach them. Entry services and the
     legacy internal-audience path keep docker's default (0.0.0.0).
     """
-    if audience != "external" or not entry_service_keys:
+    if audience != "external":
         return None
-    if service_name in entry_service_keys:
-        return None
+    configured = str(_server_state.PUBLIC_BIND_IP or "").strip()
+    if not entry_service_keys or service_name in entry_service_keys:
+        return configured or None
     return "127.0.0.1"
 
 
@@ -340,7 +343,14 @@ def materialize_compose_runtime(
             if is_entry and internal_port is not None:
                 external_port = existing_external_ports.get(service_name) or find_free_port_fn()
                 port_suffix = f"/{protocol}" if protocol != "tcp" else ""
-                service_config["ports"] = [f"0.0.0.0:{external_port}:{internal_port}{port_suffix}"]
+                bind_ip = _resolve_publish_bind_ip(
+                    audience=audience,
+                    service_name=service_name,
+                    entry_service_keys=entry_service_keys,
+                ) or "0.0.0.0"
+                service_config["ports"] = [
+                    f"{bind_ip}:{external_port}:{internal_port}{port_suffix}"
+                ]
                 external_ports[service_name] = external_port
                 public_service_names.append(service_name)
             else:

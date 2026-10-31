@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from cage.target.server import server_state as _server_state
 from cage.target.server.network_admin import list_project_containers
 from cage.target.server.schemas import ServiceInfo
 from cage.target.server.server_state import (
@@ -20,6 +21,11 @@ from cage.target.server.server_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def published_probe_host() -> str:
+    """Address where this server binds externally published target entries."""
+    return str(_server_state.PUBLIC_BIND_IP or "").strip() or "127.0.0.1"
 
 
 def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -174,7 +180,7 @@ def _wait_for_ports_stably_open(
     while time.time() < deadline:
         for svc_name, state in list(pending.items()):
             port = state["port"]
-            if is_port_open("127.0.0.1", port, timeout=2.0):
+            if is_port_open(published_probe_host(), port, timeout=2.0):
                 state["stable"] += 1
                 if state["stable"] >= required_stable_checks:
                     pending.pop(svc_name, None)
@@ -237,7 +243,7 @@ def probe_inner_service(
         if protocol == "http":
             try:
                 resp = requests.get(
-                    f"http://127.0.0.1:{ext_port}{http_path}",
+                    f"http://{published_probe_host()}:{ext_port}{http_path}",
                     timeout=min(timeout_s, 3.0),
                     allow_redirects=False,
                 )
@@ -245,7 +251,9 @@ def probe_inner_service(
             except requests.RequestException:
                 return False
         else:
-            return is_port_open("127.0.0.1", int(ext_port), timeout=min(timeout_s, 3.0))
+            return is_port_open(
+                published_probe_host(), int(ext_port), timeout=min(timeout_s, 3.0)
+            )
 
     try:
         containers = get_docker_client().containers.list(
